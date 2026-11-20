@@ -1,0 +1,10 @@
+{
+  "scopeName": "source.vertexfrm",
+  "patterns": [
+    { "match": "^\\s*!.*$", "name": "comment.line.exclamation.vertexfrm" },
+    { "match": "\\b(field|group|header|charset|port_size|text|trigger)\\b", "name": "keyword.control.vertexfrm" },
+    { "match": "\"[^\"]*\"", "name": "string.quoted.double.vertexfrm" },
+    { "match": "\\b[0-9]+\\b", "name": "constant.numeric.vertexfrm" },
+    { "match": "[{}()=]", "name": "punctuation.vertexfrm" }
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "name": "vertex-frm-preview",
+  "displayName": "Vertex FRM Preview",
+  "description": "Live preview for Vertex FRM form files inside VS Code",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "null"
+  },
+  "publisher": "Emil-TTM",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "vertexFrmPreview.open",
+        "title": "Open FRM Preview"
+      },
+      {
+        "command": "vertexFrmPreview.sortSections",
+        "title": "FRM: Sort sections"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "vertexFrmPreview.sortSections",
+          "when": "resourceLangId == vertexfrm || resourceExtname == .frm"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "vertexFrmPreview.sortSections",
+          "when": "resourceLangId == vertexfrm || resourceExtname == .frm",
+          "group": "1_modification@10"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "vertexFrmPreview.open",
+          "when": "resourceLangId == vertexfrm",
+          "group": "navigation@10"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Vertex FRM Preview",
+      "properties": {
+        "vertexFrmPreview.showZoomControls": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show zoom buttons and slider in the FRM preview titlebar."
+        },
+        "vertexFrmPreview.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open a preview when an FRM file gets focus and has no preview yet."
+        },
+        "vertexFrmPreview.autoReveal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Bring an FRM file's existing preview to the front when you switch back to that file."
+        }
+      }
+    }
+  },
+  "activationEvents": [
+    "onLanguage:vertexfrm",
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "@types/node": "^20.10.6",
+    "@types/vscode": "^1.85.0",
+    "eslint": "^9.39.2",
+    "globals": "^17.2.0",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3",
+    "typescript-eslint": "^8.54.0",
+    "vsce": "^2.15.0"
+  }
+}
