@@ -1,0 +1,11 @@
+.vscode/**
+src/**
+out/**/*.map
+out/extension - Copy*
+**/*.vsix
+**/desktop.ini
+.gitignore
+eslint.config.mts
+tsconfig.json
+test-form.frm
+node_modules/**

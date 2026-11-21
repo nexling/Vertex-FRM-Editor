@@ -34,6 +34,10 @@ Notes:
 2. Build: `npm run compile` (or `npm run watch`).
 3. Press F5 to launch an Extension Development Host. Open a FRM file and click "Open FRM Preview" in the editor title.
 
+Where things are:
+- `src/extension.ts`: the extension. Parses the FRM file (`parseFrm`), renders the form's markup and data (`renderPreview`), and applies edits from the preview to the file.
+- `media/preview.css` and `media/preview.js`: the preview page's styles and script, plain files that need no build step. The page loads them once; each refresh sends a `frmUpdate` message with the new markup and data. `preview.js` patches the page to match the new markup, keeping elements that are still there, and runs the page logic (`window.__frmMain(data)`) again. The logic may add listeners freely: all of them are removed before it runs again.
+
 #### TODO:
 - adding numbers to grid so user knowns which field is where.
 - adding field names to buttons so user knows which button belongs to which field.

@@ -24,12 +24,20 @@
 
 ### Changed
 
+- The preview opens faster. Its styles and script are built into the page instead of loaded as two separate files, and the extension starts once VS Code is up (`onStartupFinished`) and reads the translations file and page files in the background, so the first preview no longer waits for them.
+- The "Vertex FRM Preview" output channel logs how long each preview took to appear, split into building the page, the webview starting, the script starting, the page logic, and the first frame.
 - The delete button on fields, images and previews sits slightly higher so it doesn't cover the stretch handles. On very narrow elements the stretch handles only appear once the element is selected.
 - Arrow keys, Delete and Backspace no longer act on the selected element while a dialog is open. Before, Backspace in a dialog could delete the element behind it.
 - Clicking inside a dialog or menu no longer deselects the element.
 - The window header and texts are edited in place instead of in a dialog. Double-click the title in the titlebar, or double-click a text (or F2/Enter, or Edit in its right-click menu), and it turns into an input with the text selected. Enter or clicking away saves, Escape cancels, and an empty or unchanged value writes nothing. Add Text puts an empty input at the clicked cell; nothing is added unless you type something. The header and text dialogs are gone.
 - The selection and hover box around a text is as wide as the text itself, at any zoom. Only the text is clickable and draggable, and the dashed drop outline is the same width. Empty text keeps a box one column wide.
 - Checkboxes, radio buttons and buttons are sized to their content the same way: the selection and hover box is as wide as the control plus its label, and as tall as the text (buttons as tall as their border). The gap between a checkbox/radio and its label scales with zoom. Bottom-bar buttons are unchanged.
+- Refreshing the preview no longer reads the disk each time. `path:` values files, image locations and the list of trigger programs are read once and remembered; a change to one of those files refreshes only the previews that show it. A newly created trigger program is listed right away.
+- The preview now only watches `forms/`, `forms/fieldvalues/` and `forms/images/` (custom and system, without their subfolders) and the trigger program folders. Saving an `.frm` file or changing other files under `forms/` no longer re-renders open previews. All previews share one set of watchers, which stop when the last preview closes.
+- Zooming and resizing the panel measure texts and buttons in one pass instead of once per element, and at most once per frame, so the zoom slider stays smooth on large forms.
+- The preview page's styles and script are now separate files (`media/preview.css`, `media/preview.js`) that load once per page. A refresh sends only the form's markup and data, about a fifth of what it sent before for a typical form. The page then updates in place: elements that are still there are kept and only what changed is rewritten, so images don't reload. A refresh is about 30% faster in the page.
+- The extension starts when an FRM file is opened instead of in every VS Code window at startup. It now registers the `vertexfrm` language for `.frm` files itself, so it no longer depends on the Vertex FRM language extension for this. If an FRM file already has focus when the extension starts (for example when VS Code reopens one), its preview opens like it does when you switch to the file.
+- The packaged extension no longer contains the TypeScript source, source maps, the sample form or old `.vsix` files.
 
 ### Fixed
 
