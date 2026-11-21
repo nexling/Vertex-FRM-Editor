@@ -15,8 +15,8 @@ export function activate(context: vscode.ExtensionContext) {
     const config = vscode.workspace.getConfiguration('vertexFrmPreview');
     const hasPanel = panelByDoc.has(ed.document.uri.toString());
     if (hasPanel ? config.get<boolean>('autoReveal', true) : config.get<boolean>('autoOpen', true)) {
-      // Auto-opened panels leave focus in the editor; auto-reveal keeps its existing behaviour.
-      ensurePreview(context, ed.document, { preserveFocus: !hasPanel });
+      // A newly auto-opened panel takes focus; revealing an existing one leaves focus in the editor.
+      ensurePreview(context, ed.document, { preserveFocus: hasPanel });
     }
   }));
 
@@ -69,7 +69,100 @@ const refreshTimerByDoc = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingPreviewEdits = new Map<string, number>();
 // Panels whose page has loaded and accepts in-place updates
 const readyPanels = new WeakSet<vscode.WebviewPanel>();
+// Documents whose preview shows the "introduce indexes" gate instead of the form
+const gatedDocs = new Set<string>();
 const REFRESH_DELAY_MS = 150;
+
+// Statement lines the preview can only work with when they carry an index: text= / button= / pushbutton=
+const UNINDEXED_LINE = /^(\s*)(text|button|pushbutton)(?=\s*=)/i;
+const INDEXED_TEXT_LINE = /^\s*text\s*\(\s*(\d+)\s*\)\s*=/i;
+const INDEXED_BUTTON_LINE = /^\s*(?:button|pushbutton)\s*\(\s*(\d+)\s*\)\s*=/i;
+
+interface UnindexedLine { line: number; insertAt: number; kind: 'text' | 'button'; }
+
+function findUnindexed(text: string): UnindexedLine[] {
+  const found: UnindexedLine[] = [];
+  text.split(/\r?\n/).forEach((l, i) => {
+    const m = l.match(UNINDEXED_LINE);
+    if (m) {
+      found.push({ line: i, insertAt: m[1].length + m[2].length, kind: m[2].toLowerCase() === 'text' ? 'text' : 'button' });
+    }
+  });
+  return found;
+}
+
+function unindexedCounts(found: UnindexedLine[]) {
+  const texts = found.filter(u => u.kind === 'text').length;
+  return { texts, buttons: found.length - texts };
+}
+
+/** Gives every text= / button= / pushbutton= line the next free index, as one undoable edit. */
+function autoAddIndexes(doc: vscode.TextDocument) {
+  const lines = doc.getText().split(/\r?\n/);
+  let nextText = 1;
+  let nextButton = 1;
+  for (const l of lines) {
+    const t = l.match(INDEXED_TEXT_LINE);
+    if (t) nextText = Math.max(nextText, Number(t[1]) + 1);
+    const b = l.match(INDEXED_BUTTON_LINE);
+    if (b) nextButton = Math.max(nextButton, Number(b[1]) + 1);
+  }
+  const found = findUnindexed(lines.join('\n'));
+  if (!found.length) return;
+  const edit = new vscode.WorkspaceEdit();
+  for (const u of found) {
+    const n = u.kind === 'text' ? nextText++ : nextButton++;
+    edit.insert(doc.uri, new vscode.Position(u.line, u.insertAt), `(${n})`);
+  }
+  vscode.workspace.applyEdit(edit).then(ok => {
+    if (!ok) vscode.window.showErrorMessage('Failed to add indexes');
+  });
+}
+
+function unindexedMessage(c: { texts: number; buttons: number }) {
+  const parts: string[] = [];
+  if (c.texts) parts.push(`${c.texts} text`);
+  if (c.buttons) parts.push(`${c.buttons} button`);
+  return { title: 'Introduce indexes for text and button commands to use preview', detail: `(${parts.join(', ')} without index)` };
+}
+
+function renderGateHtml(webview: vscode.Webview, c: { texts: number; buttons: number }) {
+  const msg = unindexedMessage(c);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${webview.cspSource}; script-src 'unsafe-inline';" />
+  <style>
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); }
+    .gate { max-width: 420px; padding: 20px 24px; border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px; background: var(--vscode-editorWidget-background); }
+    .gate h3 { margin: 0 0 6px; font-size: 14px; }
+    .gate p { margin: 0 0 16px; opacity: .8; }
+    .actions { display: flex; gap: 8px; justify-content: flex-end; }
+    button { padding: 4px 12px; border: 1px solid transparent; border-radius: 2px; cursor: pointer; font: inherit; }
+    .primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .primary:hover { background: var(--vscode-button-hoverBackground); }
+    .secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+  </style>
+</head>
+<body>
+  <div class="gate">
+    <h3>${escapeHtml(msg.title)}</h3>
+    <p>${escapeHtml(msg.detail)}</p>
+    <div class="actions">
+      <button class="secondary" id="cancel">Cancel</button>
+      <button class="primary" id="add">Auto-add indexes</button>
+    </div>
+  </div>
+  <script>
+    const api = acquireVsCodeApi();
+    document.getElementById('cancel').addEventListener('click', () => api.postMessage({ command: 'gateCancel' }));
+    document.getElementById('add').addEventListener('click', () => api.postMessage({ command: 'autoIndex' }));
+  </script>
+</body>
+</html>`;
+}
 
 
 let customRoot: any;
@@ -79,6 +172,9 @@ let systemImg: any;
 function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocument, options: { preserveFocus?: boolean } = {}) {
   const preserveFocus = options.preserveFocus ?? false;
   const key = doc.uri.toString();
+  // Opening or revealing the preview always asks for indexes first when any are missing
+  const mustGate = findUnindexed(doc.getText()).length > 0;
+  if (mustGate) gatedDocs.add(key);
   let panel = panelByDoc.get(key);
   if (panel) {
     panel.reveal(panel.viewColumn ?? vscode.ViewColumn.Beside, preserveFocus);
@@ -111,11 +207,36 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
     });
     panel.onDidDispose(() => sub.dispose());
 
+    // Re-render when a fieldvalues (or other forms) file changes, since dropdowns expand "path:<name>"
+    const formsDirs = getFormsDirs();
+    if (formsDirs) {
+      let formsTimer: ReturnType<typeof setTimeout> | undefined;
+      const onFormsChange = () => {
+        if (formsTimer) clearTimeout(formsTimer);
+        formsTimer = setTimeout(() => {
+          formsTimer = undefined;
+          const current = vscode.workspace.textDocuments.find(d => d.uri.toString() === key);
+          if (current && panelByDoc.get(key) === createdPanel) updateWebview(createdPanel, current);
+        }, REFRESH_DELAY_MS);
+      };
+      for (const dir of [formsDirs.custom, formsDirs.system]) {
+        const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(dir), '**/*'));
+        watcher.onDidChange(onFormsChange);
+        watcher.onDidCreate(onFormsChange);
+        watcher.onDidDelete(onFormsChange);
+        panel.onDidDispose(() => {
+          if (formsTimer) clearTimeout(formsTimer);
+          watcher.dispose();
+        });
+      }
+    }
+
   panel.onDidDispose(() => {
     panelByDoc.delete(key);
     zoomByDoc.delete(key);
     activeTabByDoc.delete(key);
     gridOnByDoc.delete(key);
+    gatedDocs.delete(key);
     shownTextByDoc.delete(key);
     pendingPreviewEdits.delete(key);
     const timer = refreshTimerByDoc.get(key);
@@ -127,7 +248,11 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
 
     // Receive messages (future: editing from preview)
   panel.webview.onDidReceiveMessage((msg: any) => {
-      if (msg?.command === 'frmReady') {
+      if (msg?.command === 'gateCancel') {
+        createdPanel.dispose();
+      } else if (msg?.command === 'autoIndex') {
+        autoAddIndexes(doc);
+      } else if (msg?.command === 'frmReady') {
         readyPanels.add(createdPanel);
       } else if (msg?.command === 'frmSoftUpdateFailed') {
         // Fall back to a full reload so the preview never stays stale
@@ -156,8 +281,21 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         handleEditElement(doc, msg);
       } else if (msg?.command === 'updateHeader') {
         handleUpdateHeader(doc, msg);
+      } else if (msg?.command === 'resolveFieldValues' && Array.isArray(msg?.names)) {
+        const names = msg.names.filter((n: unknown): n is string => typeof n === 'string');
+        createdPanel.webview.postMessage({ command: 'fieldValuesResolved', requestId: msg.requestId, lines: describeFieldValues(names) });
+      } else if (msg?.command === 'setPortSize') {
+        handleSetPortSize(doc, msg);
+      } else if (msg?.command === 'resizeElement') {
+        handleResizeElement(doc, msg);
+      } else if (msg?.command === 'setTextBox') {
+        handleSetTextBox(doc, msg);
       } else if (msg?.command === 'moveElement') {
         handleMoveElement(doc, msg);
+      } else if (msg?.command === 'duplicateElement') {
+        handleDuplicateElement(doc, createdPanel, msg);
+      } else if (msg?.command === 'undo' || msg?.command === 'redo') {
+        runDocumentHistory(doc, createdPanel, msg.command);
       } else if (msg?.command === 'showInSource') {
         handleShowInSource(doc, msg);
       } else if (msg?.command === 'addTrigger') {
@@ -175,7 +313,7 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
       }
     });
     updateWebview(panel, doc);
-  } else if (doc.getText() !== shownTextByDoc.get(key)) {
+  } else if (mustGate || doc.getText() !== shownTextByDoc.get(key)) {
     updateWebview(panel, doc);
   }
 }
@@ -394,26 +532,7 @@ function handleAddElement(doc: vscode.TextDocument, msg: any) {
     
     // Add to group(1) if it exists (only for fields, handle multi-line groups ending with \)
     if (elementType === 'field') {
-      const groupRegex = /^\s*group\s*\(\s*1\s*\)\s*=\s*/i;
-      for (let i = 0; i < updatedLines.length; i++) {
-        if (groupRegex.test(updatedLines[i])) {
-          const collected = collectContinuedStatement(updatedLines, i);
-          // Format: group(1)= <type_expr> [<val1> <val2>] <field_indexes...>
-          // revision=2: first 3 values are preserved (type_expr, val1, val2)
-          // no revision or revision=1: first 1 value is preserved (type_expr)
-          const items = statementValue(collected.text).replace(/\\/g, ' ').trim().split(/\s+/).filter(Boolean);
-          const model = parseFrm(doc.getText());
-          const preserveCount = model.revision === 2 ? 3 : 1;
-          const preserved = items.slice(0, preserveCount);
-          const fieldIndexes = items.slice(preserveCount).map(s => parseInt(s)).filter(n => !isNaN(n));
-          fieldIndexes.push(nextIndex);
-          const sortedIndexes = fieldIndexes.sort((a, b) => a - b);
-          const sortedItems = [...preserved, ...sortedIndexes.map(String)];
-          const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(updatedLines[i]) : undefined;
-          replaceContinuedStatement(updatedLines, i, formatIndexStatement('group(1)', sortedItems, wrapAt));
-          break;
-        }
-      }
+      addFieldToGroup1(updatedLines, nextIndex, model.revision);
     }
     
     // If tabs exist and we have an active tab, add to appropriate opt_* list
@@ -629,6 +748,173 @@ function handleUpdateHeader(doc: vscode.TextDocument, msg: any) {
   }
 }
 
+// Writes port_size= rows cols. A missing rows/cols in the message keeps the file's current value.
+function handleSetPortSize(doc: vscode.TextDocument, msg: any) {
+  try {
+    const valid = (v: any) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+    const text = doc.getText();
+    const lines = text.split(/\r?\n/);
+    const portRegex = /^(\s*port_size\s*=\s*)(\d+)(\s+)(\d+)/i;
+    let lineIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (/^\s*port_size\s*=/i.test(lines[i])) { lineIndex = i; break; }
+    }
+    const current = lineIndex !== -1 ? lines[lineIndex].match(portRegex) : null;
+    const curRows = current ? Number(current[2]) : 0;
+    const curCols = current ? Number(current[4]) : 0;
+    const rows = valid(msg?.rows) ? msg.rows : curRows;
+    const cols = valid(msg?.cols) ? msg.cols : curCols;
+    if (current && rows === curRows && cols === curCols) return;
+
+    const edit = new vscode.WorkspaceEdit();
+    if (lineIndex !== -1) {
+      const line = lines[lineIndex];
+      let newLine: string;
+      if (current) {
+        newLine = current[1] + rows + current[3] + cols + line.slice(current[0].length);
+      } else {
+        const commentMatch = line.match(/\s+(!.*)$/);
+        newLine = `port_size= ${rows} ${cols}` + (commentMatch ? ' ' + commentMatch[1] : '');
+      }
+      edit.replace(doc.uri, new vscode.Range(lineIndex, 0, lineIndex, line.length), newLine);
+    } else {
+      // Insert next to the other header settings
+      let insertIndex = -1;
+      for (let i = 0; i < lines.length; i++) {
+        if (/^\s*(?:header|charset|vxdbase_winstyle|has_pulldowns|text_font|field_font|revision|status_bar)\s*=/i.test(lines[i])) {
+          insertIndex = i + 1;
+        } else if (/^\s*$/.test(lines[i]) && insertIndex > 0) {
+          break;
+        }
+      }
+      if (insertIndex === -1) {
+        insertIndex = lines.findIndex(l => !/^\s*!/.test(l) && !/^\s*$/.test(l));
+      }
+      const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+      const newLine = `port_size= ${rows} ${cols}`;
+      if (insertIndex === -1 || insertIndex >= doc.lineCount) {
+        const last = doc.lineAt(doc.lineCount - 1);
+        edit.insert(doc.uri, last.range.end, (last.text.length ? eol : '') + newLine + eol);
+      } else {
+        edit.insert(doc.uri, new vscode.Position(insertIndex, 0), newLine + eol);
+      }
+    }
+    vscode.workspace.applyEdit(edit).then(success => {
+      if (!success) vscode.window.showErrorMessage('Failed to update port_size');
+    });
+  } catch (error) {
+    vscode.window.showErrorMessage(`Error updating port_size: ${error}`);
+  }
+}
+
+// Stretching from the preview. Fields: msg.col + msg.len. Images/previews: msg.row, msg.col, msg.rows, msg.cols.
+// Only those numbers are rewritten; the rest of the line keeps its formatting.
+function handleResizeElement(doc: vscode.TextDocument, msg: any) {
+  try {
+    const int = (v: any, min: number) => typeof v === 'number' && Number.isInteger(v) && v >= min;
+    const type = msg?.type;
+    if (!int(msg?.index, 0) || !int(msg?.col, 1)) return;
+    let lineRegex: RegExp;
+    let rewrite: (m: RegExpMatchArray) => string;
+    if (type === 'field') {
+      if (!int(msg.len, 1)) return;
+      // prefix (keyword, name, type) | col | ws | len
+      lineRegex = /^(\s*field\s*\(\s*(\d+)\s*\)\s*=\s*"?\s*<?[$\w]+>?\s*"?\s+[\d+]+\s+\d+\s+)(\d+)(\s+)(\d+)/i;
+      rewrite = m => m[1] + msg.col + m[4] + msg.len;
+    } else if (type === 'image' || type === 'preview') {
+      if (!int(msg.row, 1) || !int(msg.rows, 1) || !int(msg.cols, 1)) return;
+      // prefix | row | ws | col | ws | rows | ws | cols
+      lineRegex = new RegExp(`^(\\s*${type}\\s*\\(\\s*(\\d+)\\s*\\)\\s*=\\s*)(\\d+)(\\s+)(\\d+)(\\s+)(\\d+)(\\s+)(\\d+)`, 'i');
+      rewrite = m => m[1] + msg.row + m[4] + msg.col + m[6] + msg.rows + m[8] + msg.cols;
+    } else if (type === 'text') {
+      // A boxed text: row/col is the box's top-left corner, #[rows,cols]* in the content is its size
+      if (!int(msg.row, 1) || !int(msg.rows, 1) || !int(msg.cols, 1)) return;
+      lineRegex = /^(\s*text\s*\(\s*(\d+)\s*\)\s*=\s*)(\d+)(\s+)(\d+)/i;
+      rewrite = m => m[1] + msg.row + m[4] + msg.col;
+    } else {
+      return;
+    }
+    for (let i = 0; i < doc.lineCount; i++) {
+      const line = doc.lineAt(i).text;
+      const m = line.match(lineRegex);
+      if (!m || Number(m[2]) !== msg.index) continue;
+      let rest = line.slice(m[0].length);
+      if (type === 'text') {
+        const boxRe = /#\s*\[\s*\d+\s*,\s*\d+\s*\]\s*\*/;
+        if (!boxRe.test(rest)) return;
+        rest = rest.replace(boxRe, `#[${msg.rows},${msg.cols}]*`);
+      }
+      const newLine = rewrite(m) + rest;
+      if (newLine === line) return;
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(doc.uri, new vscode.Range(i, 0, i, line.length), newLine);
+      vscode.workspace.applyEdit(edit).then(success => {
+        if (!success) vscode.window.showErrorMessage(`Failed to resize ${type}(${msg.index})`);
+      });
+      return;
+    }
+  } catch (error) {
+    vscode.window.showErrorMessage(`Error resizing element: ${error}`);
+  }
+}
+
+// Add or remove the #[rows,cols]* box directive on a text line, and set its column so the label stays put.
+// Only the column and the directive change; the rest of the content is left as written.
+function handleSetTextBox(doc: vscode.TextDocument, msg: any) {
+  try {
+    const int = (v: any, min: number) => typeof v === 'number' && Number.isInteger(v) && v >= min;
+    if (!int(msg?.index, 0) || !int(msg?.col, 1)) return;
+    const adding = msg.boxRows != null;
+    if (adding && (!int(msg.boxRows, 1) || !int(msg.boxCols, 1))) return;
+    const lineRegex = /^(\s*text\s*\(\s*(\d+)\s*\)\s*=\s*\d+\s+)(\d+)(\s+)(.*)$/i;
+    for (let i = 0; i < doc.lineCount; i++) {
+      const line = doc.lineAt(i).text;
+      const m = line.match(lineRegex);
+      if (!m || Number(m[2]) !== msg.index) continue;
+      let value = m[5];
+      if (adding) {
+        if (/#\s*\[\s*\d+\s*,\s*\d+\s*\]\s*\*/.test(value)) return; // already boxed
+        const directive = `+" #[${msg.boxRows},${msg.boxCols}]*"`;
+        if (value.startsWith('{')) {
+          // The } that closes the opening brace (skipping quoted text), not one in a trailing comment
+          let close = -1, depth = 0, quoted = false;
+          for (let k = 0; k < value.length && close < 0; k++) {
+            const c = value[k];
+            if (c === '"') quoted = !quoted;
+            else if (!quoted && c === '{') depth++;
+            else if (!quoted && c === '}' && --depth === 0) close = k;
+          }
+          if (close < 0) break;
+          value = value.slice(0, close) + directive + value.slice(close);
+        } else if (value.startsWith('"')) {
+          const close = value.indexOf('"', 1);
+          if (close < 0) break;
+          value = '{' + value.slice(0, close + 1) + directive + '}' + value.slice(close + 1);
+        } else {
+          break;
+        }
+      } else {
+        // `+" #[r,c]*"` as its own piece, or the directive inside a string
+        const before = value;
+        value = value.replace(/\s*\+\s*"\s*#\s*\[\s*\d+\s*,\s*\d+\s*\]\s*\*\s*"/, '');
+        if (value === before) value = value.replace(/\s*#\s*\[\s*\d+\s*,\s*\d+\s*\]\s*\*/, '');
+        if (value === before) return;
+      }
+      const newLine = m[1] + msg.col + m[4] + value;
+      if (newLine === line) return;
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(doc.uri, new vscode.Range(i, 0, i, line.length), newLine);
+      vscode.workspace.applyEdit(edit).then(success => {
+        if (!success) vscode.window.showErrorMessage(`Failed to update the box on text(${msg.index})`);
+      });
+      return;
+    }
+    vscode.window.showErrorMessage(`Could not ${adding ? 'add a box to' : 'remove the box from'} text(${msg.index})`);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Error updating text box: ${error}`);
+  }
+}
+
 function handleEditElement(doc: vscode.TextDocument, msg: any) {
   try {
     const text = doc.getText();
@@ -830,6 +1116,130 @@ function handleMoveElement(doc: vscode.TextDocument, msg: any) {
     });
   } catch (error) {
     vscode.window.showErrorMessage(`Error updating tab visibility: ${error}`);
+  }
+}
+
+/** Add a field index to group(1), keeping the leading non-index values (type_expr, and val1 val2 for revision 2). */
+function addFieldToGroup1(lines: string[], fieldIndex: number, revision: number | undefined): void {
+  const groupRegex = /^\s*group\s*\(\s*1\s*\)\s*=\s*/i;
+  const i = lines.findIndex(l => groupRegex.test(l));
+  if (i < 0) return;
+  const collected = collectContinuedStatement(lines, i);
+  const items = statementValue(collected.text).replace(/\\/g, ' ').trim().split(/\s+/).filter(Boolean);
+  const preserveCount = revision === 2 ? 3 : 1;
+  const preserved = items.slice(0, preserveCount);
+  const fieldIndexes = items.slice(preserveCount).map(s => parseInt(s)).filter(n => !isNaN(n));
+  if (fieldIndexes.includes(fieldIndex)) return;
+  fieldIndexes.push(fieldIndex);
+  fieldIndexes.sort((a, b) => a - b);
+  const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
+  replaceContinuedStatement(lines, i, formatIndexStatement('group(1)', [...preserved, ...fieldIndexes.map(String)], wrapAt));
+}
+
+const DUPLICATE_KEYWORD: Record<string, string> = {
+  text: 'text',
+  field: 'field',
+  pushbutton: '(?:push)?button',
+  image: 'image',
+  preview: 'preview',
+};
+
+const DUPLICATE_SECTION: Record<string, Section> = {
+  text: Section.Text,
+  field: Section.Field,
+  pushbutton: Section.Button,
+  image: Section.Image,
+  preview: Section.Preview,
+};
+
+/**
+ * Copy an element's statement verbatim under the next free index, placed at `msg.row`
+ * (same column), and make it visible on the same tabs. The preview is told up front to
+ * select the copy once it re-renders.
+ */
+function handleDuplicateElement(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: any): void {
+  const elementType = String(msg?.elementType ?? '');
+  const sourceIndex = Number(msg?.elementIndex);
+  const row = Number(msg?.row);
+  const keyword = DUPLICATE_KEYWORD[elementType];
+  if (!keyword || !Number.isInteger(sourceIndex) || !Number.isInteger(row) || row < 1) {
+    return;
+  }
+  try {
+    const text = doc.getText();
+    const lines = text.split(/\r?\n/);
+    const model = parseFrm(text);
+
+    const head = `^(\\s*${keyword}\\s*\\(\\s*)${sourceIndex}(\\s*\\)\\s*=\\s*)`;
+    const start = lines.findIndex(l => new RegExp(head, 'i').test(l));
+    if (start < 0) {
+      vscode.window.showWarningMessage(`Could not find ${elementType}(${sourceIndex}) in source`);
+      return;
+    }
+    const statement = lines.slice(start, collectContinuedStatement(lines, start).endIndex + 1);
+
+    const existing: Array<{ index?: number }> = ({
+      text: model.texts,
+      field: model.fields,
+      pushbutton: model.pushbuttons,
+      image: model.images,
+      preview: model.previews,
+    } as Record<string, Array<{ index?: number }>>)[elementType] ?? [];
+    const newIndex = existing.reduce((max, e) => (e.index ?? 0) > max ? (e.index ?? 0) : max, 0) + 1;
+
+    // The row is the first number after '=', except for fields: field(n)= NAME type row col ...
+    const rowPattern = new RegExp(head + (elementType === 'field' ? '(\\S+\\s+\\S+\\s+)' : '()') + '\\d+', 'i');
+    if (!rowPattern.test(statement[0])) {
+      vscode.window.showWarningMessage(`Could not read the position of ${elementType}(${sourceIndex})`);
+      return;
+    }
+    statement[0] = statement[0].replace(rowPattern, (_m, pre, eq, between) => `${pre}${newIndex}${eq}${between}${row}`);
+    insertIntoSection(lines, DUPLICATE_SECTION[elementType], statement);
+
+    if (elementType === 'field') {
+      addFieldToGroup1(lines, newIndex, model.revision);
+    }
+
+    // Visible on the same tabs as the original
+    const optTypeName = elementType === 'pushbutton' ? '(?:pushbutton|button)' : elementType;
+    const optPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*\\d+\\s*\\)\\s*=`, 'i');
+    for (let i = 0; i < lines.length; i++) {
+      if (!optPattern.test(lines[i])) continue;
+      const collected = collectContinuedStatement(lines, i);
+      const list = parseIndexList(statementValue(collected.text));
+      if (!list.includes(sourceIndex) || list.includes(newIndex)) continue;
+      list.push(newIndex);
+      list.sort((a, b) => a - b);
+      const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
+      const newLines = formatIndexStatement(statementKeyword(lines[i]), list.map(String), wrapAt);
+      lines.splice(i, collected.endIndex - i + 1, ...newLines);
+      i += newLines.length - 1;
+    }
+
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), lines.join('\n'));
+    // Sent before the edit so it arrives ahead of the refresh the edit triggers
+    panel.webview.postMessage({ command: 'frmSelectAfterRefresh', key: `${elementType}:${newIndex}` });
+    vscode.workspace.applyEdit(edit);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Failed to duplicate element: ${error}`);
+    return;
+  }
+}
+
+/**
+ * Undo/redo from the preview: run VS Code's own undo/redo on the .frm document, so the preview
+ * and the text editor share one history, then hand focus back to the preview.
+ */
+async function runDocumentHistory(doc: vscode.TextDocument, panel: vscode.WebviewPanel, command: 'undo' | 'redo') {
+  try {
+    const visible = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === doc.uri.toString());
+    await vscode.window.showTextDocument(doc, { viewColumn: visible?.viewColumn ?? vscode.ViewColumn.One, preserveFocus: false });
+    await vscode.commands.executeCommand(command);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Failed to ${command}: ${error}`);
+  } finally {
+    panel.reveal(panel.viewColumn, false);
   }
 }
 
@@ -1235,6 +1645,19 @@ function serializeFrmModel(model: FrmModel, originalText: string, changedElement
 
 function updateWebview(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
   const text = doc.getText();
+  const key = doc.uri.toString();
+  const unindexed = unindexedCounts(findUnindexed(text));
+  if (gatedDocs.has(key)) {
+    if (unindexed.texts + unindexed.buttons > 0) {
+      // The gate is its own page; leaving it later needs a full load of the form
+      readyPanels.delete(panel);
+      panel.webview.html = renderGateHtml(panel.webview, unindexed);
+      shownTextByDoc.set(key, text);
+      return;
+    }
+    // Every line has an index now (auto-added or typed): show the form
+    gatedDocs.delete(key);
+  }
   const model = parseFrm(text);
   // Resolve image URIs against allowed folders
   if (model.images && model.images.length) {
@@ -1247,7 +1670,7 @@ function updateWebview(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
   const initialGridOn = gridOnByDoc.get(doc.uri.toString());
   const availableTriggerPrograms = getAvailableTriggerPrograms();
   const showZoomControls = vscode.workspace.getConfiguration('vertexFrmPreview').get<boolean>('showZoomControls', true);
-  const html = renderHtml(panel.webview, model, initialZoom, initialTab, initialGridOn, availableTriggerPrograms, showZoomControls);
+  const html = renderHtml(panel.webview, model, initialZoom, initialTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed);
   shownTextByDoc.set(doc.uri.toString(), text);
   if (readyPanels.has(panel)) {
     // Swap the page contents in place: no document reload, so no flash
@@ -1366,6 +1789,8 @@ interface FrmModel {
   title: string;
   rows: number;
   cols: number;
+  portRows?: number; // port_size rows as written in the file (0 = auto)
+  portCols?: number; // port_size cols as written in the file (0 = auto)
   winstyle?: string; // vxdbase_winstyle value (e.g., 'VXUI' or 'only')
   revision?: number; // revision value (1 or 2) affects group format
   texts: FrmText[];
@@ -2071,10 +2496,11 @@ function parseFrm(src: string): FrmModel {
   }
 
   // Determine grid extents (no padding; exact fit). Use 1 as absolute minimum only if empty.
-  // Exclude bottom bar buttons (isBottomBar=true) from grid sizing calculations
+  // Exclude bottom bar buttons (isBottomBar=true) and hidden fields (row or col 1000, shown in the side panel)
+  const gridFields = fields.filter(f => !isHiddenFieldPosition(f.row, f.col));
   const contentMaxRow = Math.max(
     texts.reduce((a, t) => Math.max(a, t.row), 0),
-    fields.reduce((a, f) => Math.max(a, f.row), 0),
+    gridFields.reduce((a, f) => Math.max(a, f.row), 0),
     pushbuttons.filter(p => !p.isBottomBar).reduce((a, p) => Math.max(a, p.row), 0),
     boxes.reduce((a, b) => Math.max(a, b.row + Math.max(1, b.rows) - 1), 0),
     images.reduce((a, i) => Math.max(a, i.row + Math.max(1, i.rows) - 1), 0),
@@ -2082,7 +2508,7 @@ function parseFrm(src: string): FrmModel {
   );
   const contentMaxCol = Math.max(
     texts.reduce((a, t) => Math.max(a, t.col + Math.max(0, (t.content?.length ?? 0) - 1)), 0),
-    fields.reduce((a, f) => {
+    gridFields.reduce((a, f) => {
       const extra = (f.values && f.values.length > 0) ? 2 : 0; // dropdowns take +2 columns
       return Math.max(a, f.col + Math.max(1, f.len + extra) - 1);
     }, 0),
@@ -2113,7 +2539,7 @@ function parseFrm(src: string): FrmModel {
     Object.keys(tabPreviews).forEach(k => { tabPreviews[Number(k)] = uniqueNums(tabPreviews[Number(k)]); });
   }
 
-  return { title, rows, cols, winstyle, revision, texts, fields, pushbuttons, boxes, images, previews, triggers, tabOrder, tabs: sortedTabs, tabTexts: sortedTabs ? tabTexts : undefined, tabFields: sortedTabs ? tabFields : undefined, tabPushButtons: sortedTabs ? tabPushButtons : undefined, tabImages: sortedTabs ? tabImages : undefined, tabPreviews: sortedTabs ? tabPreviews : undefined };
+  return { title, rows, cols, portRows: requestedRows, portCols: requestedCols, winstyle, revision, texts, fields, pushbuttons, boxes, images, previews, triggers, tabOrder, tabs: sortedTabs, tabTexts: sortedTabs ? tabTexts : undefined, tabFields: sortedTabs ? tabFields : undefined, tabPushButtons: sortedTabs ? tabPushButtons : undefined, tabImages: sortedTabs ? tabImages : undefined, tabPreviews: sortedTabs ? tabPreviews : undefined };
 }
 
 // Translation support: load system/programs64/userprompt1.xml and resolve VXID keys
@@ -2148,8 +2574,7 @@ function getRepoRootFolder(): vscode.WorkspaceFolder | undefined {
 // <root>/custom/forms/images and then <root>/system/forms/images
 function resolveImageSrc(webview: vscode.Webview, fileName: string): string | undefined {
   try {
-    const root = getRepoRootFolder();
-    if (!root) return undefined;
+    if (!customImg || !systemImg) return undefined;
     const candidates = [
       path.join(customImg.fsPath, fileName),
       path.join(systemImg.fsPath, fileName)
@@ -2161,6 +2586,131 @@ function resolveImageSrc(webview: vscode.Webview, fileName: string): string | un
   } catch {
     return undefined;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Field values: dropdown entries written as "path:<name>" refer to a values
+// file. The preview expands them; the .frm text is never changed.
+// ---------------------------------------------------------------------------
+
+const FIELD_VALUES_PREFIX = 'path:';
+
+/** One dropdown option as shown in the preview. */
+interface DropdownOption {
+  label: string; // text shown in the dropdown
+  title?: string; // tooltip (real value, or why the option is a placeholder)
+  kind?: 'missing' | 'database'; // set for placeholder options
+}
+
+type FieldValuesResolution =
+  | { kind: 'values'; name: string; file: string; options: DropdownOption[] }
+  | { kind: 'database'; name: string; file: string }
+  | { kind: 'missing'; name: string };
+
+/** The custom and system forms folders: <custom>/forms, then <root>/system/forms. */
+function getFormsDirs(): { custom: string; system: string } | undefined {
+  const repoRoot = getRepoRootFolder();
+  if (!repoRoot) return undefined;
+  const custom = vscode.workspace.workspaceFolders?.find(wf => wf.name.toLowerCase().startsWith('custom'));
+  return {
+    custom: custom ? path.join(custom.uri.fsPath, 'forms') : path.join(repoRoot.uri.fsPath, 'custom', 'forms'),
+    system: path.join(repoRoot.uri.fsPath, 'system', 'forms')
+  };
+}
+
+/** Find a file in dir whose name matches name ignoring case. */
+function findFileIgnoreCase(dir: string, name: string): string | undefined {
+  try {
+    const wanted = name.toLowerCase();
+    const hit = fs.readdirSync(dir, { withFileTypes: true }).find(e => e.isFile() && e.name.toLowerCase() === wanted);
+    return hit ? path.join(dir, hit.name) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Split "Description [realvalue]*" into its shown text and real value. */
+function parseDropdownValue(raw: string): DropdownOption {
+  const m = raw.match(/^(.*?)\s*\[([^\]]*)\]\*\s*$/);
+  return m ? { label: m[1], title: m[2] } : { label: raw };
+}
+
+/** Look up and read the values file for name: custom before system, fieldvalues/ before forms/. */
+function resolveFieldValues(name: string): FieldValuesResolution {
+  const dirs = getFormsDirs();
+  if (!dirs) return { kind: 'missing', name };
+  const searchDirs = [
+    path.join(dirs.custom, 'fieldvalues'),
+    dirs.custom,
+    path.join(dirs.system, 'fieldvalues'),
+    dirs.system
+  ];
+  for (const dir of searchDirs) {
+    const file = findFileIgnoreCase(dir, name);
+    if (!file) continue;
+    let text: string;
+    try {
+      text = fs.readFileSync(file, 'utf8').replace(/^﻿/, '');
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    // Format files (#SETUP# / #FORMAT#) describe a list Vertex builds from a database at runtime
+    if (lines.some(l => /^#(SETUP|FORMAT|HEADERFORMAT)#/i.test(l.trim()))) {
+      return { kind: 'database', name, file };
+    }
+    const options = lines
+      .map(l => l.trimEnd())
+      .filter(l => l.trim() !== '' && !l.trimStart().startsWith('!') && !/^\s*charset\s*=/i.test(l))
+      .map(parseDropdownValue);
+    return { kind: 'values', name, file, options };
+  }
+  return { kind: 'missing', name };
+}
+
+/** The name in a "path:<name>" value, or undefined for a literal value. */
+function fieldValuesName(value: string): string | undefined {
+  const v = value.trim();
+  return v.toLowerCase().startsWith(FIELD_VALUES_PREFIX) ? v.slice(FIELD_VALUES_PREFIX.length).trim() : undefined;
+}
+
+/** A path relative to the repo root, with forward slashes, for display. */
+function displayPath(file: string): string {
+  const repoRoot = getRepoRootFolder();
+  const rel = repoRoot ? path.relative(repoRoot.uri.fsPath, file) : file;
+  return rel.split(path.sep).join('/');
+}
+
+/** Turn a field's raw values into dropdown options, expanding each "path:<name>" where it sits. */
+function expandDropdownValues(values: string[]): DropdownOption[] {
+  const out: DropdownOption[] = [];
+  for (const v of values) {
+    const name = fieldValuesName(v);
+    if (name === undefined) {
+      out.push(parseDropdownValue(v));
+      continue;
+    }
+    const r = resolveFieldValues(name);
+    if (r.kind === 'values') {
+      out.push(...r.options);
+    } else if (r.kind === 'database') {
+      out.push({ label: `‹database list: ${name}›`, title: `Values are built from the database at runtime (${displayPath(r.file)})`, kind: 'database' });
+    } else {
+      out.push({ label: v, title: 'fieldvalues file not found', kind: 'missing' });
+    }
+  }
+  return out;
+}
+
+/** Short description of each "path:<name>" for the field dialog's hint. */
+function describeFieldValues(names: string[]): string[] {
+  return names.map(name => {
+    const r = resolveFieldValues(name);
+    const ref = `${FIELD_VALUES_PREFIX}${name}`;
+    if (r.kind === 'values') return `${ref} → ${r.options.length} value${r.options.length === 1 ? '' : 's'} from ${displayPath(r.file)}`;
+    if (r.kind === 'database') return `${ref} → database list (${displayPath(r.file)})`;
+    return `${ref} → fieldvalues file not found`;
+  });
 }
 
 // Get list of available trigger programs from custom*/macros/triggers/ and system/macros/triggers/
@@ -2308,6 +2858,10 @@ function normalizeBraceText(expr: string): string {
     .join('');
 }
 
+// Boxed text is drawn this many columns right of the box's corner. Preview only: the file keeps the
+// original column, and the page subtracts it again when turning a drop position into a column.
+const BOX_LABEL_OFFSET = 2;
+
 // Parse and remove any box directives from concatenated text content.
 // Format: #[rows,columns]* where rows and columns are positive integers.
 function extractBoxesFromContent(content: string, startRow: number, startCol: number): { cleaned: string; boxes: FrmBox[] } | null {
@@ -2324,7 +2878,8 @@ function extractBoxesFromContent(content: string, startRow: number, startCol: nu
     const cols = Number(m[2]);
     if (Number.isFinite(rows) && Number.isFinite(cols) && rows > 0 && cols > 0) {
       // Create box at the same position as the text, with gap for the label
-      found.push({ row: startRow, col: startCol, rows, cols, gapStart: 2, gapSpan: Math.max(0, labelLen) });
+      // Label is drawn BOX_LABEL_OFFSET columns in from the corner; the gap gets 1 column of padding each side
+      found.push({ row: startRow, col: startCol, rows, cols, gapStart: BOX_LABEL_OFFSET, gapSpan: Math.max(0, labelLen) + 2 });
       any = true;
     }
   }
@@ -2334,8 +2889,18 @@ function extractBoxesFromContent(content: string, startRow: number, startCol: nu
   return { cleaned, boxes: found };
 }
 
-function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: number = 1, initialActiveTab?: number, initialGridOn?: boolean, availableTriggerPrograms: string[] = [], showZoomControls: boolean = true) {
+function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: number = 1, initialActiveTab?: number, initialGridOn?: boolean, availableTriggerPrograms: string[] = [], showZoomControls: boolean = true, unindexed: { texts: number; buttons: number } = { texts: 0, buttons: 0 }) {
+  const unindexedMsg = unindexed.texts + unindexed.buttons > 0 ? unindexedMessage(unindexed) : null;
   const styles = `
+    /* Unindexed text/button lines: shown but locked until they get an index */
+    [data-unindexed] { pointer-events: none; opacity: .45; outline: 1px dashed var(--vscode-editorWarning-foreground, #cca700); }
+    .unindexed-strip { display: flex; align-items: center; gap: 10px; padding: 6px 10px; margin-bottom: 8px; border-radius: 3px;
+      background: var(--vscode-inputValidation-warningBackground, rgba(204,167,0,.15)); border: 1px solid var(--vscode-inputValidation-warningBorder, #cca700); }
+    .unindexed-strip .msg { flex: 1; }
+    .unindexed-strip .detail { opacity: .8; margin-left: 4px; }
+    .unindexed-strip button { padding: 3px 10px; border: 0; border-radius: 2px; cursor: pointer; font: inherit;
+      background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+    .unindexed-strip button:hover { background: var(--vscode-button-hoverBackground); }
     :root { --col-w: 1ch; --row-h: calc(2ch + 16px); --frm-font-size: 11px; --row-gap: 0px; --col-gap: 0px; --gridline-alpha: 0; }
     body { font-family: 'Times New Roman', Times, serif; padding: 12px; color: rgba(0, 0, 0, 1); }
     /* Window chrome */
@@ -2419,6 +2984,9 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
       display: grid;
       grid-template-columns: repeat(${model.cols}, var(--col-w));
       grid-template-rows: repeat(${model.rows}, var(--row-h));
+      /* Elements outside a port_size smaller than the content keep the same cell size */
+      grid-auto-columns: var(--col-w);
+      grid-auto-rows: var(--row-h);
       row-gap: var(--row-gap);
       column-gap: var(--col-gap);
       position: relative;
@@ -2449,6 +3017,79 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         );
       border: 1px solid var(--vscode-editorWidget-border);
     }
+    /* Window resize (port_size) */
+    .grid-frame { position: relative; width: fit-content; }
+    .resize-handle { position: absolute; z-index: 50; touch-action: none; }
+    .resize-handle.e { top: 0; bottom: 6px; right: -6px; width: 10px; cursor: ew-resize; }
+    .resize-handle.s { left: 0; right: 6px; bottom: -6px; height: 10px; cursor: ns-resize; }
+    .resize-handle.se { right: -7px; bottom: -7px; width: 14px; height: 14px; cursor: nwse-resize; }
+    .resize-handle.se::after {
+      content: ""; position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px;
+      border-right: 2px solid rgba(104,104,104,.8); border-bottom: 2px solid rgba(104,104,104,.8);
+    }
+    .resize-handle.e:hover, .resize-handle.s:hover, .grid-frame.resizing-e .resize-handle.e, .grid-frame.resizing-s .resize-handle.s {
+      background: rgba(0, 120, 212, .25); border-radius: 3px;
+    }
+    .grid-frame.resizing .grid { outline: 2px dashed var(--vscode-focusBorder, #0078d4); outline-offset: 1px; }
+    body.tab-order-active .resize-handle { display: none; }
+    .resize-size-label {
+      position: absolute; right: 0; bottom: -26px; z-index: 60; padding: 2px 6px; border-radius: 3px;
+      background: rgba(0,0,0,.75); color: #fff; font: 11px/1.4 sans-serif; font-variant-numeric: tabular-nums;
+      white-space: nowrap; pointer-events: none;
+    }
+    .grid > .frm-overflow.frm-overflow { opacity: .35; z-index: 3; }
+    .grid > .frm-overflow.frm-overflow:hover, .grid > .frm-overflow.frm-overflow.selected { opacity: .8; }
+    .context-menu-item.disabled { opacity: .45; pointer-events: none; }
+    /* Stretch handles on fields, images and previews: thin strips centred on each edge */
+    .el-resize { position: absolute; z-index: 12; touch-action: none; display: none; }
+    .draggable:hover > .el-resize, .draggable.selected > .el-resize, .draggable.el-resizing > .el-resize { display: block; }
+    .draggable.el-narrow:not(.selected):not(.el-resizing) > .el-resize { display: none; }
+    body.tab-order-active .el-resize { display: none !important; }
+    .el-resize.e, .el-resize.w { top: 0; bottom: 0; width: 6px; cursor: ew-resize; }
+    .el-resize.e { right: -3px; }
+    .el-resize.w { left: -3px; }
+    .el-resize.n, .el-resize.s { left: 0; right: 0; height: 6px; cursor: ns-resize; }
+    .el-resize.n { top: -3px; }
+    .el-resize.s { bottom: -3px; }
+    .el-resize.ne, .el-resize.nw, .el-resize.se, .el-resize.sw { width: 9px; height: 9px; z-index: 13; }
+    .el-resize.ne { top: -4px; right: -4px; cursor: nesw-resize; }
+    .el-resize.sw { bottom: -4px; left: -4px; cursor: nesw-resize; }
+    .el-resize.nw { top: -4px; left: -4px; cursor: nwse-resize; }
+    .el-resize.se { bottom: -4px; right: -4px; cursor: nwse-resize; }
+    .el-resize:hover, .el-resize.active { background: rgba(0, 120, 212, .35); border-radius: 2px; }
+    .draggable.el-resizing { outline: 2px dashed var(--vscode-focusBorder, #0078d4); outline-offset: 1px; z-index: 20; }
+    .el-resize-label { right: auto; bottom: auto; }
+    /* Stretch handles on a text's box, placed on its drawn lines (inset half a cell from the box element) */
+    .box-resize { position: absolute; z-index: 12; touch-action: none; display: none; }
+    .box.stretchable:hover > .box-resize, .box.owner-hover > .box-resize, .box.owner-selected > .box-resize, .box.box-resizing > .box-resize { display: block; }
+    body.tab-order-active .box-resize { display: none !important; }
+    .box-resize.n, .box-resize.s { left: calc(var(--col-w) / 2); right: calc(var(--col-w) / 2); height: 6px; cursor: ns-resize; }
+    .box-resize.n { top: calc(var(--row-h) / 2 - 3px); }
+    .box-resize.s { top: calc(100% - var(--row-h) / 2 - 3px); }
+    .box-resize.e, .box-resize.w { top: calc(var(--row-h) / 2); bottom: calc(var(--row-h) / 2); width: 6px; cursor: ew-resize; }
+    .box-resize.w { left: calc(var(--col-w) / 2 - 3px); }
+    .box-resize.e { right: calc(var(--col-w) / 2 - 3px); }
+    .box-resize.ne, .box-resize.nw, .box-resize.se, .box-resize.sw { width: 9px; height: 9px; z-index: 13; }
+    .box-resize.nw, .box-resize.ne { top: calc(var(--row-h) / 2 - 4px); }
+    .box-resize.sw, .box-resize.se { top: calc(100% - var(--row-h) / 2 - 4px); }
+    .box-resize.nw, .box-resize.sw { left: calc(var(--col-w) / 2 - 4px); }
+    .box-resize.ne, .box-resize.se { right: calc(var(--col-w) / 2 - 4px); }
+    .box-resize.nw, .box-resize.se { cursor: nwse-resize; }
+    .box-resize.ne, .box-resize.sw { cursor: nesw-resize; }
+    .box-resize:hover, .box-resize.active { background: rgba(0, 120, 212, .35); border-radius: 2px; }
+    /* In-place editing of the window header and texts */
+    .inline-edit {
+      font: inherit; letter-spacing: inherit; user-select: text;
+      color: var(--vscode-input-foreground, inherit);
+      background: var(--vscode-input-background, #fff);
+      border: 1px solid var(--vscode-focusBorder, #0078d4); border-radius: 2px;
+      outline: none; margin: 0; padding: 0 3px; box-sizing: content-box; min-width: 4ch;
+    }
+    .titlebar .inline-edit { height: 18px; line-height: 18px; background: rgba(255, 255, 255, .9); color: #000; border-color: rgba(0, 0, 0, .55); }
+    .grid .inline-edit { position: relative; z-index: 20; height: 1.3em; line-height: 1.3em; margin: -0.15em 0 0 -4px; }
+    .text.inline-editing > .delete-button, .text.inline-editing > .insertion-point { display: none; }
+    /* Lift the delete button above the top edge so it doesn't cover the e/ne stretch handles */
+    .field > .delete-button, .image > .delete-button, .preview > .delete-button { top: -17px; right: -6px; z-index: 14; }
   /* Boxes */
   .box { position: relative; border: 0; background: transparent; box-sizing: border-box; z-index: 0; }
   .box .hrow { position: absolute; height: 0; border-top: 1px solid var(--vscode-editorWidget-border); }
@@ -2473,6 +3114,8 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     .grid.drag-over { background-color: rgba(0, 120, 212, 0.1); }
     
     .text { align-self: center; white-space: nowrap; padding: 0; font-family: inherit; font-size: inherit; line-height: 1em; height: 1em; }
+    /* Text hugs its rendered width; fitTextSpans() sizes the grid span to match */
+    .grid > .text { justify-self: start; width: max-content; min-width: var(--col-w); }
     .field { display: flex; align-items: center; padding: 0; }
     .field select, .field input {
       width: 100%; padding: 0; margin: 0; border: 0; outline: 1px solid var(--vscode-input-border);
@@ -2483,6 +3126,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     /* Dropdown affordance */
     .field select { padding-right: 14px; }
     .field.dropdown { position: relative; }
+    .field select option.fv-missing, .field select option.fv-database { font-style: italic; color: rgba(0,0,0,0.5); }
     .field.dropdown::after {
       content: "▾"; /* down arrow */
       position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
@@ -2504,9 +3148,11 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     .field.transparent input, .field.transparent select { outline: none; background: transparent; }
 
     /* Push buttons */
-    .push { display: inline-flex; align-items: center; gap: 6px; height: calc(1em + 15px); font-family: inherit; font-size: inherit; }
+    /* Push buttons hug their content like text; fitTextSpans() sizes the grid span to match */
+    .push { display: inline-flex; align-items: center; gap: 0.4em; align-self: center; height: 1em; font-family: inherit; font-size: inherit; }
+    .grid > .push { justify-self: start; width: max-content; min-width: var(--col-w); }
     .push .label { white-space: nowrap; line-height: 1em; }
-    .push.select { align-items: center; height: calc(1em + 15px); }
+    .push.select { height: auto; }
     .push .btn { padding: 1px 6px; background: rgba(255,255,255,1); color: rgba(0,0,0,1); border: 1px solid var(--vscode-input-border); border-radius: 4px; font-family: inherit; font-size: inherit; line-height: calc(1em); cursor: default; }
     .push input[type="radio"], .push input[type="checkbox"] { width: 1em; height: 1em; margin: 0; }
 
@@ -2647,6 +3293,8 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
       font-size: 11px;
       color: rgba(0,0,0,0.6);
     }
+    .modal-field small.fv-hint { display: block; white-space: pre-line; font-style: italic; }
+    .modal-field small.fv-hint:empty { display: none; }
     .modal-buttons {
       display: flex;
       gap: 8px;
@@ -2669,6 +3317,63 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     }
     .modal-button:hover {
       opacity: 0.9;
+    }
+    .modal-button.danger {
+      background: #c42b1c;
+      border-color: #c42b1c;
+      color: #fff;
+    }
+    .modal-discard-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      padding: 8px 10px;
+      border: 1px solid rgba(196, 43, 28, 0.35);
+      border-radius: 4px;
+      background: rgba(196, 43, 28, 0.08);
+      font-size: 12px;
+      color: rgba(0,0,0,1);
+    }
+    .modal-discard-bar span { margin-right: auto; font-weight: 600; }
+    .context-menu-item.kbd-active { background: rgba(0, 120, 212, 0.1); }
+    .context-menu-shortcut {
+      margin-left: auto;
+      padding-left: 24px;
+      font-size: 11px;
+      color: rgba(0,0,0,0.5);
+    }
+    .shortcuts-modal { max-width: 640px; }
+    .shortcuts-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px 16px;
+      align-items: center;
+      max-height: 60vh;
+      overflow: auto;
+      font-size: 12px;
+      color: rgba(0,0,0,1);
+    }
+    .shortcuts-grid h4 {
+      grid-column: 1 / -1;
+      margin: 10px 0 0;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      color: rgba(0,0,0,0.6);
+    }
+    .shortcuts-grid h4:first-child { margin-top: 0; }
+    .shortcuts-grid kbd {
+      display: inline-block;
+      margin-right: 2px;
+      padding: 1px 6px;
+      border: 1px solid rgba(0,0,0,0.25);
+      border-bottom-width: 2px;
+      border-radius: 3px;
+      background: #f6f6f6;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      white-space: nowrap;
     }
     .hidden { display: none !important; }
 
@@ -2827,15 +3532,25 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
       z-index: 5;
       box-sizing: border-box;
     }
+    /* Where a dragged element will land */
+    .drop-target-outline {
+      position: absolute;
+      border: 2px dashed var(--vscode-focusBorder, #0078d4);
+      pointer-events: none;
+      z-index: 101;
+      box-sizing: border-box;
+    }
   `;
 
   const texts = model.texts.map(t => {
-    const span = Math.max(1, Math.min(32, (t.content?.length ?? 6)));
-    const dataIdx = t.index != null ? ` data-text-idx="${t.index}"` : '';
+    // Initial guess; the page measures the rendered text and tightens it (fitTextSpans)
+    const span = Math.max(1, t.content?.length ?? 1);
+    const dataIdx = t.index != null ? ` data-text-idx="${t.index}"` : ' data-unindexed="1"';
     // Find associated box for this text element to store box dimensions
     const associatedBox = model.boxes.find(b => b.row === t.row && b.col === t.col);
-    const boxData = associatedBox ? ` data-box-rows="${associatedBox.rows}" data-box-cols="${associatedBox.cols}"` : '';
-    return `<div class="text draggable"${dataIdx}${boxData} draggable="true" data-type="text" data-row="${t.row}" data-col="${t.col}" style="grid-row:${t.row}; grid-column:${t.col} / span ${span};">
+    const boxData = associatedBox ? ` data-box-rows="${associatedBox.rows}" data-box-cols="${associatedBox.cols}" data-col-offset="${BOX_LABEL_OFFSET}"` : '';
+    const drawCol = t.col + (associatedBox ? BOX_LABEL_OFFSET : 0);
+    return `<div class="text draggable"${dataIdx}${boxData} draggable="true" data-type="text" data-row="${t.row}" data-col="${t.col}" style="grid-row:${t.row}; grid-column:${drawCol} / span ${span};">
       <div class="insertion-point" title="Insertion Point"></div>
       <div class="delete-button" title="Delete">×</div>
       ${escapeHtml(t.content || '')}
@@ -2856,11 +3571,12 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
 
     // Left segment on top line: allow width to apply (unset right)
     if (leftSegW > 0) {
-      parts.push(`<div class="hrow top" style="left:${inset}; right:auto; width: calc(${leftSegW} * var(--col-w));"></div>`);
+      parts.push(`<div class="hrow top gap-left" style="left:${inset}; right:auto; width: calc(${leftSegW} * var(--col-w));"></div>`);
     }
-    // Right segment on top line: pin right inset, no width needed
-    if (rightSegL < cspan) {
-      parts.push(`<div class="hrow top" style="left: calc(${rightSegL} * var(--col-w)); right: ${inset};"></div>`);
+    // Right segment on top line: pin right inset, no width needed. Emitted even when the character
+    // estimate fills the box, since the page re-places it from the measured label width (fitBoxGaps)
+    if (rightSegL < cspan || gw > 0) {
+      parts.push(`<div class="hrow top gap-right" style="left: calc(${rightSegL} * var(--col-w)); right: ${inset};"></div>`);
     }
     // Bottom full-width line, inset to column centers on both sides
     parts.push(`<div class="hrow bottom" style="left:${inset}; right:${inset};"></div>`);
@@ -2869,7 +3585,12 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     parts.push(`<div class="vline left"></div>`);
     parts.push(`<div class="vline right"></div>`);
 
-    return `<div class="box" style="grid-row:${b.row} / span ${rspan}; grid-column:${b.col} / span ${cspan};">${parts.join('')}</div>`;
+    // A box belonging to an indexed text gets stretch handles (its size lives in that text's #[rows,cols]*)
+    const owner = model.texts.find(t => t.row === b.row && t.col === b.col && t.index != null);
+    const stretch = owner ? ` data-text-idx="${owner.index}"` : '';
+    const handles = owner ? boxResizeHandles() : '';
+
+    return `<div class="box${owner ? ' stretchable' : ''}"${stretch} data-row="${b.row}" data-col="${b.col}" style="grid-row:${b.row} / span ${rspan}; grid-column:${b.col} / span ${cspan};">${parts.join('')}${handles}</div>`;
   }).join('\n');
 
   const hiddenFields = model.fields.filter(f => isHiddenFieldPosition(f.row, f.col));
@@ -2879,21 +3600,22 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     const control = isDropdown
       ? `<select ${f.locked ? 'disabled' : ''}>
           <option value="" disabled selected>${escapeHtml(prettyName(f.name))}</option>
-          ${f.values.map(v => `<option>${escapeHtml(v)}</option>`).join('')}
+          ${expandDropdownValues(f.values).map(o => `<option${o.kind ? ` class="fv-${o.kind}"` : ''}${o.title ? ` title="${escapeAttr(o.title)}"` : ''}>${escapeHtml(o.label)}</option>`).join('')}
         </select>`
       : `<input type="text" ${f.locked ? 'disabled' : ''} placeholder="${escapeHtml(prettyName(f.name))}">`;
     const cls = `field draggable${f.locked ? ' locked' : ''}${isDropdown ? ' dropdown' : ''}${f.rightAlign ? ' right-align' : ''}${f.centerAlign ? ' center-align' : ''}${f.transparent ? ' transparent' : ''}`;
     const span = Math.max(1, f.len + (f.values.length > 0 ? 2 : 0));
     // Use field index if available, otherwise use position-based index (0-based)
     const fieldIdx = f.index != null ? f.index : model.fields.indexOf(f);
-    const dataIdx = ` data-field-idx="${fieldIdx}"`;
+    const dataIdx = ` data-field-idx="${fieldIdx}"${f.index == null ? ' data-no-index="1"' : ''}`;
     const typeExpr = (f.typeExpr ?? '').trim() || String(f.type);
     const dataValues = f.values.length > 0 ? ` data-field-values="${escapeAttr(JSON.stringify(f.values))}"` : '';
     const dataNameFormat = f.nameFormat ? ` data-field-nameformat="${escapeAttr(JSON.stringify(f.nameFormat))}"` : '';
-    return `<div class="${cls}"${dataIdx} draggable="true" data-type="field" data-row="${f.row}" data-col="${f.col}" data-field-name="${escapeAttr(f.name)}" data-field-type="${escapeAttr(typeExpr)}" data-field-len="${f.len}"${dataValues}${dataNameFormat} style="grid-row:${f.row}; grid-column:${f.col} / span ${span};">
+    return `<div class="${cls}"${dataIdx} draggable="true" data-type="field" data-row="${f.row}" data-col="${f.col}" data-field-name="${escapeAttr(f.name)}" data-field-type="${escapeAttr(typeExpr)}" data-field-len="${f.len}" data-field-extra="${isDropdown ? 2 : 0}"${dataValues}${dataNameFormat} style="grid-row:${f.row}; grid-column:${f.col} / span ${span};">
       <div class="insertion-point" title="Insertion Point"></div>
       <div class="delete-button" title="Delete">×</div>
       ${control}
+      ${f.index != null ? elementResizeHandles(['w', 'e']) : ''}
     </div>`;
   }).join('\n');
 
@@ -2902,7 +3624,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
   const bottomBarButtons = (model.pushbuttons || []).filter(pb => pb.isBottomBar);
   
   const push = regularButtons.map(pb => {
-    const dataIdx = pb.index != null ? ` data-push-idx="${pb.index}" data-pb-idx="${pb.index}"` : '';
+    const dataIdx = pb.index != null ? ` data-push-idx="${pb.index}" data-pb-idx="${pb.index}"` : ' data-unindexed="1"';
     const dataKind = ` data-pb-kind="${pb.kind}"`;
     const dataName = pb.name ? ` data-pb-name="${escapeAttr(pb.name)}"` : '';
     const dataValue = pb.value ? ` data-pb-value="${escapeAttr(pb.value)}"` : '';
@@ -2929,7 +3651,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
   
   // Render bottom bar buttons
   const bottomBarHtml = bottomBarButtons.length > 0 ? bottomBarButtons.map(pb => {
-    const dataIdx = pb.index != null ? ` data-push-idx="${pb.index}" data-pb-idx="${pb.index}"` : '';
+    const dataIdx = pb.index != null ? ` data-push-idx="${pb.index}" data-pb-idx="${pb.index}"` : ' data-unindexed="1"';
     const dataKind = ` data-pb-kind="${pb.kind}"`;
     const dataName = pb.name ? ` data-pb-name="${escapeAttr(pb.name)}"` : '';
     const dataValue = pb.value ? ` data-pb-value="${escapeAttr(pb.value)}"` : '';
@@ -2994,7 +3716,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     }
     // const valueSummary = f.values.length > 0 ? ` | values ${f.values.length}` : '';
     return `
-    <div class="trigger-item hidden-field-item" draggable="true" data-type="field" data-field-idx="${fieldIdx}" data-row="${f.row}" data-col="${f.col}" onclick="showHiddenFieldInSource(${fieldIdx})" title="Drag onto the preview to unhide, or click to show in source">
+    <div class="trigger-item hidden-field-item" draggable="true" data-type="field" data-field-idx="${fieldIdx}" data-row="${f.row}" data-col="${f.col}" data-span="${Math.max(1, f.len + (f.values.length > 0 ? 2 : 0))}" onclick="showHiddenFieldInSource(${fieldIdx})" title="Drag onto the preview to unhide, or click to show in source">
       <div class="trigger-target">Field ${fieldIdx} - ${escapeHtml(f.name)}</div>
       <div class="trigger-actions">
         <button class="trigger-action-btn delete" onclick="deleteHiddenField(event, ${fieldIdx})" title="Delete">×</button>
@@ -3013,6 +3735,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
       <div class="insertion-point" title="Insertion Point"></div>
       <div class="delete-button" title="Delete">×</div>
       <img${srcAttr} alt="${alt}" />
+      ${img.index != null ? elementResizeHandles(['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) : ''}
     </div>`;
   }).join('\n');
 
@@ -3029,6 +3752,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         <div class="preview-label">${escapeHtml(prev.portType)}</div>
         <div class="preview-path">${escapeHtml(prev.path)}</div>
       </div>
+      ${prev.index != null ? elementResizeHandles(['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) : ''}
     </div>`;
   }).join('\n');
 
@@ -3133,6 +3857,10 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
     </script>
   </head>
   <body>
+    ${unindexedMsg ? `<div class="unindexed-strip">
+      <span class="msg">${escapeHtml(unindexedMsg.title)}<span class="detail">${escapeHtml(unindexedMsg.detail)}</span></span>
+      <button onclick="window.__frmVscodeApi && window.__frmVscodeApi.postMessage({ command: 'autoIndex' })">Auto-add indexes</button>
+    </div>` : ''}
     <div class="window">
       <div class="titlebar">
         <div class="caption">
@@ -3153,6 +3881,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
             <button id="tabOrderBtn" class="ctrl" style="gap:6px; width:auto;" title="Set tab order for fields">
               Tab Order
             </button>
+            <button id="shortcutsBtn" class="ctrl" title="Keyboard shortcuts (?)">⌨</button>
           </div>
         <div class="controls">
           <button class="ctrl close" title="Close">✕</button>
@@ -3164,15 +3893,23 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
           ${model.tabs.map((t,i) => `<div class="tab${i===0?' active':''}" data-tab-id="${t.id}" title="${escapeHtml(t.label)}">${escapeHtml(t.label.replace(/_/g, ' '))}</div>`).join('')}
         </div>` : ''}
         <div class="main-container">
-          <div>
+          <div class="form-area">
+            <div class="grid-frame" id="gridFrame">
             <div class="grid gridlines" style="width: calc(${model.cols} * var(--col-w) + ${(model.cols - 1)} * var(--col-gap)); height: calc(${model.rows} * var(--row-h) + ${(model.rows - 1)} * var(--row-gap));">
               <div id="gridCellHighlight" class="grid-cell-highlight hidden"></div>
+              <div id="dropTargetOutline" class="drop-target-outline hidden"></div>
               ${boxesHtml}
               ${texts}
               ${fields}
               ${push}
               ${images}
               ${previews}
+            </div>
+              <div class="resize-handle e" data-resize="e" title="Drag to change width (port_size cols). Right-click to set to auto."></div>
+              <div class="resize-handle s" data-resize="s" title="Drag to change height (port_size rows). Right-click to set to auto."></div>
+              <div class="resize-handle se" data-resize="se" title="Drag to change port_size. Right-click to set to auto."></div>
+              <div id="resizeSizeLabel" class="resize-size-label hidden"></div>
+              <div id="elResizeLabel" class="resize-size-label el-resize-label hidden"></div>
             </div>
             ${bottomBarHtml ? `
             <div class="bottom-bar">
@@ -3221,9 +3958,19 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
 
     <!-- Element Context Menu -->
     <div id="elementContextMenu" class="context-menu hidden">
-      <div class="context-menu-item" data-action="edit-element">Edit</div>
+      <div class="context-menu-item" data-action="edit-element">Edit<span class="context-menu-shortcut">F2</span></div>
+      <div class="context-menu-item hidden" data-action="toggle-box" id="toggleBoxMenuItem">Add Box</div>
+      <div class="context-menu-item" data-action="duplicate-element">Duplicate<span class="context-menu-shortcut" data-kbd-mod>Ctrl+D</span></div>
       <div class="context-menu-item" data-action="move-element" id="moveElementMenuItem">Set Tab Visibility</div>
       <div class="context-menu-item" data-action="show-in-source">Show in Source</div>
+      <div class="context-menu-item" data-action="delete-element">Delete<span class="context-menu-shortcut">Del</span></div>
+    </div>
+
+    <!-- Window Resize Handle Context Menu -->
+    <div id="resizeContextMenu" class="context-menu hidden">
+      <div class="context-menu-item" data-resize-action="size">Set size to auto</div>
+      <div class="context-menu-item" data-resize-action="width">Set width to auto</div>
+      <div class="context-menu-item" data-resize-action="height">Set height to auto</div>
     </div>
 
     <!-- Outside Grid Context Menu -->
@@ -3233,8 +3980,8 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
 
     <!-- Tab Order Mode Context Menu -->
     <div id="tabOrderContextMenu" class="context-menu hidden">
-      <div class="context-menu-item" data-action="confirm-tab-order" style="color: var(--vscode-button-background, #0078d4); font-weight: 600;">✓ Confirm Tab Order</div>
-      <div class="context-menu-item" data-action="cancel-tab-order" style="color: #c42b1c;">✕ Cancel</div>
+      <div class="context-menu-item" data-action="confirm-tab-order" style="color: var(--vscode-button-background, #0078d4); font-weight: 600;">✓ Confirm Tab Order<span class="context-menu-shortcut">Enter</span></div>
+      <div class="context-menu-item" data-action="cancel-tab-order" style="color: #c42b1c;">✕ Cancel<span class="context-menu-shortcut">Esc</span></div>
     </div>
 
     <!-- Modal for Moving Element to Tab -->
@@ -3263,60 +4010,6 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
           <div class="modal-buttons">
             <button class="modal-button" data-action="cancel">Cancel</button>
             <button class="modal-button primary" data-action="confirm-move">Confirm</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal for Header Edit -->
-    <div id="headerModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3>Edit Window Header</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label>Header</label>
-            <input type="text" id="headerContent" placeholder="e.g., Multi-joist" />
-            <small>The title shown in the window header</small>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-header">Confirm</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal for Text Input -->
-    <div id="textModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="textModalTitle">Add Text</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label>Text Content</label>
-            <input type="text" id="textContent" placeholder="Enter text to display" />
-            <small>The text that will be displayed on the form</small>
-          </div>
-          <div class="modal-field">
-            <label style="display: flex; align-items: center; gap: 8px;">
-              <input type="checkbox" id="textHasBox" />
-              <span>Create Box Around Text</span>
-            </label>
-          </div>
-          <div id="textBoxDimensions" class="hidden" style="display: flex; gap: 12px;">
-            <div class="modal-field" style="flex: 1;">
-              <label>Box Rows</label>
-              <input type="number" id="textBoxRows" value="5" min="1" />
-              <small>Height in rows</small>
-            </div>
-            <div class="modal-field" style="flex: 1;">
-              <label>Box Columns</label>
-              <input type="number" id="textBoxCols" value="20" min="1" />
-              <small>Width in columns</small>
-            </div>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-text">Confirm</button>
           </div>
         </div>
       </div>
@@ -3524,7 +4217,8 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
           <div class="modal-field">
             <label>Dropdown Values (optional)</label>
             <textarea id="fieldValues" placeholder='One per line, or "value1" "value2". Can also use description syntax like "Description [realvalue]*" "Description2 [realvalue2]*"'></textarea>
-            <small>For dropdown fields, enter choices (one per line or quoted)</small>
+            <small>For dropdown fields, enter choices (one per line or quoted). "path:name" reads choices from forms/fieldvalues</small>
+            <small id="fieldValuesHint" class="fv-hint"></small>
           </div>
           <div class="modal-buttons">
             <button class="modal-button" data-action="cancel">Cancel</button>
@@ -3648,6 +4342,39 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
       </div>
     </div>
 
+    <!-- Keyboard Shortcuts -->
+    <div id="shortcutsModal" class="modal-overlay hidden">
+      <div class="modal shortcuts-modal">
+        <h3>Keyboard Shortcuts</h3>
+        <div class="shortcuts-grid">
+          <h4>Selected element</h4>
+          <span><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span><span>Move one cell</span>
+          <span><kbd>Shift</kbd>+<kbd>Arrow</kbd></span><span>Stretch (fields, images, previews)</span>
+          <span><kbd>F2</kbd> / <kbd>Enter</kbd></span><span>Edit</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>D</kbd></span><span>Duplicate one row below</span>
+          <span><kbd>Del</kbd> / <kbd>Backspace</kbd></span><span>Delete</span>
+          <span><kbd>Esc</kbd></span><span>Deselect</span>
+          <h4>Form</h4>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Z</kbd></span><span>Undo (shared with the .frm source)</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Y</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></span><span>Redo</span>
+          <span><kbd>Enter</kbd> / <kbd>Esc</kbd></span><span>Confirm / cancel tab order (in tab-order mode)</span>
+          <span><kbd>?</kbd></span><span>Show this list</span>
+          <h4>Dialogs</h4>
+          <span><kbd>Esc</kbd></span><span>Cancel, discarding changes</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Enter</kbd></span><span>Confirm</span>
+          <span><kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd></span><span>Next / previous input</span>
+          <span>Click outside</span><span>Close (asks first if anything changed)</span>
+          <h4>Context menus</h4>
+          <span><kbd>↑</kbd><kbd>↓</kbd></span><span>Move highlight</span>
+          <span><kbd>Enter</kbd></span><span>Choose highlighted item</span>
+          <span><kbd>Esc</kbd></span><span>Close menu</span>
+        </div>
+        <div class="modal-buttons">
+          <button class="modal-button primary" data-action="cancel">Close</button>
+        </div>
+      </div>
+    </div>
+
     <script>
     (function(){
       var vscodeApi;
@@ -3681,6 +4408,50 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
           var w = w - 1;
           probe.remove();
           root.style.setProperty('--col-w', w + 'px');
+        } catch (e) { /* ignore */ }
+        fitTextSpans();
+      }
+
+      // Each text's and push button's grid span = its rendered width in whole columns (min 1), so drop outlines
+      // and the keep-inside-window checks use the size you see. Re-run when the font size changes.
+      // Columns between an element's file column and where it is drawn (boxed text labels)
+      function colOffset(el) {
+        return (el && parseInt(el.getAttribute('data-col-offset'), 10)) || 0;
+      }
+
+      // Start the box's top line to the right of a boxed label at the measured end of the text,
+      // leaving the same space as between the left line segment and the start of the text
+      function fitBoxGaps() {
+        document.querySelectorAll('.grid > .text[data-box-rows]').forEach(function(el) {
+          var box = document.querySelector('.grid > .box[data-row="' + el.getAttribute('data-row') + '"][data-col="' + el.getAttribute('data-col') + '"]');
+          var right = box && box.querySelector('.hrow.top.gap-right');
+          if (!right) return;
+          var left = box.querySelector('.hrow.top.gap-left');
+          var t = el.getBoundingClientRect();
+          var b = box.getBoundingClientRect();
+          var pad = t.left - (left ? left.getBoundingClientRect().right : b.left);
+          var start = t.right - b.left + Math.max(0, pad);
+          right.style.left = start + 'px';
+          right.style.display = start < b.width - parseFloat(getComputedStyle(right).right || '0') ? '' : 'none';
+        });
+      }
+
+      function fitTextSpans() {
+        try {
+          var m = getGridMetrics();
+          if (!m || !(m.colPitch > 0)) return;
+          var colGap = m.colPitch - m.colWidth;
+          document.querySelectorAll('.grid > .text.draggable, .grid > .push.draggable').forEach(function(el) {
+            var w = el.getBoundingClientRect().width;
+            if (!(w > 0)) return; // hidden (other tab): keep the estimate until it is shown
+            var span =Math.max(1, Math.ceil((w + colGap) / m.colPitch - 0.01));
+            var col = parseInt(el.getAttribute('data-col'), 10);
+            if (!isFinite(col)) return;
+            el.style.gridColumn = (col + colOffset(el)) + ' / span ' + span;
+          });
+          fitBoxGaps();
+          // Spans changed: refresh which elements reach outside the window
+          if (typeof gridRows === 'number' && typeof gridCols === 'number') updateOverflow(gridRows, gridCols);
         } catch (e) { /* ignore */ }
       }
 
@@ -3836,6 +4607,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
               var id = Number(tb.getAttribute('data-tab-id'));
               currentActiveTab = id;
               applyTab(id);
+              fitTextSpans();
               try {
                 if (vscodeApi && vscodeApi.postMessage) {
                   vscodeApi.postMessage({ command: 'setActiveTab', id: id });
@@ -3904,6 +4676,14 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
           }
         }
 
+        // Texts toggle their box from here
+        var boxItem = document.getElementById('toggleBoxMenuItem');
+        if (boxItem) {
+          var isText = elementType === 'text' && isFinite(elementIndex);
+          boxItem.classList.toggle('hidden', !isText);
+          if (isText) boxItem.textContent = element && element.hasAttribute('data-box-rows') ? 'Remove Box' : 'Add Box';
+        }
+
         menu.classList.remove('hidden');
         menu.style.left = x + 'px';
         menu.style.top = y + 'px';
@@ -3928,23 +4708,38 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         if (menu) menu.classList.add('hidden');
       }
 
+      // Cell size measured from the rendered grid. The CSS variables can't be parsed for this:
+      // --row-h is "calc(2ch + 16px)" and depends on the zoomed font size.
+      function getGridMetrics() {
+        var grid = document.querySelector('.grid');
+        if (!grid) return null;
+        var rect = grid.getBoundingClientRect();
+        var cs = getComputedStyle(grid);
+        var colGap = parseFloat(cs.columnGap) || 0;
+        var rowGap = parseFloat(cs.rowGap) || 0;
+        var rows = (typeof gridRows === 'number' && gridRows > 0) ? gridRows : ${model.rows};
+        var cols = (typeof gridCols === 'number' && gridCols > 0) ? gridCols : ${model.cols};
+        var rowPitch = (rect.height + rowGap) / rows;
+        var colPitch = (rect.width + colGap) / cols;
+        return {
+          rect: rect, rows: rows, cols: cols,
+          rowPitch: rowPitch, colPitch: colPitch,
+          rowHeight: rowPitch - rowGap, colWidth: colPitch - colGap
+        };
+      }
+
+      function placeOnGrid(el, m, row, col, rowSpan, colSpan) {
+        el.style.left = ((col - 1) * m.colPitch) + 'px';
+        el.style.top = ((row - 1) * m.rowPitch) + 'px';
+        el.style.width = ((colSpan || 1) * m.colPitch - (m.colPitch - m.colWidth)) + 'px';
+        el.style.height = ((rowSpan || 1) * m.rowPitch - (m.rowPitch - m.rowHeight)) + 'px';
+      }
+
       function showGridCellHighlight(row, col) {
         var highlight = document.getElementById('gridCellHighlight');
-        if (!highlight) return;
-        
-        var colWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--col-w')) || 8;
-        var rowHeight = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 27;
-        var colGap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--col-gap')) || 0;
-        var rowGap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-gap')) || 0;
-        
-        // Calculate position (0-indexed for positioning)
-        var left = (col - 1) * (colWidth + colGap);
-        var top = (row - 1) * (rowHeight + rowGap);
-        
-        highlight.style.left = left + 'px';
-        highlight.style.top = top + 'px';
-        highlight.style.width = colWidth + 'px';
-        highlight.style.height = rowHeight + 'px';
+        var m = getGridMetrics();
+        if (!highlight || !m) return;
+        placeOnGrid(highlight, m, row, col, 1, 1);
         highlight.classList.remove('hidden');
       }
 
@@ -3955,12 +4750,148 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
 
       function showModal(modalId) {
         var modal = document.getElementById(modalId);
-        if (modal) modal.classList.remove('hidden');
+        if (!modal) return;
+        hideAllContextMenus();
+        modal.classList.remove('hidden');
+        hideDiscardBar(modal, false);
+        focusFirstModalInput(modal);
+        // Snapshot after the caller has filled in the form (callers do that synchronously around this call)
+        modal.__frmSnapshot = undefined;
+        setTimeout(function() {
+          if (!modal.classList.contains('hidden')) modal.__frmSnapshot = modalSnapshot(modal);
+        }, 0);
       }
 
       function hideModal(modalId) {
         var modal = document.getElementById(modalId);
-        if (modal) modal.classList.add('hidden');
+        if (!modal) return;
+        modal.classList.add('hidden');
+        hideDiscardBar(modal, false);
+        if (!topModal()) restoreCanvasFocus();
+      }
+
+      // Type, index and the data the edit dialogs need, read from a rendered element
+      function collectElementInfo(element) {
+        var elementType = element.getAttribute('data-type');
+        var elementIndex = 0;
+        var elementData = {
+          row: parseInt(element.getAttribute('data-row')),
+          col: parseInt(element.getAttribute('data-col'))
+        };
+
+        // Get element index based on type
+        if (elementType === 'text') {
+          elementIndex = parseInt(element.getAttribute('data-text-idx'));
+        } else if (elementType === 'field') {
+          elementIndex = parseInt(element.getAttribute('data-field-idx'));
+        } else if (elementType === 'pushbutton') {
+          elementIndex = parseInt(element.getAttribute('data-pb-idx'));
+        } else if (elementType === 'image') {
+          elementIndex = parseInt(element.getAttribute('data-image-idx'));
+        } else if (elementType === 'preview') {
+          elementIndex = parseInt(element.getAttribute('data-preview-idx'));
+        }
+
+        // Get element-specific data from the element
+        if (elementType === 'text') {
+          // Get text content excluding drag-handle and delete-button
+          var textContent = '';
+          for (var i = 0; i < element.childNodes.length; i++) {
+            var node = element.childNodes[i];
+            // Include text nodes and skip delete-button elements
+            if (node.nodeType === 3) { // Text node
+              textContent += node.textContent;
+            } else if (node.nodeType === 1 && !node.classList.contains('delete-button') && !node.classList.contains('insertion-point')) {
+              textContent += node.textContent;
+            }
+          }
+          elementData.content = textContent.trim();
+          // Extract box dimensions if present
+          var boxRows = element.getAttribute('data-box-rows');
+          var boxCols = element.getAttribute('data-box-cols');
+          if (boxRows && boxCols) {
+            elementData.boxRows = parseInt(boxRows);
+            elementData.boxCols = parseInt(boxCols);
+          }
+        } else if (elementType === 'field') {
+          elementData.name = element.getAttribute('data-field-name') || '';
+          const nameFormatAttr = element.getAttribute('data-field-nameformat');
+          try {
+            elementData.nameFormat = nameFormatAttr ? JSON.parse(nameFormatAttr) : {};
+          } catch (e) {
+            elementData.nameFormat = {};
+          }
+          const rawFieldType = element.getAttribute('data-field-type');
+          elementData.type = rawFieldType && rawFieldType.trim()
+            ? rawFieldType.trim()
+            : (element.classList.contains('locked') ? '4' : '1');
+          // Use stored length attribute to avoid including dropdown padding
+          const storedLen = element.getAttribute('data-field-len');
+          if (storedLen) {
+            elementData.len = parseInt(storedLen);
+          } else {
+            // Fallback: extract from grid span and subtract 2 if dropdown
+            const span = element.style.gridColumnEnd ? 
+              parseInt(element.style.gridColumnEnd.replace('span ', '')) : 10;
+            const isDropdown = element.classList.contains('dropdown');
+            elementData.len = isDropdown ? Math.max(1, span - 2) : span;
+          }
+          const rawValues = element.getAttribute('data-field-values');
+          if (rawValues) {
+            try {
+              elementData.values = JSON.parse(rawValues);
+            } catch (e) {
+              elementData.values = [];
+            }
+          } else {
+            elementData.values = [];
+          }
+        } else if (elementType === 'pushbutton') {
+          var labelEl = element.querySelector('.label, .btn');
+          elementData.label = labelEl ? labelEl.textContent.trim() : '';
+          var kindAttr = element.getAttribute('data-pb-kind');
+          elementData.kind = kindAttr || (element.classList.contains('checkbox') ? 'checkbox' : element.classList.contains('radio') ? 'radio' : 'select');
+          var dataName = element.getAttribute('data-pb-name');
+          if (dataName) {
+            elementData.name = dataName;
+          }
+          var dataValue = element.getAttribute('data-pb-value');
+          if (dataValue) {
+            elementData.value = dataValue;
+          }
+          if (!dataValue) {
+            if (elementData.kind === 'checkbox') {
+              elementData.value = '1;0';
+            } else if (elementData.kind === 'radio') {
+              elementData.value = '1';
+            }
+          }
+          var dataProgram = element.getAttribute('data-pb-program');
+          if (dataProgram) {
+            elementData.program = dataProgram;
+          }
+          var dataAction = element.getAttribute('data-pb-action');
+          if (dataAction) {
+            elementData.action = dataAction;
+          } else if (elementData.kind === 'checkbox' || elementData.kind === 'radio' || elementData.name) {
+            elementData.action = 'variable';
+          } else if (elementData.program) {
+            elementData.action = 'program';
+          }
+        } else if (elementType === 'preview') {
+          elementData.mode = element.getAttribute('data-preview-mode') || '0';
+          elementData.path = element.getAttribute('data-preview-path') || '$DIR_PICTS/file.vxp';
+          elementData.field = element.getAttribute('data-preview-field') || '';
+          elementData.portType = element.getAttribute('data-preview-porttype') || 'PORT_2D';
+          elementData.portStyle = element.getAttribute('data-preview-portstyle') || 'SIMPLE';
+          // Get rows and cols from data attributes
+          const rowsAttr = element.getAttribute('data-preview-rows');
+          const colsAttr = element.getAttribute('data-preview-cols');
+          elementData.rows = rowsAttr ? parseInt(rowsAttr) : 25;
+          elementData.cols = colsAttr ? parseInt(colsAttr) : 72;
+        }
+
+        return { type: elementType, index: elementIndex, data: elementData };
       }
 
       function setupContextMenu() {
@@ -3975,146 +4906,22 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
             e.preventDefault();
             e.stopPropagation();
             
-            var elementType = element.getAttribute('data-type');
-            var elementIndex = 0;
-            var elementData = {
-              row: parseInt(element.getAttribute('data-row')),
-              col: parseInt(element.getAttribute('data-col'))
-            };
-
-            // Get element index based on type
-            if (elementType === 'text') {
-              elementIndex = parseInt(element.getAttribute('data-text-idx'));
-            } else if (elementType === 'field') {
-              elementIndex = parseInt(element.getAttribute('data-field-idx'));
-            } else if (elementType === 'pushbutton') {
-              elementIndex = parseInt(element.getAttribute('data-pb-idx'));
-            } else if (elementType === 'image') {
-              elementIndex = parseInt(element.getAttribute('data-image-idx'));
-            } else if (elementType === 'preview') {
-              elementIndex = parseInt(element.getAttribute('data-preview-idx'));
-            }
-
-            // Get element-specific data from the element
-            if (elementType === 'text') {
-              // Get text content excluding drag-handle and delete-button
-              var textContent = '';
-              for (var i = 0; i < element.childNodes.length; i++) {
-                var node = element.childNodes[i];
-                // Include text nodes and skip delete-button elements
-                if (node.nodeType === 3) { // Text node
-                  textContent += node.textContent;
-                } else if (node.nodeType === 1 && !node.classList.contains('delete-button') && !node.classList.contains('insertion-point')) {
-                  textContent += node.textContent;
-                }
-              }
-              elementData.content = textContent.trim();
-              // Extract box dimensions if present
-              var boxRows = element.getAttribute('data-box-rows');
-              var boxCols = element.getAttribute('data-box-cols');
-              if (boxRows && boxCols) {
-                elementData.boxRows = parseInt(boxRows);
-                elementData.boxCols = parseInt(boxCols);
-              }
-            } else if (elementType === 'field') {
-              elementData.name = element.getAttribute('data-field-name') || '';
-              const nameFormatAttr = element.getAttribute('data-field-nameformat');
-              try {
-                elementData.nameFormat = nameFormatAttr ? JSON.parse(nameFormatAttr) : {};
-              } catch (e) {
-                elementData.nameFormat = {};
-              }
-              const rawFieldType = element.getAttribute('data-field-type');
-              elementData.type = rawFieldType && rawFieldType.trim()
-                ? rawFieldType.trim()
-                : (element.classList.contains('locked') ? '4' : '1');
-              // Use stored length attribute to avoid including dropdown padding
-              const storedLen = element.getAttribute('data-field-len');
-              if (storedLen) {
-                elementData.len = parseInt(storedLen);
-              } else {
-                // Fallback: extract from grid span and subtract 2 if dropdown
-                const span = element.style.gridColumnEnd ? 
-                  parseInt(element.style.gridColumnEnd.replace('span ', '')) : 10;
-                const isDropdown = element.classList.contains('dropdown');
-                elementData.len = isDropdown ? Math.max(1, span - 2) : span;
-              }
-              const rawValues = element.getAttribute('data-field-values');
-              if (rawValues) {
-                try {
-                  elementData.values = JSON.parse(rawValues);
-                } catch (e) {
-                  elementData.values = [];
-                }
-              } else {
-                elementData.values = [];
-              }
-            } else if (elementType === 'pushbutton') {
-              var labelEl = element.querySelector('.label, .btn');
-              elementData.label = labelEl ? labelEl.textContent.trim() : '';
-              var kindAttr = element.getAttribute('data-pb-kind');
-              elementData.kind = kindAttr || (element.classList.contains('checkbox') ? 'checkbox' : element.classList.contains('radio') ? 'radio' : 'select');
-              var dataName = element.getAttribute('data-pb-name');
-              if (dataName) {
-                elementData.name = dataName;
-              }
-              var dataValue = element.getAttribute('data-pb-value');
-              if (dataValue) {
-                elementData.value = dataValue;
-              }
-              if (!dataValue) {
-                if (elementData.kind === 'checkbox') {
-                  elementData.value = '1;0';
-                } else if (elementData.kind === 'radio') {
-                  elementData.value = '1';
-                }
-              }
-              var dataProgram = element.getAttribute('data-pb-program');
-              if (dataProgram) {
-                elementData.program = dataProgram;
-              }
-              var dataAction = element.getAttribute('data-pb-action');
-              if (dataAction) {
-                elementData.action = dataAction;
-              } else if (elementData.kind === 'checkbox' || elementData.kind === 'radio' || elementData.name) {
-                elementData.action = 'variable';
-              } else if (elementData.program) {
-                elementData.action = 'program';
-              }
-            } else if (elementType === 'preview') {
-              elementData.mode = element.getAttribute('data-preview-mode') || '0';
-              elementData.path = element.getAttribute('data-preview-path') || '$DIR_PICTS/file.vxp';
-              elementData.field = element.getAttribute('data-preview-field') || '';
-              elementData.portType = element.getAttribute('data-preview-porttype') || 'PORT_2D';
-              elementData.portStyle = element.getAttribute('data-preview-portstyle') || 'SIMPLE';
-              // Get rows and cols from data attributes
-              const rowsAttr = element.getAttribute('data-preview-rows');
-              const colsAttr = element.getAttribute('data-preview-cols');
-              elementData.rows = rowsAttr ? parseInt(rowsAttr) : 25;
-              elementData.cols = colsAttr ? parseInt(colsAttr) : 72;
-            }
-
-            showElementContextMenu(e.clientX, e.clientY, element, elementType, elementIndex, elementData);
+            var info = collectElementInfo(element);
+            showElementContextMenu(e.clientX, e.clientY, element, info.type, info.index, info.data);
             return;
           }
 
           // Right-click on empty grid space
           e.preventDefault();
           
-          var gridRect = this.getBoundingClientRect();
-          var colWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--col-w')) || 8;
-          var rowHeight = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 28;
-          var colGap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--col-gap')) || 0;
-          var rowGap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-gap')) || 0;
-          
-          var x = e.clientX - gridRect.left;
-          var y = e.clientY - gridRect.top;
-          
-          var col = Math.max(1, Math.ceil(x / (colWidth + colGap)));
-          var row = Math.max(1, Math.ceil(y / (rowHeight + rowGap)));
-          
-          col = Math.min(col, ${model.cols});
-          row = Math.min(row, ${model.rows});
+          var m = getGridMetrics();
+          if (!m) return;
+          var x = e.clientX - m.rect.left;
+          var y = e.clientY - m.rect.top;
+
+          // The cell under the pointer
+          var col = Math.min(m.cols, Math.max(1, Math.floor(x / m.colPitch) + 1));
+          var row = Math.min(m.rows, Math.max(1, Math.floor(y / m.rowPitch) + 1));
           
           showGridCellHighlight(row, col);
           showContextMenu(e.clientX, e.clientY, row, col);
@@ -4140,8 +4947,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
             
             switch(action) {
               case 'add-text':
-                showModal('textModal');
-                document.getElementById('textContent').focus();
+                startNewTextEdit(contextMenuState.row, contextMenuState.col);
                 break;
               case 'add-field':
                 showModal('fieldModal');
@@ -4188,22 +4994,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
               case 'edit-element':
                 // Open appropriate modal with existing data
                 if (elementType === 'text') {
-                  document.getElementById('textModalTitle').textContent = 'Edit Text';
-                  document.getElementById('textContent').value = elementData.content || '';
-                  // Populate box dimensions if present
-                  var hasBox = elementData.boxRows && elementData.boxCols;
-                  document.getElementById('textHasBox').checked = hasBox;
-                  if (hasBox) {
-                    document.getElementById('textBoxRows').value = elementData.boxRows;
-                    document.getElementById('textBoxCols').value = elementData.boxCols;
-                    document.getElementById('textBoxDimensions').classList.remove('hidden');
-                  } else {
-                    document.getElementById('textBoxDimensions').classList.add('hidden');
-                  }
-                  document.getElementById('textModal').setAttribute('data-edit-mode', 'true');
-                  document.getElementById('textModal').setAttribute('data-edit-index', elementIndex);
-                  showModal('textModal');
-                  document.getElementById('textContent').focus();
+                  startTextEdit(elementContextMenuState.element);
                 } else if (elementType === 'field') {
                   document.getElementById('fieldModalTitle').textContent = 'Edit Field';
                   document.getElementById('fieldName').value = elementData.name || '';
@@ -4262,7 +5053,8 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
                   } else if (valuesTextarea) {
                     valuesTextarea.value = '';
                   }
-                  
+                  updateFieldValuesHint();
+
                   document.getElementById('fieldModal').setAttribute('data-edit-mode', 'true');
                   document.getElementById('fieldModal').setAttribute('data-edit-index', elementIndex);
                   document.getElementById('fieldModal').setAttribute('data-nameformat', JSON.stringify(elementData.nameFormat || {}));
@@ -4322,6 +5114,24 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
                 populateTabVisibility(elementType, elementIndex);
                 showModal('moveModal');
                 break;
+              case 'toggle-box':
+                if (elementContextMenuState.element) toggleTextBox(elementContextMenuState.element);
+                break;
+              case 'duplicate-element':
+                if (elementContextMenuState.element) {
+                  selectElement(elementContextMenuState.element);
+                  duplicateSelectedElement();
+                }
+                break;
+              case 'delete-element':
+                if (vscodeApi && vscodeApi.postMessage && elementIndex) {
+                  vscodeApi.postMessage({ command: 'deleteElement', elementType: elementType, elementIndex: elementIndex });
+                  if (selectedElement === elementContextMenuState.element) {
+                    selectedElement = null;
+                    selectedElementKey = null;
+                  }
+                }
+                break;
               case 'show-in-source':
                 // Send message to VS Code to reveal the line in the editor
                 if (vscodeApi && vscodeApi.postMessage) {
@@ -4337,8 +5147,8 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         });
 
         // Setup modal action handlers
-        setupHeaderModal();
-        setupTextModal();
+        setupHeaderEdit();
+        setupTextEdit();
         setupFieldModal();
         setupButtonModal();
         setupPreviewModal();
@@ -4488,129 +5298,152 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         });
       }
 
-      function setupHeaderModal() {
-        var modal = document.getElementById('headerModal');
-        if (!modal) return;
+      // ---------------------------------------------------------------------
+      // In-place editing: the window header and texts turn into an input where they are drawn.
+      // Enter or clicking away saves, Esc cancels; an empty or unchanged value saves nothing.
+      // ---------------------------------------------------------------------
+      var inlineEdit = null; // { input, finish(commit) } while an input is open
 
-        var captionEl = document.querySelector('.titlebar .caption');
-        var titleEl = document.querySelector('.titlebar .title');
-        if (captionEl) {
-          captionEl.addEventListener('dblclick', function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            var input = document.getElementById('headerContent');
-            if (input) {
-              input.value = (titleEl && titleEl.textContent) || '';
-            }
-            showModal('headerModal');
-            if (input) {
-              input.focus();
-              input.select();
-            }
-          });
+      function openInlineInput(host, value, onDone, minChars) {
+        if (inlineEdit) inlineEdit.finish(true);
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'inline-edit';
+        input.spellcheck = false;
+        input.value = value;
+        function fit() { input.style.width = (Math.max(input.value.length, minChars || 4) + 1) + 'ch'; }
+        fit();
+        var done = false;
+        function finish(commit) {
+          if (done) return;
+          done = true;
+          inlineEdit = null;
+          var v = input.value.trim();
+          input.remove();
+          onDone(commit && v ? v : null);
         }
-
-        modal.querySelector('[data-action="cancel"]').addEventListener('click', function() {
-          hideModal('headerModal');
+        input.addEventListener('input', fit);
+        input.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+          else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+          e.stopPropagation(); // keys belong to the input, not the canvas
         });
-
-        modal.querySelector('[data-action="confirm-header"]').addEventListener('click', function() {
-          var input = document.getElementById('headerContent');
-          var title = input ? input.value : '';
-          if (vscodeApi && vscodeApi.postMessage) {
-            vscodeApi.postMessage({ command: 'updateHeader', title: title });
-          }
-          hideModal('headerModal');
+        input.addEventListener('blur', function() { finish(true); });
+        ['pointerdown', 'mousedown', 'click', 'dblclick', 'contextmenu', 'dragstart'].forEach(function(t) {
+          input.addEventListener(t, function(e) { e.stopPropagation(); });
         });
+        host.appendChild(input);
+        inlineEdit = { input: input, finish: finish };
+        input.focus();
+        input.select();
+        return input;
+      }
 
-        document.getElementById('headerContent').addEventListener('keypress', function(e) {
-          if (e.key === 'Enter') {
-            modal.querySelector('[data-action="confirm-header"]').click();
-          }
+      function setupHeaderEdit() {
+        var caption = document.querySelector('.titlebar .caption');
+        var titleEl = document.querySelector('.titlebar .title');
+        if (!caption || !titleEl) return;
+        caption.addEventListener('dblclick', function(e) {
+          if (inlineEdit && inlineEdit.input.parentNode === caption) return;
+          e.preventDefault();
+          e.stopPropagation();
+          var old = titleEl.textContent || '';
+          titleEl.classList.add('hidden');
+          openInlineInput(caption, old, function(v) {
+            titleEl.classList.remove('hidden');
+            if (v == null || v === old) return;
+            titleEl.textContent = v;
+            if (vscodeApi && vscodeApi.postMessage) vscodeApi.postMessage({ command: 'updateHeader', title: v });
+          }, 8);
         });
       }
 
-      function setupTextModal() {
-        var modal = document.getElementById('textModal');
-        if (!modal) return;
-
-        // Toggle box dimensions visibility
-        document.getElementById('textHasBox').addEventListener('change', function() {
-          var boxDims = document.getElementById('textBoxDimensions');
-          if (this.checked) {
-            boxDims.classList.remove('hidden');
-          } else {
-            boxDims.classList.add('hidden');
-          }
+      // Edit an existing text in place (double-click, F2/Enter, or Edit in its context menu)
+      function startTextEdit(el) {
+        if (!el || el.getAttribute('data-type') !== 'text' || tabOrderMode) return;
+        var info = collectElementInfo(el);
+        if (!isFinite(info.index)) return;
+        var old = info.data.content || '';
+        var label = Array.prototype.filter.call(el.childNodes, function(n) { return n.nodeType === 3; });
+        selectElement(el);
+        label.forEach(function(n) { n.remove(); });
+        el.setAttribute('draggable', 'false');
+        el.classList.add('inline-editing');
+        openInlineInput(el, old, function(v) {
+          el.classList.remove('inline-editing');
+          el.setAttribute('draggable', 'true');
+          var changed = v != null && v !== old;
+          if (changed) el.appendChild(document.createTextNode(v)); // shown until the preview refreshes
+          else label.forEach(function(n) { el.appendChild(n); });
+          fitTextSpans();
+          restoreCanvasFocus();
+          if (!changed || !vscodeApi || !vscodeApi.postMessage) return;
+          vscodeApi.postMessage({
+            command: 'editElement',
+            elementType: 'text',
+            elementIndex: info.index,
+            row: info.data.row,
+            col: info.data.col,
+            content: v,
+            boxRows: info.data.boxRows || null,
+            boxCols: info.data.boxCols || null
+          });
         });
+      }
 
-        // Cancel button
-        modal.querySelector('[data-action="cancel"]').addEventListener('click', function() {
-          hideModal('textModal');
-          document.getElementById('textContent').value = '';
-          document.getElementById('textHasBox').checked = false;
-          document.getElementById('textBoxDimensions').classList.add('hidden');
+      // Add Text: an empty input at the clicked cell; nothing is written unless it gets text
+      function startNewTextEdit(row, col) {
+        var grid = document.querySelector('.grid');
+        if (!grid || !isFinite(row) || !isFinite(col) || tabOrderMode) return;
+        var host = document.createElement('div');
+        host.className = 'text inline-new';
+        host.style.gridRow = String(row);
+        host.style.gridColumn = col + ' / span 1';
+        grid.appendChild(host);
+        openInlineInput(host, '', function(v) {
+          if (v == null) { host.remove(); restoreCanvasFocus(); return; }
+          host.textContent = v; // shown until the preview refreshes
+          restoreCanvasFocus();
+          if (!vscodeApi || !vscodeApi.postMessage) return;
+          vscodeApi.postMessage({
+            command: 'addElement',
+            elementType: 'text',
+            row: row,
+            col: col,
+            content: v,
+            boxRows: null,
+            boxCols: null,
+            activeTabId: tabs.length > 0 ? currentActiveTab : undefined
+          });
         });
+      }
 
-        // Confirm button
-        modal.querySelector('[data-action="confirm-text"]').addEventListener('click', function() {
-            var content = document.getElementById('textContent').value.trim();
-            if (!content) {
-              // Skip if no content
-              return;
-            }          var isEditMode = modal.getAttribute('data-edit-mode') === 'true';
-          var editIndex = parseInt(modal.getAttribute('data-edit-index'));
-
-          // Get box dimensions if enabled
-          var hasBox = document.getElementById('textHasBox').checked;
-          var boxRows = hasBox ? parseInt(document.getElementById('textBoxRows').value) : null;
-          var boxCols = hasBox ? parseInt(document.getElementById('textBoxCols').value) : null;
-
-          // Send to VS Code
-          if (vscodeApi && vscodeApi.postMessage) {
-            if (isEditMode && editIndex) {
-              // Edit existing element
-              var elementData = elementContextMenuState.elementData;
-              vscodeApi.postMessage({
-                command: 'editElement',
-                elementType: 'text',
-                elementIndex: editIndex,
-                row: elementData.row,
-                col: elementData.col,
-                content: content,
-                boxRows: boxRows,
-                boxCols: boxCols
-              });
-            } else {
-              // Add new element
-              vscodeApi.postMessage({
-                command: 'addElement',
-                elementType: 'text',
-                row: contextMenuState.row,
-                col: contextMenuState.col,
-                content: content,
-                boxRows: boxRows,
-                boxCols: boxCols,
-                activeTabId: tabs.length > 0 ? currentActiveTab : undefined
-              });
-            }
-          }
-
-          hideModal('textModal');
-          document.getElementById('textContent').value = '';
-          document.getElementById('textHasBox').checked = false;
-          document.getElementById('textBoxDimensions').classList.add('hidden');
-          modal.removeAttribute('data-edit-mode');
-          modal.removeAttribute('data-edit-index');
-          document.getElementById('textModalTitle').textContent = 'Add Text';
+      function setupTextEdit() {
+        document.addEventListener('dblclick', function(e) {
+          if (e.target.closest('.inline-edit, .el-resize, .box-resize')) return;
+          var el = e.target.closest('.grid > .text.draggable');
+          if (!el || !el.hasAttribute('data-text-idx')) return;
+          e.preventDefault();
+          e.stopPropagation();
+          startTextEdit(el);
         });
+      }
 
-        // Enter key to confirm
-        document.getElementById('textContent').addEventListener('keypress', function(e) {
-          if (e.key === 'Enter') {
-            modal.querySelector('[data-action="confirm-text"]').click();
-          }
-        });
+      // Add Box / Remove Box from a text's context menu. The label keeps its place on screen:
+      // a boxed label is drawn BOX_OFFSET columns in from the box corner, which is the text's file column.
+      function toggleTextBox(el) {
+        var info = collectElementInfo(el);
+        if (!isFinite(info.index) || !vscodeApi || !vscodeApi.postMessage) return;
+        var row = info.data.row, col = info.data.col;
+        if (el.hasAttribute('data-box-rows')) {
+          vscodeApi.postMessage({ command: 'setTextBox', index: info.index, col: col + BOX_OFFSET, boxRows: null });
+          return;
+        }
+        var newCol = Math.max(1, col - BOX_OFFSET);
+        var minCols = boxMinCols(el);
+        var cols = Math.max(minCols, Math.min(Math.max(20, minCols), gridCols - newCol + 1));
+        var rows = Math.max(1, Math.min(5, gridRows - row)); // drawn rows + 1 tall
+        vscodeApi.postMessage({ command: 'setTextBox', index: info.index, col: newCol, boxRows: rows, boxCols: cols });
       }
 
       function setupFieldModal() {
@@ -4801,12 +5634,51 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         });
       }
 
+      // Hint under the dropdown values: what each "path:<name>" resolves to (asked of the extension)
+      function updateFieldValuesHint() {
+        var ta = document.getElementById('fieldValues');
+        var hint = document.getElementById('fieldValuesHint');
+        if (!ta || !hint) return;
+        var names = [];
+        var re = /path:([^"\\s]+)/gi;
+        var m;
+        while ((m = re.exec(ta.value)) !== null) {
+          if (names.indexOf(m[1]) === -1) names.push(m[1]);
+        }
+        window.__frmFvHintRequest = (window.__frmFvHintRequest || 0) + 1;
+        if (names.length === 0 || !vscodeApi) {
+          hint.textContent = '';
+          return;
+        }
+        vscodeApi.postMessage({ command: 'resolveFieldValues', names: names, requestId: window.__frmFvHintRequest });
+      }
+      if (!window.__frmFvHintListener) {
+        // Installed once per page; this script re-runs on every in-place update
+        window.__frmFvHintListener = true;
+        window.addEventListener('message', function(ev) {
+          var msg = ev.data;
+          if (!msg || msg.command !== 'fieldValuesResolved' || msg.requestId !== window.__frmFvHintRequest) return;
+          var hint = document.getElementById('fieldValuesHint');
+          if (hint) hint.textContent = (msg.lines || []).join('\\n');
+        });
+      }
+      (function() {
+        var ta = document.getElementById('fieldValues');
+        if (!ta) return;
+        var timer;
+        ta.addEventListener('input', function() {
+          clearTimeout(timer);
+          timer = setTimeout(updateFieldValuesHint, 200);
+        });
+      })();
+
       function clearFieldModal() {
         document.getElementById('fieldName').value = '';
         document.getElementById('fieldType').value = '1';
         document.getElementById('fieldLen').value = '10';
         document.getElementById('fieldIgnore').value = defaultIgnoreValue;
         document.getElementById('fieldValues').value = '';
+        updateFieldValuesHint();
         
         // Reset checkboxes to default (only fieldType1 checked)
         document.getElementById('fieldType1').checked = true;
@@ -5445,6 +6317,7 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
             this.classList.remove('dragging');
             draggedElement = null;
             grid.classList.remove('drag-over');
+            hideDropTarget();
           });
         });
 
@@ -5463,63 +6336,85 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
             this.classList.remove('dragging');
             draggedElement = null;
             grid.classList.remove('drag-over');
+            hideDropTarget();
           });
         });
+
+        function spanOf(start, end) {
+          var m = /span\\s+(\\d+)/.exec(String(end || ''));
+          if (m) return Math.max(1, parseInt(m[1], 10));
+          var s = parseInt(start, 10), n = parseInt(end, 10);
+          return (isFinite(s) && isFinite(n) && n > s) ? n - s : 1;
+        }
+
+        // The cell the dragged element would land on for this pointer position
+        function computeDropTarget(e) {
+          var m = getGridMetrics();
+          if (!m || !draggedElement) return null;
+          var isHidden = draggedElement.classList.contains('hidden-field-item');
+          var colSpan, rowSpan, col, row;
+          if (isHidden) {
+            colSpan = Math.max(1, parseInt(draggedElement.getAttribute('data-span'), 10) || 1);
+            rowSpan = 1;
+            // Field starts in the cell under the pointer
+            col = Math.floor((e.clientX - m.rect.left) / m.colPitch) + 1;
+            row = Math.floor((e.clientY - m.rect.top) / m.rowPitch) + 1;
+          } else {
+            var st = draggedElement.style;
+            colSpan = spanOf(st.gridColumnStart, st.gridColumnEnd);
+            rowSpan = spanOf(st.gridRowStart, st.gridRowEnd);
+            // Snap the element's top-left corner (where its drag image is) to the nearest cell
+            col = Math.round((e.clientX - dragOffset.x - m.rect.left) / m.colPitch) + 1;
+            row = Math.round((e.clientY - dragOffset.y - m.rect.top) / m.rowPitch) + 1;
+          }
+          // Keep the whole element inside the current grid
+          col = Math.max(1, Math.min(col, m.cols - colSpan + 1));
+          row = Math.max(1, Math.min(row, m.rows - rowSpan + 1));
+          // col is where it will be drawn; fileCol is what gets saved (boxed labels are drawn shifted)
+          var off = isHidden ? 0 : colOffset(draggedElement);
+          col = Math.max(1 + off, col);
+          return { m: m, row: row, col: col, fileCol: col - off, rowSpan: rowSpan, colSpan: colSpan };
+        }
+
+        function showDropTarget(t) {
+          var outline = document.getElementById('dropTargetOutline');
+          if (!outline || !t) return;
+          placeOnGrid(outline, t.m, t.row, t.col, t.rowSpan, t.colSpan);
+          outline.classList.remove('hidden');
+        }
+
+        function hideDropTarget() {
+          var outline = document.getElementById('dropTargetOutline');
+          if (outline) outline.classList.add('hidden');
+        }
 
         // Grid drop handling
         grid.addEventListener('dragover', function(e) {
           e.preventDefault();
           e.dataTransfer.dropEffect = 'move';
           this.classList.add('drag-over');
+          showDropTarget(computeDropTarget(e));
         });
 
         grid.addEventListener('dragleave', function(e) {
           if (!this.contains(e.relatedTarget)) {
             this.classList.remove('drag-over');
+            hideDropTarget();
           }
         });
 
         grid.addEventListener('drop', function(e) {
           e.preventDefault();
           this.classList.remove('drag-over');
-          
+          hideDropTarget();
+
           if (!draggedElement) return;
-
-          var gridRect = this.getBoundingClientRect();
-          var colWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--col-w')) || 8;
-          var rowHeight = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 28;
-          var colGap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--col-gap')) || 0;
-          var rowGap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-gap')) || 0;
+          var target = computeDropTarget(e);
+          if (!target) return;
           var isHiddenFieldSource = draggedElement.classList.contains('hidden-field-item');
-          var x;
-          var y;
-          
-          if (isHiddenFieldSource) {
-            x = e.clientX - gridRect.left;
-            y = e.clientY - gridRect.top;
-          } else {
-            // Get the element's bounding rect to determine its center-left insertion point
-            var elemRect = draggedElement.getBoundingClientRect();
-            var elemHeight = elemRect.height;
+          var newRow = target.row;
+          var newCol = target.fileCol;
 
-            // Calculate the insertion point position (left edge, middle vertically)
-            // The insertion point is at left: 0 (left edge) and top: 50% (middle)
-            var insertionPointX = e.clientX - dragOffset.x; // left edge of element
-            var insertionPointY = e.clientY - dragOffset.y + (elemHeight / 2); // middle of element vertically
-            
-            // Convert insertion point to grid-relative coordinates
-            x = insertionPointX - gridRect.left;
-            y = insertionPointY - gridRect.top;
-          }
-          
-          // Calculate grid position from insertion point
-          var newCol = Math.max(1, Math.round(x / (colWidth + colGap)) + 1);
-          var newRow = Math.max(1, Math.round(y / (rowHeight + rowGap)) + 1);
-          
-          // Ensure we don't exceed grid bounds
-          newCol = Math.min(newCol, ${model.cols});
-          newRow = Math.min(newRow, ${model.rows});
-          
           // Update element position
           var type = draggedElement.getAttribute('data-type');
           var oldRow = parseInt(draggedElement.getAttribute('data-row'));
@@ -5535,6 +6430,18 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
       }
 
       function updateElementPosition(element, newRow, newCol) {
+        // A boxed text label carries its box along (the box sits at the label's file row/col)
+        if (element.getAttribute('data-type') === 'text' && element.hasAttribute('data-box-rows')) {
+          var box = document.querySelector('.grid > .box[data-row="' + element.getAttribute('data-row') + '"][data-col="' + element.getAttribute('data-col') + '"]');
+          if (box) {
+            box.setAttribute('data-row', newRow);
+            box.setAttribute('data-col', newCol);
+            var bRows = String(box.style.gridRow || '').match(/span (\\d+)/);
+            var bCols = String(box.style.gridColumn || '').match(/span (\\d+)/);
+            box.style.gridRow = newRow + ' / span ' + (bRows ? bRows[1] : '1');
+            box.style.gridColumn = newCol + ' / span ' + (bCols ? bCols[1] : '1');
+          }
+        }
         element.setAttribute('data-row', newRow);
         element.setAttribute('data-col', newCol);
         
@@ -5543,8 +6450,11 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         var spanMatch = currentStyle.match(/span (\\d+)/);
         var span = spanMatch ? spanMatch[1] : '1';
         
-        element.style.gridRow = newRow;
-        element.style.gridColumn = newCol + ' / span ' + span;
+        // Keep a row span (images, previews) when moving
+        var rowSpanMatch = String(element.style.gridRow || '').match(/span (\\d+)/);
+        element.style.gridRow = rowSpanMatch ? newRow + ' / span ' + rowSpanMatch[1] : String(newRow);
+        element.style.gridColumn = (newCol + colOffset(element)) + ' / span ' + span;
+        if (element.hasAttribute('data-box-rows')) fitBoxGaps();
       }
 
       function sendPositionUpdate(type, element, newRow, newCol, alreadyDrawn) {
@@ -5711,8 +6621,15 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
 
         // Add global keyboard event listener
         document.addEventListener('keydown', function(e) {
-          if (!selectedElement) return;
+          if (!selectedElement || shortcutsBlocked(e)) return;
           
+          // Shift+Arrow stretches instead of moving
+          if (e.shiftKey && /^Arrow(Up|Down|Left|Right)$/.test(e.key)) {
+            e.preventDefault();
+            stretchSelectedElement(e.key);
+            return;
+          }
+
           var handled = false;
           
           switch(e.key) {
@@ -5775,8 +6692,9 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
           }
         });
         
-        // Deselect when clicking on empty area
+        // Deselect when clicking on empty area (not when using a dialog or menu)
         document.addEventListener('click', function(e) {
+          if (e.target.closest('.modal-overlay, .context-menu')) return;
           if (!e.target.closest('.draggable') && selectedElement) {
             selectedElement.classList.remove('selected');
             selectedElement = null;
@@ -5998,10 +6916,878 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
         }
       });
 
+      // Window resize: drag the grid's right/bottom edge or corner to set port_size= rows cols
+      var sizeDrag = null;
+      var portRows = ${Number(model.portRows ?? 0)}; // as written in the file, 0 = auto
+      var portCols = ${Number(model.portCols ?? 0)};
+      var gridRows = ${model.rows}; // as displayed
+      var gridCols = ${model.cols};
+
+      function placementEnd(start, end) {
+        var s = parseInt(start, 10);
+        if (!isFinite(s)) return 0;
+        var m = /^span\\s+(\\d+)/.exec(String(end || '').trim());
+        if (m) return s + parseInt(m[1], 10) - 1;
+        var n = parseInt(end, 10);
+        return isFinite(n) && n > s ? n - 1 : s;
+      }
+
+      // Dim elements that reach outside the window and make room for them so they don't cover the side panels
+      function updateOverflow(rows, cols) {
+        var grid = document.querySelector('.grid');
+        if (!grid) return;
+        var maxRow = rows, maxCol = cols;
+        Array.prototype.forEach.call(grid.children, function(el) {
+          if (!el.style || !el.style.gridRowStart) return;
+          var endRow = placementEnd(el.style.gridRowStart, el.style.gridRowEnd);
+          var endCol = placementEnd(el.style.gridColumnStart, el.style.gridColumnEnd);
+          el.classList.toggle('frm-overflow', endRow > rows || endCol > cols);
+          if (endRow > maxRow) maxRow = endRow;
+          if (endCol > maxCol) maxCol = endCol;
+        });
+        var area = document.querySelector('.form-area');
+        if (area) {
+          area.style.paddingRight = maxCol > cols ? 'calc(' + (maxCol - cols) + ' * (var(--col-w) + var(--col-gap)))' : '';
+          area.style.paddingBottom = maxRow > rows ? 'calc(' + (maxRow - rows) + ' * (var(--row-h) + var(--row-gap)))' : '';
+        }
+      }
+
+      function setGridSize(rows, cols) {
+        var grid = document.querySelector('.grid');
+        if (!grid) return;
+        grid.style.gridTemplateRows = 'repeat(' + rows + ', var(--row-h))';
+        grid.style.gridTemplateColumns = 'repeat(' + cols + ', var(--col-w))';
+        grid.style.width = 'calc(' + cols + ' * var(--col-w) + ' + (cols - 1) + ' * var(--col-gap))';
+        grid.style.height = 'calc(' + rows + ' * var(--row-h) + ' + (rows - 1) + ' * var(--row-gap))';
+        updateOverflow(rows, cols);
+      }
+
+      function hideResizeContextMenu() {
+        var menu = document.getElementById('resizeContextMenu');
+        if (menu) menu.classList.add('hidden');
+      }
+
+      function setupWindowResize() {
+        var frame = document.getElementById('gridFrame');
+        var grid = document.querySelector('.grid');
+        var label = document.getElementById('resizeSizeLabel');
+        if (!frame || !grid) return;
+        updateOverflow(gridRows, gridCols);
+
+        function showLabel(rows, cols) {
+          if (!label) return;
+          label.textContent = rows + ' rows \\u00d7 ' + cols + ' cols';
+          label.classList.remove('hidden');
+        }
+
+        function endDrag(commit) {
+          if (!sizeDrag) return;
+          var d = sizeDrag;
+          sizeDrag = null;
+          try { d.handle.releasePointerCapture(d.pointerId); } catch (e) { /* ignore */ }
+          frame.classList.remove('resizing', 'resizing-e', 'resizing-s', 'resizing-se');
+          if (label) label.classList.add('hidden');
+          var changed = d.rows !== d.startRows || d.cols !== d.startCols;
+          if (!commit) {
+            if (changed) setGridSize(d.startRows, d.startCols);
+            return;
+          }
+          if (!changed) return;
+          gridRows = d.rows;
+          gridCols = d.cols;
+          var msg = { command: 'setPortSize' };
+          if (d.dir !== 's') { msg.cols = d.cols; portCols = d.cols; }
+          if (d.dir !== 'e') { msg.rows = d.rows; portRows = d.rows; }
+          if (vscodeApi && vscodeApi.postMessage) vscodeApi.postMessage(msg);
+        }
+
+        frame.querySelectorAll('.resize-handle').forEach(function(handle) {
+          var dir = handle.getAttribute('data-resize');
+
+          handle.addEventListener('pointerdown', function(e) {
+            if (e.button !== 0 || tabOrderMode || document.querySelector('.modal-overlay:not(.hidden)')) return;
+            e.preventDefault();
+            e.stopPropagation();
+            hideResizeContextMenu();
+            var cs = getComputedStyle(grid);
+            var colGap = parseFloat(cs.columnGap) || 0;
+            var rowGap = parseFloat(cs.rowGap) || 0;
+            sizeDrag = {
+              dir: dir, handle: handle, pointerId: e.pointerId,
+              x: e.clientX, y: e.clientY,
+              startRows: gridRows, startCols: gridCols, rows: gridRows, cols: gridCols,
+              colPitch: (grid.clientWidth + colGap) / gridCols,
+              rowPitch: (grid.clientHeight + rowGap) / gridRows
+            };
+            try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+            frame.classList.add('resizing', 'resizing-' + dir);
+            showLabel(gridRows, gridCols);
+          });
+
+          handle.addEventListener('pointermove', function(e) {
+            if (!sizeDrag || sizeDrag.handle !== handle) return;
+            var d = sizeDrag;
+            var cols = d.cols, rows = d.rows;
+            if (dir !== 's' && d.colPitch > 0) cols = Math.max(1, d.startCols + Math.round((e.clientX - d.x) / d.colPitch));
+            if (dir !== 'e' && d.rowPitch > 0) rows = Math.max(1, d.startRows + Math.round((e.clientY - d.y) / d.rowPitch));
+            if (rows !== d.rows || cols !== d.cols) {
+              d.rows = rows;
+              d.cols = cols;
+              setGridSize(rows, cols);
+            }
+            showLabel(d.rows, d.cols);
+          });
+
+          handle.addEventListener('pointerup', function() { endDrag(true); });
+          handle.addEventListener('pointercancel', function() { endDrag(false); });
+          handle.addEventListener('click', function(e) { e.stopPropagation(); });
+
+          handle.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (sizeDrag) return;
+            try { hideContextMenu(); hideElementContextMenu(); hideOutsideContextMenu(); } catch (err) { /* ignore */ }
+            var menu = document.getElementById('resizeContextMenu');
+            if (!menu) return;
+            menu.querySelectorAll('[data-resize-action]').forEach(function(item) {
+              var action = item.getAttribute('data-resize-action');
+              var show = dir === 'se' || (dir === 'e' && action === 'width') || (dir === 's' && action === 'height');
+              var alreadyAuto = action === 'width' ? portCols === 0 : action === 'height' ? portRows === 0 : (portRows === 0 && portCols === 0);
+              item.classList.toggle('hidden', !show);
+              item.classList.toggle('disabled', alreadyAuto);
+            });
+            menu.classList.remove('hidden');
+            menu.style.left = e.clientX + 'px';
+            menu.style.top = e.clientY + 'px';
+          });
+        });
+
+        document.querySelectorAll('#resizeContextMenu [data-resize-action]').forEach(function(item) {
+          item.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            hideResizeContextMenu();
+            var action = item.getAttribute('data-resize-action');
+            var msg = { command: 'setPortSize' };
+            if (action !== 'height') msg.cols = 0;
+            if (action !== 'width') msg.rows = 0;
+            if (vscodeApi && vscodeApi.postMessage) vscodeApi.postMessage(msg);
+          });
+        });
+
+        document.addEventListener('click', function(e) {
+          if (!e.target.closest('#resizeContextMenu')) hideResizeContextMenu();
+        });
+        document.addEventListener('contextmenu', function(e) {
+          if (!e.target.closest('.resize-handle')) hideResizeContextMenu();
+        }, true);
+        document.addEventListener('keydown', function(e) {
+          if (e.key === 'Escape') {
+            if (sizeDrag) { e.preventDefault(); e.stopPropagation(); endDrag(false); }
+            hideResizeContextMenu();
+          }
+        }, true);
+      }
+
+      // Stretching fields, images and previews: drag an edge/corner handle, or Shift+Arrow.
+      // A box is { row, col, rows, cols } as drawn; a field's drawn width is len + 2 for dropdowns.
+      var elResize = null;
+
+      // Span from a grid-row / grid-column value such as "3 / span 16" or "3 / 19"
+      function elSpan(value) {
+        var parts = String(value || '').split('/');
+        var end = (parts[1] || '').trim();
+        var m = /^span\\s+(\\d+)/.exec(end);
+        if (m) return Math.max(1, parseInt(m[1], 10));
+        var s = parseInt(parts[0], 10), n = parseInt(end, 10);
+        return (isFinite(s) && isFinite(n) && n > s) ? n - s : 1;
+      }
+
+      function elBox(el) {
+        var st = el.style;
+        return {
+          row: parseInt(el.getAttribute('data-row'), 10),
+          col: parseInt(el.getAttribute('data-col'), 10),
+          rows: elSpan(st.gridRow),
+          cols: elSpan(st.gridColumn)
+        };
+      }
+
+      function fieldExtra(el) {
+        return parseInt(el.getAttribute('data-field-extra'), 10) || 0;
+      }
+
+      function elMinCols(el) {
+        return el.getAttribute('data-type') === 'field' ? 1 + fieldExtra(el) : 1;
+      }
+
+      function elIndex(el) {
+        var type = el.getAttribute('data-type');
+        if (el.getAttribute('data-no-index')) return NaN;
+        var attr = type === 'field' ? 'data-field-idx' : type === 'image' ? 'data-image-idx' : type === 'preview' ? 'data-preview-idx' : null;
+        return attr ? parseInt(el.getAttribute(attr), 10) : NaN;
+      }
+
+      function canStretch(el) {
+        if (!el) return false;
+        var type = el.getAttribute('data-type');
+        return (type === 'field' || type === 'image' || type === 'preview') && isFinite(elIndex(el));
+      }
+
+      function sameBox(a, b) {
+        return a.row === b.row && a.col === b.col && a.rows === b.rows && a.cols === b.cols;
+      }
+
+      // Move edges by whole cells. e/s change the size; w/n move the start and keep the opposite edge.
+      function stretchedBox(start, dir, dRows, dCols, minCols, minRows) {
+        minRows = minRows || 1;
+        var b = { row: start.row, col: start.col, rows: start.rows, cols: start.cols };
+        var right = start.col + start.cols - 1;
+        var bottom = start.row + start.rows - 1;
+        if (dir.indexOf('e') >= 0) b.cols = Math.max(minCols, start.cols + dCols);
+        if (dir.indexOf('w') >= 0) {
+          b.col = Math.max(1, Math.min(start.col + dCols, right - minCols + 1));
+          b.cols = right - b.col + 1;
+        }
+        if (dir.indexOf('s') >= 0) b.rows = Math.max(minRows, start.rows + dRows);
+        if (dir.indexOf('n') >= 0) {
+          b.row = Math.max(1, Math.min(start.row + dRows, bottom - minRows + 1));
+          b.rows = bottom - b.row + 1;
+        }
+        return b;
+      }
+
+      function applyElBox(el, b) {
+        var type = el.getAttribute('data-type');
+        el.setAttribute('data-row', b.row);
+        el.setAttribute('data-col', b.col);
+        el.style.gridRow = type === 'field' ? String(b.row) : b.row + ' / span ' + b.rows;
+        el.style.gridColumn = b.col + ' / span ' + b.cols;
+        if (type === 'field') el.setAttribute('data-field-len', String(b.cols - fieldExtra(el)));
+        if (type === 'preview') {
+          el.setAttribute('data-preview-rows', String(b.rows));
+          el.setAttribute('data-preview-cols', String(b.cols));
+        }
+        updateOverflow(gridRows, gridCols);
+      }
+
+      function sendElResize(el, b) {
+        if (!vscodeApi || !vscodeApi.postMessage) return;
+        var type = el.getAttribute('data-type');
+        var msg = { command: 'resizeElement', type: type, index: elIndex(el), row: b.row, col: b.col };
+        if (type === 'field') {
+          msg.len = b.cols - fieldExtra(el);
+        } else {
+          msg.rows = b.rows;
+          msg.cols = b.cols;
+        }
+        vscodeApi.postMessage(msg);
+      }
+
+      function stretchSelectedElement(key) {
+        var el = selectedElement;
+        if (!canStretch(el) || tabOrderMode) return;
+        var dCols = key === 'ArrowRight' ? 1 : key === 'ArrowLeft' ? -1 : 0;
+        var dRows = key === 'ArrowDown' ? 1 : key === 'ArrowUp' ? -1 : 0;
+        if (dRows && el.getAttribute('data-type') === 'field') return; // fields have no height
+        var start = elBox(el);
+        var b = stretchedBox(start, dRows ? 's' : 'e', dRows, dCols, elMinCols(el));
+        if (sameBox(start, b)) return;
+        applyElBox(el, b);
+        sendElResize(el, b);
+      }
+
+      function setupElementResize() {
+        var frame = document.getElementById('gridFrame');
+        var label = document.getElementById('elResizeLabel');
+
+        function showLabel(el, b) {
+          if (!label || !frame) return;
+          label.textContent = el.getAttribute('data-type') === 'field'
+            ? 'len ' + (b.cols - fieldExtra(el))
+            : b.rows + ' rows \\u00d7 ' + b.cols + ' cols';
+          var fr = frame.getBoundingClientRect();
+          var r = el.getBoundingClientRect();
+          label.style.left = (r.left - fr.left) + 'px';
+          label.style.top = (r.bottom - fr.top + 4) + 'px';
+          label.classList.remove('hidden');
+        }
+
+        function endStretch(commit) {
+          if (!elResize) return;
+          var d = elResize;
+          elResize = null;
+          try { d.handle.releasePointerCapture(d.pointerId); } catch (e) { /* ignore */ }
+          d.handle.classList.remove('active');
+          d.el.classList.remove('el-resizing');
+          d.el.setAttribute('draggable', 'true');
+          if (label) label.classList.add('hidden');
+          if (sameBox(d.start, d.box)) return;
+          if (!commit) {
+            applyElBox(d.el, d.start);
+            return;
+          }
+          sendElResize(d.el, d.box);
+        }
+
+        document.querySelectorAll('.draggable > .el-resize').forEach(function(handle) {
+          var el = handle.parentElement;
+          var dir = handle.getAttribute('data-el-resize');
+
+          handle.addEventListener('pointerdown', function(e) {
+            if (e.button !== 0 || tabOrderMode || document.querySelector('.modal-overlay:not(.hidden)')) return;
+            if (!canStretch(el)) return;
+            var m = getGridMetrics();
+            if (!m) return;
+            e.preventDefault();
+            e.stopPropagation();
+            selectElement(el);
+            el.setAttribute('draggable', 'false'); // keep the native move-drag from starting
+            var start = elBox(el);
+            elResize = {
+              el: el, handle: handle, dir: dir, pointerId: e.pointerId,
+              x: e.clientX, y: e.clientY, start: start, box: start,
+              minCols: elMinCols(el), colPitch: m.colPitch, rowPitch: m.rowPitch
+            };
+            try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+            handle.classList.add('active');
+            el.classList.add('el-resizing');
+            showLabel(el, start);
+          });
+
+          handle.addEventListener('pointermove', function(e) {
+            if (!elResize || elResize.handle !== handle) return;
+            var d = elResize;
+            var dCols = d.colPitch > 0 ? Math.round((e.clientX - d.x) / d.colPitch) : 0;
+            var dRows = d.rowPitch > 0 ? Math.round((e.clientY - d.y) / d.rowPitch) : 0;
+            var b = stretchedBox(d.start, d.dir, dRows, dCols, d.minCols);
+            if (!sameBox(b, d.box)) {
+              d.box = b;
+              applyElBox(el, b);
+            }
+            showLabel(el, d.box);
+          });
+
+          handle.addEventListener('pointerup', function() { endStretch(true); });
+          handle.addEventListener('pointercancel', function() { endStretch(false); });
+          handle.addEventListener('click', function(e) { e.stopPropagation(); });
+          handle.addEventListener('dragstart', function(e) { e.preventDefault(); });
+        });
+
+        // On very narrow elements the edge strips would cover everything: show them only once selected
+        document.querySelectorAll('.field.draggable, .image.draggable, .preview.draggable').forEach(function(el) {
+          el.addEventListener('pointerenter', function() {
+            var r = el.getBoundingClientRect();
+            var isField = el.getAttribute('data-type') === 'field';
+            el.classList.toggle('el-narrow', r.width < 24 || (!isField && r.height < 18));
+          });
+        });
+
+        document.addEventListener('keydown', function(e) {
+          if (e.key === 'Escape' && elResize) {
+            e.preventDefault();
+            e.stopPropagation();
+            endStretch(false);
+          }
+        }, true);
+      }
+
+      // Stretching a text's box from any edge or corner. The box's top-left corner is the text's file row/col,
+      // so the n and w edges move the text too. A box is { row, col, rows, cols } in #[rows,cols]* terms;
+      // it is drawn rows + 1 tall. Stays inside the window (port_size) and wide enough for its label.
+      var BOX_OFFSET = ${BOX_LABEL_OFFSET};
+      var boxResize = null;
+
+      function textOfBox(box) {
+        return document.querySelector('.grid > .text[data-text-idx="' + box.getAttribute('data-text-idx') + '"]');
+      }
+
+      function boxOfText(el) {
+        return document.querySelector('.grid > .box.stretchable[data-text-idx="' + el.getAttribute('data-text-idx') + '"]');
+      }
+
+      // Room for the left line, the label (its measured span) and a column of line after it
+      function boxMinCols(textEl) {
+        return BOX_OFFSET + elSpan(textEl.style.gridColumn) + 2;
+      }
+
+      function readTextBox(textEl) {
+        return {
+          row: parseInt(textEl.getAttribute('data-row'), 10),
+          col: parseInt(textEl.getAttribute('data-col'), 10),
+          rows: parseInt(textEl.getAttribute('data-box-rows'), 10),
+          cols: parseInt(textEl.getAttribute('data-box-cols'), 10)
+        };
+      }
+
+      function applyTextBox(textEl, box, b) {
+        updateElementPosition(textEl, b.row, b.col); // carries the box along to the new corner
+        box.style.gridRow = b.row + ' / span ' + (b.rows + 1);
+        box.style.gridColumn = b.col + ' / span ' + b.cols;
+        textEl.setAttribute('data-box-rows', String(b.rows));
+        textEl.setAttribute('data-box-cols', String(b.cols));
+        fitBoxGaps();
+        updateOverflow(gridRows, gridCols);
+      }
+
+      function stretchedTextBox(start, dir, dRows, dCols, minCols) {
+        var drawn = { row: start.row, col: start.col, rows: start.rows + 1, cols: start.cols };
+        var b = stretchedBox(drawn, dir, dRows, dCols, minCols, 2);
+        // Only the e and s edges can grow past the window; never clamp below where the box already reached
+        var maxRight = Math.max(gridCols, drawn.col + drawn.cols - 1);
+        var maxBottom = Math.max(gridRows, drawn.row + drawn.rows - 1);
+        if (b.col + b.cols - 1 > maxRight) b.cols = Math.max(minCols, maxRight - b.col + 1);
+        if (b.row + b.rows - 1 > maxBottom) b.rows = Math.max(2, maxBottom - b.row + 1);
+        return { row: b.row, col: b.col, rows: b.rows - 1, cols: b.cols };
+      }
+
+      function setupBoxResize() {
+        var frame = document.getElementById('gridFrame');
+        var label = document.getElementById('elResizeLabel');
+        var grid = document.querySelector('.grid');
+
+        function showLabel(box, b) {
+          if (!label || !frame) return;
+          label.textContent = b.rows + ' rows \\u00d7 ' + b.cols + ' cols';
+          var fr = frame.getBoundingClientRect();
+          var r = box.getBoundingClientRect();
+          label.style.left = (r.left - fr.left) + 'px';
+          label.style.top = (r.bottom - fr.top + 4) + 'px';
+          label.classList.remove('hidden');
+        }
+
+        function endBoxStretch(commit) {
+          if (!boxResize) return;
+          var d = boxResize;
+          boxResize = null;
+          try { d.handle.releasePointerCapture(d.pointerId); } catch (e) { /* ignore */ }
+          d.handle.classList.remove('active');
+          d.box.classList.remove('box-resizing');
+          if (label) label.classList.add('hidden');
+          if (sameBox(d.start, d.cur)) return;
+          if (!commit) {
+            applyTextBox(d.text, d.box, d.start);
+            return;
+          }
+          if (vscodeApi && vscodeApi.postMessage) {
+            vscodeApi.postMessage({
+              command: 'resizeElement', type: 'text', index: parseInt(d.text.getAttribute('data-text-idx'), 10),
+              row: d.cur.row, col: d.cur.col, rows: d.cur.rows, cols: d.cur.cols
+            });
+          }
+        }
+
+        document.querySelectorAll('.grid > .box.stretchable > .box-resize').forEach(function(handle) {
+          var box = handle.parentElement;
+          var dir = handle.getAttribute('data-box-resize');
+
+          handle.addEventListener('pointerdown', function(e) {
+            if (e.button !== 0 || tabOrderMode || inlineEdit || document.querySelector('.modal-overlay:not(.hidden)')) return;
+            var text = textOfBox(box);
+            var m = getGridMetrics();
+            if (!text || !m) return;
+            var start = readTextBox(text);
+            if (!isFinite(start.rows) || !isFinite(start.cols)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            selectElement(text);
+            boxResize = {
+              box: box, text: text, handle: handle, dir: dir, pointerId: e.pointerId,
+              x: e.clientX, y: e.clientY, start: start, cur: start,
+              minCols: boxMinCols(text), colPitch: m.colPitch, rowPitch: m.rowPitch
+            };
+            try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+            handle.classList.add('active');
+            box.classList.add('box-resizing');
+            showLabel(box, start);
+          });
+
+          handle.addEventListener('pointermove', function(e) {
+            if (!boxResize || boxResize.handle !== handle) return;
+            var d = boxResize;
+            var dCols = d.colPitch > 0 ? Math.round((e.clientX - d.x) / d.colPitch) : 0;
+            var dRows = d.rowPitch > 0 ? Math.round((e.clientY - d.y) / d.rowPitch) : 0;
+            var b = stretchedTextBox(d.start, d.dir, dRows, dCols, d.minCols);
+            if (!sameBox(b, d.cur)) {
+              d.cur = b;
+              applyTextBox(d.text, d.box, b);
+            }
+            showLabel(d.box, d.cur);
+          });
+
+          handle.addEventListener('pointerup', function() { endBoxStretch(true); });
+          handle.addEventListener('pointercancel', function() { endBoxStretch(false); });
+          handle.addEventListener('click', function(e) { e.stopPropagation(); });
+          handle.addEventListener('contextmenu', function(e) { e.preventDefault(); e.stopPropagation(); });
+        });
+
+        // Handles also show while the box's label is hovered or selected (not while it is being edited)
+        function syncBoxOwners() {
+          document.querySelectorAll('.grid > .box.stretchable').forEach(function(box) {
+            var t = textOfBox(box);
+            var on = !!t && t.classList.contains('selected') && !t.classList.contains('inline-editing');
+            if (box.classList.contains('owner-selected') !== on) box.classList.toggle('owner-selected', on);
+          });
+        }
+        if (grid && typeof MutationObserver === 'function') {
+          new MutationObserver(syncBoxOwners).observe(grid, { subtree: true, attributes: true, attributeFilter: ['class'] });
+        }
+        syncBoxOwners();
+        document.querySelectorAll('.grid > .text[data-box-rows][data-text-idx]').forEach(function(t) {
+          t.addEventListener('pointerenter', function() { var b = boxOfText(t); if (b) b.classList.add('owner-hover'); });
+          t.addEventListener('pointerleave', function() { var b = boxOfText(t); if (b) b.classList.remove('owner-hover'); });
+        });
+
+        document.addEventListener('keydown', function(e) {
+          if (e.key === 'Escape' && boxResize) {
+            e.preventDefault();
+            e.stopPropagation();
+            endBoxStretch(false);
+          }
+        }, true);
+      }
+
+      // ---------------------------------------------------------------------
+      // Keyboard shortcuts, modal keyboard/backdrop handling, context-menu navigation
+      // ---------------------------------------------------------------------
+      var pendingSelectionKey = null; // the extension names a new element (e.g. a duplicate) to select after the next refresh
+      var backdropPress = null;
+
+      function isVisible(el) {
+        return !!(el && el.getClientRects().length);
+      }
+
+      function topModal() {
+        var open = document.querySelectorAll('.modal-overlay:not(.hidden)');
+        return open.length ? open[open.length - 1] : null;
+      }
+
+      function isTypingTarget(t) {
+        if (!t || !t.tagName) return false;
+        if (t.classList && t.classList.contains('inline-edit')) return true; // in-place header/text editor
+        if (t.closest && t.closest('.draggable')) return false; // mock controls drawn inside form elements
+        if (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return true;
+        return t.tagName === 'INPUT' && !/^(checkbox|radio|button|submit|reset|range)$/i.test(t.type);
+      }
+
+      // Canvas shortcuts are off while a dialog is open or the user is typing
+      function shortcutsBlocked(e) {
+        return !!topModal() || isTypingTarget(e.target);
+      }
+
+      function focusablesIn(container) {
+        return Array.prototype.filter.call(
+          container.querySelectorAll('input:not([type="hidden"]), select, textarea, button, [tabindex]:not([tabindex="-1"])'),
+          function(el) { return !el.disabled && isVisible(el); }
+        );
+      }
+
+      function focusFirstModalInput(modal) {
+        var focusables = focusablesIn(modal);
+        var target = focusables.filter(function(el) {
+          return el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && isTypingTarget(el));
+        })[0] || focusables[0];
+        if (!target) return;
+        target.focus({ preventScroll: true });
+        // Cursor at the end, nothing selected, so typing never wipes an existing value
+        try { var n = target.value.length; target.setSelectionRange(n, n); } catch (err) { /* e.g. number inputs */ }
+      }
+
+      function restoreCanvasFocus() {
+        var active = document.activeElement;
+        if (active && active.closest && active.closest('.modal-overlay')) active.blur();
+        if (selectedElement && document.contains(selectedElement)) {
+          selectedElement.focus({ preventScroll: true });
+        }
+      }
+
+      function modalSnapshot(modal) {
+        return JSON.stringify(Array.prototype.map.call(modal.querySelectorAll('input, select, textarea'), function(el) {
+          return (el.type === 'checkbox' || el.type === 'radio') ? el.checked : el.value;
+        }));
+      }
+
+      function isModalDirty(modal) {
+        return modal.__frmSnapshot !== undefined && modalSnapshot(modal) !== modal.__frmSnapshot;
+      }
+
+      function cancelModal(modal) {
+        var btn = modal.querySelector('[data-action="cancel"]');
+        if (btn) btn.click(); else hideModal(modal.id);
+      }
+
+      function confirmModal(modal) {
+        var btn = modal.querySelector('.modal-buttons .modal-button.primary[data-action^="confirm"]');
+        if (btn) btn.click();
+      }
+
+      // Inline "Discard changes?" bar, shown when clicking outside a dialog with changes
+      function discardBarOf(modal) {
+        var box = modal.querySelector('.modal');
+        if (!box) return null;
+        var bar = box.querySelector('.modal-discard-bar');
+        if (!bar) {
+          bar = document.createElement('div');
+          bar.className = 'modal-discard-bar hidden';
+          bar.innerHTML = '<span>Discard changes?</span>' +
+            '<button type="button" class="modal-button" data-discard="keep">Keep editing</button>' +
+            '<button type="button" class="modal-button danger" data-discard="discard">Discard</button>';
+          bar.querySelector('[data-discard="keep"]').addEventListener('click', function() { hideDiscardBar(modal, true); });
+          bar.querySelector('[data-discard="discard"]').addEventListener('click', function() { cancelModal(modal); });
+          box.appendChild(bar);
+        }
+        return bar;
+      }
+
+      function isDiscardBarOpen(modal) {
+        var bar = modal.querySelector('.modal-discard-bar');
+        return !!bar && !bar.classList.contains('hidden');
+      }
+
+      function showDiscardBar(modal) {
+        var bar = discardBarOf(modal);
+        if (!bar) return;
+        modal.__frmFocusBeforeBar = document.activeElement;
+        bar.classList.remove('hidden');
+        bar.querySelector('[data-discard="keep"]').focus({ preventScroll: true });
+      }
+
+      function hideDiscardBar(modal, refocus) {
+        var bar = modal.querySelector('.modal-discard-bar');
+        if (!bar || bar.classList.contains('hidden')) return;
+        bar.classList.add('hidden');
+        if (!refocus) return;
+        var prev = modal.__frmFocusBeforeBar;
+        if (prev && modal.contains(prev) && isVisible(prev)) prev.focus({ preventScroll: true });
+        else focusFirstModalInput(modal);
+      }
+
+      // Keep Tab / Shift+Tab inside the container
+      function trapTab(e, container) {
+        var items = focusablesIn(container);
+        if (!items.length) { e.preventDefault(); return; }
+        var first = items[0];
+        var last = items[items.length - 1];
+        var active = document.activeElement;
+        if (!container.contains(active)) {
+          (e.shiftKey ? last : first).focus();
+          e.preventDefault();
+        } else if (e.shiftKey && active === first) {
+          last.focus();
+          e.preventDefault();
+        } else if (!e.shiftKey && active === last) {
+          first.focus();
+          e.preventDefault();
+        }
+      }
+
+      function openContextMenu() {
+        return Array.prototype.filter.call(document.querySelectorAll('.context-menu:not(.hidden)'), isVisible)[0] || null;
+      }
+
+      function clearMenuHighlight() {
+        document.querySelectorAll('.context-menu-item.kbd-active').forEach(function(i) { i.classList.remove('kbd-active'); });
+      }
+
+      function hideAllContextMenus() {
+        hideContextMenu();
+        hideElementContextMenu();
+        hideOutsideContextMenu();
+        hideResizeContextMenu();
+        var tabMenu = document.getElementById('tabOrderContextMenu');
+        if (tabMenu) tabMenu.classList.add('hidden');
+        clearMenuHighlight();
+      }
+
+      function moveMenuHighlight(menu, delta) {
+        var items = Array.prototype.filter.call(menu.querySelectorAll('.context-menu-item'), function(i) {
+          return isVisible(i) && !i.classList.contains('disabled');
+        });
+        if (!items.length) return;
+        var cur = items.indexOf(menu.querySelector('.context-menu-item.kbd-active'));
+        var next = cur < 0 ? (delta > 0 ? 0 : items.length - 1) : (cur + delta + items.length) % items.length;
+        clearMenuHighlight();
+        items[next].classList.add('kbd-active');
+      }
+
+      function elementIndexOf(el) {
+        var attr = {
+          text: 'data-text-idx', field: 'data-field-idx', pushbutton: 'data-push-idx',
+          image: 'data-image-idx', preview: 'data-preview-idx'
+        }[el.getAttribute('data-type')];
+        var n = attr ? parseInt(el.getAttribute(attr), 10) : NaN;
+        return isFinite(n) ? n : null;
+      }
+
+      // Rows the element covers (a boxed text label covers its box)
+      function rowSpanOfElement(el) {
+        var boxRows = parseInt(el.getAttribute('data-box-rows'), 10);
+        if (boxRows > 0) return boxRows;
+        var m = /span (\\d+)/.exec(String(el.style.gridRow || ''));
+        return m ? parseInt(m[1], 10) : 1;
+      }
+
+      // Same column, one row down; stays put when that would leave the form
+      function duplicateSelectedElement() {
+        var el = selectedElement;
+        if (!el || tabOrderMode || !vscodeApi || !vscodeApi.postMessage) return;
+        var type = el.getAttribute('data-type');
+        var index = elementIndexOf(el);
+        var row = parseInt(el.getAttribute('data-row'), 10);
+        if (!type || !index || !isFinite(row)) return;
+        var newRow = row + rowSpanOfElement(el) <= ${model.rows} ? row + 1 : row;
+        vscodeApi.postMessage({ command: 'duplicateElement', elementType: type, elementIndex: index, row: newRow });
+      }
+
+      // Same as choosing Edit in the element's context menu (images have no edit dialog)
+      function openElementEditor(element) {
+        var info = collectElementInfo(element);
+        if (!info.type || info.type === 'image') return;
+        elementContextMenuState.element = element;
+        elementContextMenuState.elementType = info.type;
+        elementContextMenuState.elementIndex = info.index;
+        elementContextMenuState.elementData = info.data;
+        var item = document.querySelector('#elementContextMenu .context-menu-item[data-action="edit-element"]');
+        if (item) item.click();
+      }
+
+      function consumeKey(e) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+
+      // Capture phase: runs before the canvas handler, which moves/deletes/deselects the selected element
+      function onShortcutKeydown(e) {
+        var mod = e.ctrlKey || e.metaKey;
+        var modal = topModal();
+        var menu = openContextMenu();
+
+        // Esc closes one layer per press. An open native <select> list swallows Esc itself.
+        if (e.key === 'Escape') {
+          if (sizeDrag || elResize || boxResize) return; // the resize handlers cancel the drag
+          if (menu) { hideAllContextMenus(); consumeKey(e); return; }
+          if (modal) {
+            if (isDiscardBarOpen(modal)) hideDiscardBar(modal, true); else cancelModal(modal);
+            consumeKey(e);
+            return;
+          }
+          if (tabOrderMode) { cancelTabOrder(); consumeKey(e); return; }
+          return; // the canvas handler deselects
+        }
+
+        if (modal) {
+          if (isDiscardBarOpen(modal)) {
+            if (e.key === 'Enter') { hideDiscardBar(modal, true); consumeKey(e); }
+            else if (e.key === 'Tab') trapTab(e, modal.querySelector('.modal-discard-bar'));
+            return;
+          }
+          if (e.key === 'Enter' && mod) { confirmModal(modal); consumeKey(e); return; }
+          if (e.key === 'Tab') { trapTab(e, modal.querySelector('.modal') || modal); return; }
+          if (e.key === '?' && modal.id === 'shortcutsModal') { hideModal('shortcutsModal'); consumeKey(e); }
+          return;
+        }
+
+        if (menu) {
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            moveMenuHighlight(menu, e.key === 'ArrowDown' ? 1 : -1);
+            consumeKey(e);
+            return;
+          }
+          if (e.key === 'Enter') {
+            var active = menu.querySelector('.context-menu-item.kbd-active');
+            if (active) active.click();
+            consumeKey(e);
+            return;
+          }
+        }
+
+        if (isTypingTarget(e.target)) return;
+
+        if (tabOrderMode) {
+          if (e.key === 'Enter') { confirmTabOrder(); consumeKey(e); }
+          return;
+        }
+
+        var key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+        if (mod && !e.altKey && (key === 'z' || key === 'y')) {
+          if (vscodeApi && vscodeApi.postMessage) {
+            vscodeApi.postMessage({ command: (key === 'y' || e.shiftKey) ? 'redo' : 'undo' });
+          }
+          consumeKey(e);
+          return;
+        }
+        if (mod && !e.altKey && !e.shiftKey && key === 'd') {
+          duplicateSelectedElement();
+          consumeKey(e);
+          return;
+        }
+        if (!mod && !e.altKey && e.key === '?') {
+          showModal('shortcutsModal');
+          consumeKey(e);
+          return;
+        }
+        if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedElement &&
+            !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
+          openElementEditor(selectedElement);
+          consumeKey(e);
+        }
+      }
+
+      function setupShortcuts() {
+        document.addEventListener('keydown', onShortcutKeydown, true);
+
+        // A backdrop click counts only when the press also started on the backdrop
+        // (so drag-selecting text in an input and releasing outside does nothing)
+        document.addEventListener('mousedown', function(e) {
+          backdropPress = (e.target.classList && e.target.classList.contains('modal-overlay')) ? e.target : null;
+        }, true);
+        document.addEventListener('click', function(e) {
+          var overlay = backdropPress;
+          backdropPress = null;
+          if (!overlay || e.target !== overlay || overlay.classList.contains('hidden')) return;
+          if (isModalDirty(overlay)) showDiscardBar(overlay); else cancelModal(overlay);
+        });
+
+        // A menu opened by mouse starts without a keyboard highlight
+        document.addEventListener('contextmenu', clearMenuHighlight, true);
+        document.addEventListener('click', function(e) {
+          if (!e.target.closest('.context-menu')) clearMenuHighlight();
+        }, true);
+
+        window.addEventListener('message', function(ev) {
+          var msg = ev.data;
+          if (msg && msg.command === 'frmSelectAfterRefresh' && typeof msg.key === 'string') {
+            pendingSelectionKey = msg.key;
+          }
+        });
+
+        var shortcutsModal = document.getElementById('shortcutsModal');
+        if (shortcutsModal) {
+          shortcutsModal.querySelector('[data-action="cancel"]').addEventListener('click', function() {
+            hideModal('shortcutsModal');
+          });
+        }
+        var shortcutsBtn = document.getElementById('shortcutsBtn');
+        if (shortcutsBtn) {
+          shortcutsBtn.addEventListener('click', function() { showModal('shortcutsModal'); });
+        }
+
+        if (/Mac|iPhone|iPad/.test(navigator.platform || '')) {
+          document.querySelectorAll('[data-kbd-mod]').forEach(function(el) {
+            el.textContent = el.textContent.replace('Ctrl', '⌘');
+          });
+        }
+      }
+
       // Initialize drag and drop and keyboard navigation after DOM is ready
+      setupShortcuts(); // first, so its capture-phase Escape runs before the resize handlers end a drag
+      setupWindowResize();
+      setupElementResize();
+      setupBoxResize();
       setupContextMenu();
       setupDragAndDrop();
       setupKeyboardNavigation();
+      fitTextSpans();
       
       // Restore selection if it existed before this update
       restoreSelection();
@@ -6010,16 +7796,27 @@ function renderHtml(webview: vscode.Webview, model: FrmModel, initialZoom: numbe
       // Hooks for the head bootstrap's in-place updates
       window.__frmHooks = {
         isBusy: function() {
-          return !!draggedElement || tabOrderMode || !!document.querySelector('.modal-overlay:not(.hidden)');
+          return !!draggedElement || !!sizeDrag || !!elResize || tabOrderMode ||!!document.querySelector('.modal-overlay:not(.hidden)');
         },
         getSelectionKey: function() {
-          return selectedElement ? selectedElementKey : null;
+          return pendingSelectionKey || (selectedElement ? selectedElementKey : null);
         }
       };
     })();
     </script>
   </body>
   </html>`;
+}
+
+// Stretch handles on a field, image or preview; dir is the edge or corner it moves (n, s, e, w, ne, ...)
+function elementResizeHandles(dirs: string[]): string {
+  return dirs.map(d => `<div class="el-resize ${d}" data-el-resize="${d}"></div>`).join('');
+}
+
+// Stretch handles on a text's box, sitting on its drawn lines (which are inset half a cell from the box element)
+function boxResizeHandles(): string {
+  return ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']
+    .map(d => `<div class="box-resize ${d}" data-box-resize="${d}"></div>`).join('');
 }
 
 function escapeHtml(s: string) {
