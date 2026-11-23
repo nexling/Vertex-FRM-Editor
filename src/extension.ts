@@ -181,8 +181,76 @@ function flushCursorSync(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
 // created the panel, and how long the extension spent building the page
 const pageLoadByPanel = new WeakMap<vscode.WebviewPanel, { start: number; created: boolean; renderMs: number; file: string }>();
 
+// Messages sent by the preview page (media/preview.js)
+
+interface TimingMessage {
+  timeOrigin?: number;
+  placeholderLoaded?: number | null;
+  htmlStart?: number;
+  scriptStart?: number;
+  mainDone?: number;
+  drawn?: number;
+}
+
+interface ElementRefMessage { elementType: string; elementIndex: number; }
+
+interface PositionMessage { type: string; index: number; newRow: number; newCol: number; alreadyDrawn?: boolean; }
+
+/** What the add/edit dialogs send; which of the optional values are present depends on the element type. */
+interface ElementContentMessage {
+  elementType: string;
+  row: number;
+  col: number;
+  // text
+  content?: string;
+  boxRows?: number | null;
+  boxCols?: number | null;
+  // field
+  name?: string;
+  nameFormat?: { angle?: boolean; quoted?: boolean };
+  type?: string;
+  len?: number;
+  ignore?: number | string | null;
+  values?: string[];
+  // pushbutton (also uses name)
+  label?: string;
+  kind?: string;
+  program?: string;
+  value?: string;
+  // preview
+  rows?: number;
+  cols?: number;
+  mode?: string;
+  path?: string;
+  field?: string;
+  portType?: string;
+  portStyle?: string;
+}
+
+interface AddElementMessage extends ElementContentMessage { activeTabId?: number | null; }
+
+interface EditElementMessage extends ElementContentMessage { elementIndex: number; }
+
+interface MoveElementMessage extends ElementRefMessage { targetTabIds: 'all' | number[]; }
+
+interface DuplicateElementMessage extends ElementRefMessage { row: number; }
+
+interface HeaderMessage { title?: string; }
+
+interface PortSizeMessage { rows?: number; cols?: number; }
+
+interface ResizeElementMessage { type: string; index: number; col: number; row?: number; rows?: number; cols?: number; len?: number; }
+
+interface TextBoxMessage { index: number; col: number; boxRows?: number | null; boxCols?: number | null; }
+
+interface TriggerMessage { target: string; program: string; flag: string; }
+
+interface EditTriggerMessage extends TriggerMessage { line: number; createFile?: boolean; openFile?: boolean; }
+
+interface AddTriggerMessage { fieldIndex: number | string; program: string; createFile?: boolean; openFile?: boolean; }
+
 /** Log how long a full page load took, from the page's 'frmTiming' report. */
-function logPageTiming(panel: vscode.WebviewPanel, msg: any) {
+function logPageTiming(panel: vscode.WebviewPanel, msg: TimingMessage) {
   const load = pageLoadByPanel.get(panel);
   if (!load || typeof msg?.timeOrigin !== 'number') return;
   pageLoadByPanel.delete(panel);
@@ -289,9 +357,9 @@ function renderGateHtml(webview: vscode.Webview, c: { texts: number; buttons: nu
 }
 
 
-let customRoot: any;
-let customImg: any;
-let systemImg: any;
+let customRoot: vscode.WorkspaceFolder | undefined;
+let customImg: vscode.Uri | undefined;
+let systemImg: vscode.Uri | undefined;
 
 function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocument, options: { preserveFocus?: boolean } = {}) {
   const preserveFocus = options.preserveFocus ?? false;
@@ -371,7 +439,7 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
   });
 
     // Receive messages (future: editing from preview)
-  panel.webview.onDidReceiveMessage((msg: any) => {
+  panel.webview.onDidReceiveMessage(msg => {
       if (!NON_EDITING_COMMANDS.has(msg?.command) && msg?.type !== 'openTriggerProgram') ignoreCursorMoves(key);
       if (msg?.command === 'gateCancel') {
         createdPanel.dispose();
@@ -442,8 +510,6 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         handleOpenTriggerProgram(msg);
       } else if (msg?.command === 'confirmTabOrder') {
         handleConfirmTabOrder(doc, msg);
-      } else if (msg?.command === 'cancelTabOrder') {
-        handleCancelTabOrder(doc, msg);
       }
     });
     updateWebview(panel, doc);
@@ -452,7 +518,7 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
   }
 }
 
-function handlePositionUpdate(doc: vscode.TextDocument, msg: any) {
+function handlePositionUpdate(doc: vscode.TextDocument, msg: PositionMessage) {
   try {
     const key = doc.uri.toString();
     const text = doc.getText();
@@ -521,7 +587,7 @@ function handlePositionUpdate(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleAddElement(doc: vscode.TextDocument, msg: any) {
+function handleAddElement(doc: vscode.TextDocument, msg: AddElementMessage) {
   try {
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
@@ -726,7 +792,7 @@ function handleAddElement(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleDeleteElement(doc: vscode.TextDocument, msg: any) {
+function handleDeleteElement(doc: vscode.TextDocument, msg: ElementRefMessage) {
   try {
     const elementType = msg.elementType; // 'text', 'field', 'pushbutton'
     const elementIndex = msg.elementIndex;
@@ -812,7 +878,7 @@ function handleDeleteElement(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleUpdateHeader(doc: vscode.TextDocument, msg: any) {
+function handleUpdateHeader(doc: vscode.TextDocument, msg: HeaderMessage) {
   try {
     const title = typeof msg?.title === 'string' ? msg.title : '';
     const escaped = title.replace(/"/g, '\\"');
@@ -877,9 +943,9 @@ function handleUpdateHeader(doc: vscode.TextDocument, msg: any) {
 }
 
 // Writes port_size= rows cols. A missing rows/cols in the message keeps the file's current value.
-function handleSetPortSize(doc: vscode.TextDocument, msg: any) {
+function handleSetPortSize(doc: vscode.TextDocument, msg: PortSizeMessage) {
   try {
-    const valid = (v: any) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+    const valid = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
     const portRegex = /^(\s*port_size\s*=\s*)(\d+)(\s+)(\d+)/i;
@@ -937,9 +1003,9 @@ function handleSetPortSize(doc: vscode.TextDocument, msg: any) {
 
 // Stretching from the preview. Fields: msg.col + msg.len. Images/previews: msg.row, msg.col, msg.rows, msg.cols.
 // Only those numbers are rewritten; the rest of the line keeps its formatting.
-function handleResizeElement(doc: vscode.TextDocument, msg: any) {
+function handleResizeElement(doc: vscode.TextDocument, msg: ResizeElementMessage) {
   try {
-    const int = (v: any, min: number) => typeof v === 'number' && Number.isInteger(v) && v >= min;
+    const int = (v: unknown, min: number) => typeof v === 'number' && Number.isInteger(v) && v >= min;
     const type = msg?.type;
     if (!int(msg?.index, 0) || !int(msg?.col, 1)) return;
     let lineRegex: RegExp;
@@ -988,9 +1054,9 @@ function handleResizeElement(doc: vscode.TextDocument, msg: any) {
 
 // Add or remove the #[rows,cols]* box directive on a text line, and set its column so the label stays put.
 // Only the column and the directive change; the rest of the content is left as written.
-function handleSetTextBox(doc: vscode.TextDocument, msg: any) {
+function handleSetTextBox(doc: vscode.TextDocument, msg: TextBoxMessage) {
   try {
-    const int = (v: any, min: number) => typeof v === 'number' && Number.isInteger(v) && v >= min;
+    const int = (v: unknown, min: number) => typeof v === 'number' && Number.isInteger(v) && v >= min;
     if (!int(msg?.index, 0) || !int(msg?.col, 1)) return;
     const adding = msg.boxRows != null;
     if (adding && (!int(msg.boxRows, 1) || !int(msg.boxCols, 1))) return;
@@ -1043,7 +1109,7 @@ function handleSetTextBox(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleEditElement(doc: vscode.TextDocument, msg: any) {
+function handleEditElement(doc: vscode.TextDocument, msg: EditElementMessage) {
   try {
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
@@ -1154,7 +1220,7 @@ function handleEditElement(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleMoveElement(doc: vscode.TextDocument, msg: any) {
+function handleMoveElement(doc: vscode.TextDocument, msg: MoveElementMessage) {
   try {
     const text = doc.getText();
     const model = parseFrm(text);
@@ -1280,7 +1346,7 @@ const DUPLICATE_SECTION: Record<string, Section> = {
  * (same column), and make it visible on the same tabs. The preview is told up front to
  * select the copy once it re-renders.
  */
-function handleDuplicateElement(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: any): void {
+function handleDuplicateElement(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: DuplicateElementMessage): void {
   const elementType = String(msg?.elementType ?? '');
   const sourceIndex = Number(msg?.elementIndex);
   const row = Number(msg?.row);
@@ -1371,7 +1437,7 @@ async function runDocumentHistory(doc: vscode.TextDocument, panel: vscode.Webvie
   }
 }
 
-function handleShowInSource(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: any) {
+function handleShowInSource(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: ElementRefMessage) {
   try {
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
@@ -1411,7 +1477,7 @@ function handleShowInSource(doc: vscode.TextDocument, panel: vscode.WebviewPanel
   }
 }
 
-function handleEditTrigger(doc: vscode.TextDocument, msg: any) {
+function handleEditTrigger(doc: vscode.TextDocument, msg: EditTriggerMessage) {
   try {
     const { line, target, program, flag, createFile, openFile } = msg;
     const text = doc.getText();
@@ -1444,7 +1510,7 @@ function handleEditTrigger(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleDeleteTrigger(doc: vscode.TextDocument, msg: any) {
+function handleDeleteTrigger(doc: vscode.TextDocument, msg: TriggerMessage) {
   try {
     const { target, program, flag } = msg;
     const text = doc.getText();
@@ -1482,7 +1548,7 @@ function handleDeleteTrigger(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleAddTrigger(doc: vscode.TextDocument, msg: any) {
+function handleAddTrigger(doc: vscode.TextDocument, msg: AddTriggerMessage) {
   try {
     const text = doc.getText();
     const fieldIndex = msg.fieldIndex;
@@ -1519,10 +1585,8 @@ function handleAddTrigger(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleConfirmTabOrder(doc: vscode.TextDocument, msg: any) {
+function handleConfirmTabOrder(doc: vscode.TextDocument, msg: { fieldOrder?: number[] }) {
   try {
-    const key = doc.uri.toString();
-    
     const text = doc.getText();
     const fieldOrder: number[] = msg.fieldOrder || [];
     
@@ -1561,16 +1625,7 @@ function handleConfirmTabOrder(doc: vscode.TextDocument, msg: any) {
   }
 }
 
-function handleCancelTabOrder(doc: vscode.TextDocument, msg: any) {
-  try {
-    const key = doc.uri.toString();
-    // Just exit tab order mode without changes
-  } catch (error) {
-    vscode.window.showErrorMessage(`Error canceling tab order: ${error}`);
-  }
-}
-
-function handleOpenTriggerProgram(msg: any) {
+function handleOpenTriggerProgram(msg: { program?: string }) {
   try {
     const programName = msg.program;
     if (!programName) {
@@ -2380,7 +2435,7 @@ function parseFrm(src: string): FrmModel {
   while ((tm = textRegex.exec(text))) {
     const idx = tm[1] != null ? Number(tm[1]) : undefined;
     const row = Number(tm[2]);
-    let col = Number(tm[3]);
+    const col = Number(tm[3]);
     const raw = ((tm[4] ?? tm[5] ?? '') as string).trim();
     // If came from braces (tm[4]), support concatenation like {LABEL2+":"} by resolving tokens and concatenating
     let content = (tm[5] != null)
@@ -2495,7 +2550,7 @@ function parseFrm(src: string): FrmModel {
     const len = Number(fm[6]);
     // fm[7] is optional ignore value; fm[8] is trailing text containing optional choices
     const tail = (fm[8] ?? '').toString();
-    const values = Array.from(tail.matchAll(/\"([^\"]+)\"/g)).map(x => x[1]);
+    const values = Array.from(tail.matchAll(/"([^"]+)"/g)).map(x => x[1]);
     fields.push({ index: idx, name, nameFormat, type, typeExpr: normalizedTypeExpr, locked, rightAlign, centerAlign, transparent, row, col, len, values });
   }
 
@@ -2799,7 +2854,7 @@ function readFieldValues(name: string): FieldValuesResolution {
     if (!file) continue;
     let text: string;
     try {
-      text = fs.readFileSync(file, 'utf8').replace(/^﻿/, '');
+      text = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
     } catch {
       continue;
     }
@@ -3047,7 +3102,7 @@ async function createTriggerProgramFile(programName: string, openAfterCreate: bo
     }
     
     // Find the first "custom" folder (starts with "custom")
-    let customFolder = workspaceFolders.find(f => f.name.toLowerCase().startsWith('custom'));
+    const customFolder = workspaceFolders.find(f => f.name.toLowerCase().startsWith('custom'));
     if (!customFolder) {
       vscode.window.showErrorMessage('No custom workspace folder found');
       return false;
@@ -3387,14 +3442,6 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
   const hiddenFieldsHtml = hiddenFields.map(f => {
     const fieldIdx = f.index != null ? f.index : model.fields.indexOf(f);
     // const typeExpr = (f.typeExpr ?? '').trim() || String(f.type);
-    let hiddenReason = 'hidden';
-    if (Number(f.row) === 1000 && Number(f.col) === 1000) {
-      hiddenReason = 'row 1000 | col 1000';
-    } else if (Number(f.row) === 1000) {
-      hiddenReason = 'row 1000';
-    } else if (Number(f.col) === 1000) {
-      hiddenReason = 'col 1000';
-    }
     // const valueSummary = f.values.length > 0 ? ` | values ${f.values.length}` : '';
     return `
     <div class="trigger-item hidden-field-item" draggable="true" data-type="field" data-field-idx="${fieldIdx}"${f.index == null ? ' data-no-index="1"' : ''} data-field-name="${escapeAttr(f.name)}" data-row="${f.row}" data-col="${f.col}" data-span="${Math.max(1, f.len + (f.values.length > 0 ? 2 : 0))}" onclick="showHiddenFieldInSource(${fieldIdx})" title="Drag onto the preview to unhide, or click to show in source">

@@ -8,7 +8,7 @@
   window.__frmBoot = true;
   window.__frmScriptStart = performance.now();
   var api = null;
-  try { if (typeof acquireVsCodeApi === 'function') { api = acquireVsCodeApi(); } } catch (e) { /* ignore */ }
+  try { if (typeof acquireVsCodeApi === 'function') { api = acquireVsCodeApi(); } } catch { /* ignore */ }
   window.__frmVscodeApi = api;
 
   // Track every listener the page logic adds, so an update can remove them all before the logic runs
@@ -25,7 +25,7 @@
   window.__frmUpdatePending = function() { return pending !== null; };
 
   function isBusy() {
-    try { return !!(window.__frmHooks && window.__frmHooks.isBusy()); } catch (e) { return false; }
+    try { return !!(window.__frmHooks && window.__frmHooks.isBusy()); } catch { return false; }
   }
 
   function tryApply() {
@@ -135,7 +135,7 @@
   function applyUpdate(msg) {
     try {
       var carry = { selection: null };
-      try { if (window.__frmHooks) carry.selection = window.__frmHooks.getSelection(); } catch (e) { /* ignore */ }
+      try { if (window.__frmHooks) carry.selection = window.__frmHooks.getSelection(); } catch { /* ignore */ }
       var scrollX = window.scrollX;
       var scrollY = window.scrollY;
 
@@ -175,7 +175,6 @@ window.__frmMain = function(D) {
   var root = document.documentElement;
   var basePx = 11; // default matches CSS
   var winstyle = D.winstyle; // vxdbase_winstyle from FRM file
-  var existingTabOrder = D.tabOrder; // existing tab_order from FRM file
   var defaultIgnoreValue = winstyle.toLowerCase() === 'only' ? 4 : 7;
   try {
     var fs = getComputedStyle(root).getPropertyValue('--frm-font-size').trim();
@@ -184,7 +183,7 @@ window.__frmMain = function(D) {
     // --frm-font-size already holds the zoomed size, so reading it would compound the zoom.
     var m = fs.match(/([d.]+)/);
     if (m) basePx = parseFloat(m[1]);
-  } catch (e) { /* ignore */ }
+  } catch { /* ignore */ }
   var currentZoom = 1;
   var currentGridOn = true;
 
@@ -200,10 +199,10 @@ window.__frmMain = function(D) {
       probe.style.fontSize = size;
       document.body.appendChild(probe);
       var w = probe.getBoundingClientRect().width || 8;
-      var w = w - 1;
+      w = w - 1;
       probe.remove();
       root.style.setProperty('--col-w', w + 'px');
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
     scheduleFitTextSpans();
   }
 
@@ -273,7 +272,7 @@ window.__frmMain = function(D) {
       fitBoxGaps();
       // Spans changed: refresh which elements reach outside the window
       if (typeof gridRows === 'number' && typeof gridCols === 'number') updateOverflow(gridRows, gridCols);
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
   }
 
   function applyZoom(z, silent){
@@ -293,7 +292,7 @@ window.__frmMain = function(D) {
   function applyGrid(on, silent){
     currentGridOn = !!on;
     // Set alpha: on => 0.8, off => 0
-    try { root.style.setProperty('--gridline-alpha', currentGridOn ? '0.8' : '0'); } catch(e){}
+    try { root.style.setProperty('--gridline-alpha', currentGridOn ? '0.8' : '0'); } catch { /* ignore */ }
     var gt = document.getElementById('gridToggle');
     if (gt && gt.tagName === 'INPUT') { (gt).checked = !!currentGridOn; }
     if (!silent && vscodeApi && vscodeApi.postMessage) {
@@ -304,7 +303,7 @@ window.__frmMain = function(D) {
         var prev = (vscodeApi.getState && vscodeApi.getState()) || {};
         vscodeApi.setState(Object.assign({}, prev, { gridOn: !!currentGridOn }));
       }
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
   }
 
 
@@ -338,7 +337,7 @@ window.__frmMain = function(D) {
     }
 
 
-  } catch (e) { /* ignore */ }
+  } catch { /* ignore */ }
 
   // Initialize to provided initial zoom
   applyZoom(D.initialZoom, true);
@@ -348,7 +347,7 @@ window.__frmMain = function(D) {
       try {
         var state = vscodeApi && vscodeApi.getState ? (vscodeApi.getState() || {}) : {};
         if (typeof state.gridOn === 'boolean') return state.gridOn;
-      } catch (e) {}
+      } catch { /* ignore */ }
       return D.initialGridOn;
     })();
     applyGrid(initial, true);
@@ -408,7 +407,7 @@ window.__frmMain = function(D) {
         if (imageSet.has(idx)) el.classList.remove('hidden');
         else el.classList.add('hidden');
       });
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
   }
   function switchTab(id) {
     currentActiveTab = id;
@@ -423,7 +422,7 @@ window.__frmMain = function(D) {
         var prev = (vscodeApi.getState && vscodeApi.getState()) || {};
         vscodeApi.setState(Object.assign({}, prev, { activeTabId: id }));
       }
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
   }
   // Tabs an element is shown on; null when it doesn't depend on the tab
   function tabsOfElement(el) {
@@ -441,7 +440,7 @@ window.__frmMain = function(D) {
     try {
       var state = vscodeApi && vscodeApi.getState ? (vscodeApi.getState() || {}) : {};
       if (state && typeof state.activeTabId === 'number') restoreId = state.activeTabId;
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
     if (typeof initialActiveTab === 'number') restoreId = initialActiveTab;
     var hasRestore = tabs.some(function(t){ return String(t.id) === String(restoreId); });
     currentActiveTab = hasRestore ? restoreId : firstId;
@@ -477,7 +476,7 @@ window.__frmMain = function(D) {
     contextMenuState.row = row;
     contextMenuState.col = col;
     // Log the selected grid position for debugging
-    try { console.log('Context menu opened at row:', row, 'col:', col); } catch (e) { /* ignore */ }
+    try { console.log('Context menu opened at row:', row, 'col:', col); } catch { /* ignore */ }
     
     menu.classList.remove('hidden');
     menu.style.left = x + 'px';
@@ -652,7 +651,7 @@ window.__frmMain = function(D) {
       const nameFormatAttr = element.getAttribute('data-field-nameformat');
       try {
         elementData.nameFormat = nameFormatAttr ? JSON.parse(nameFormatAttr) : {};
-      } catch (e) {
+      } catch {
         elementData.nameFormat = {};
       }
       const rawFieldType = element.getAttribute('data-field-type');
@@ -674,7 +673,7 @@ window.__frmMain = function(D) {
       if (rawValues) {
         try {
           elementData.values = JSON.parse(rawValues);
-        } catch (e) {
+        } catch {
           elementData.values = [];
         }
       } else {
@@ -1100,7 +1099,6 @@ window.__frmMain = function(D) {
   function populateTabVisibility(elementType, elementIndex) {
     // Determine which tabs currently show this element
     var currentTabs = [];
-    var optKey = 'opt_' + (elementType === 'pushbutton' ? 'pushbutton' : elementType);
     
     // Check each tab's opt_ list
     var tabLists = elementType === 'text' ? D.tabTexts :
@@ -1401,7 +1399,7 @@ window.__frmMain = function(D) {
           var nameFormat = {};
           try {
             nameFormat = nameFormatAttr ? JSON.parse(nameFormatAttr) : {};
-          } catch (e) {
+          } catch {
             nameFormat = {};
           }
           // Update with current checkbox values
@@ -1422,7 +1420,7 @@ window.__frmMain = function(D) {
           });
         } else {
           // Add new element
-          var nameFormat = {
+          var newNameFormat = {
             angle: document.getElementById('fieldNameAngle').checked,
             quoted: document.getElementById('fieldNameQuoted').checked
           };
@@ -1432,7 +1430,7 @@ window.__frmMain = function(D) {
             row: targetRow,
             col: targetCol,
             name: name,
-            nameFormat: nameFormat,
+            nameFormat: newNameFormat,
             type: type,
             len: len,
             ignore: ignore,
@@ -1626,10 +1624,11 @@ window.__frmMain = function(D) {
           data.elementIndex = editIndex;
         }
 
+        var variable, value;
         // For checkbox/radio, get variable and value
         if (contextMenuState.buttonType === 'checkbox' || contextMenuState.buttonType === 'radio') {
-          var variable = document.getElementById('buttonVariable').value.trim().toUpperCase();
-          var value = document.getElementById('buttonValue').value.trim();
+          variable = document.getElementById('buttonVariable').value.trim().toUpperCase();
+          value = document.getElementById('buttonValue').value.trim();
 
           if (!variable) {
             // Skip if no variable name
@@ -1654,8 +1653,8 @@ window.__frmMain = function(D) {
             }
             data.program = program;
           } else {
-            var variable = document.getElementById('buttonVariable').value.trim().toUpperCase();
-            var value = document.getElementById('buttonValue').value.trim();
+            variable = document.getElementById('buttonVariable').value.trim().toUpperCase();
+            value = document.getElementById('buttonValue').value.trim();
             
             if (!variable) {
               // Skip if no variable name
@@ -2145,11 +2144,10 @@ window.__frmMain = function(D) {
       element.addEventListener('dragstart', function(e) {
         // Dragging moves this element only
         if (selectedElements.length !== 1 || selectedElement !== this) setSelection([this], this);
-        draggedElement = this;
+        draggedElement = element;
         this.classList.add('dragging');
         
         var rect = this.getBoundingClientRect();
-        var gridRect = grid.getBoundingClientRect();
         dragOffset.x = e.clientX - rect.left;
         dragOffset.y = e.clientY - rect.top;
         
@@ -2158,7 +2156,7 @@ window.__frmMain = function(D) {
         if (hiddenPanel && canHide(this)) hiddenPanel.classList.add('hide-drop-ready');
       });
 
-      element.addEventListener('dragend', function(e) {
+      element.addEventListener('dragend', function() {
         this.classList.remove('dragging');
         draggedElement = null;
         grid.classList.remove('drag-over');
@@ -2169,7 +2167,7 @@ window.__frmMain = function(D) {
 
     document.querySelectorAll('.hidden-field-item[draggable="true"]').forEach(function(element) {
       element.addEventListener('dragstart', function(e) {
-        draggedElement = this;
+        draggedElement = element;
         this.classList.add('dragging');
         dragOffset.x = 0;
         dragOffset.y = 0;
@@ -2341,20 +2339,21 @@ window.__frmMain = function(D) {
     };
     
     // Add type-specific identifiers
+    var idx;
     if (type === 'text') {
-      var idx = element.getAttribute('data-text-idx');
+      idx = element.getAttribute('data-text-idx');
       if (idx) data.index = parseInt(idx);
     } else if (type === 'field') {
-      var idx = element.getAttribute('data-field-idx');
+      idx = element.getAttribute('data-field-idx');
       if (idx) data.index = parseInt(idx);
     } else if (type === 'pushbutton') {
-      var idx = element.getAttribute('data-push-idx');
+      idx = element.getAttribute('data-push-idx');
       if (idx) data.index = parseInt(idx);
     } else if (type === 'image') {
-      var idx = element.getAttribute('data-image-idx');
+      idx = element.getAttribute('data-image-idx');
       if (idx) data.index = parseInt(idx);
     } else if (type === 'preview') {
-      var idx = element.getAttribute('data-preview-idx');
+      idx = element.getAttribute('data-preview-idx');
       if (idx) data.index = parseInt(idx);
     }
     
@@ -2789,14 +2788,6 @@ window.__frmMain = function(D) {
     // Remove existing badges
     document.querySelectorAll('.tab-order-badge').forEach(function(el) { el.remove(); });
     
-    // Show message if cleansing existing tab order
-    if (existingTabOrder && existingTabOrder.length > 0) {
-      var msg = 'Existing tab order will be replaced. Click fields in the desired order, then right-click to confirm or cancel.';
-      if (vscodeApi && vscodeApi.postMessage) {
-        // Could send a message to show a VS Code notification, but for now just continue
-      }
-    }
-    
     // Highlight all fields and buttons that affect fields
     document.querySelectorAll('.field').forEach(function(el) {
       el.classList.add('tab-order-mode');
@@ -2973,18 +2964,17 @@ window.__frmMain = function(D) {
     if (!item) return;
     
     var action = item.getAttribute('data-action');
+    var menu = document.getElementById('tabOrderContextMenu');
     if (action === 'confirm-tab-order') {
       e.preventDefault();
       e.stopPropagation();
       confirmTabOrder();
-      var menu = document.getElementById('tabOrderContextMenu');
       if (menu) menu.classList.add('hidden');
       return false;
     } else if (action === 'cancel-tab-order') {
       e.preventDefault();
       e.stopPropagation();
       cancelTabOrder();
-      var menu = document.getElementById('tabOrderContextMenu');
       if (menu) menu.classList.add('hidden');
       return false;
     }
@@ -3058,7 +3048,7 @@ window.__frmMain = function(D) {
       if (!sizeDrag) return;
       var d = sizeDrag;
       sizeDrag = null;
-      try { d.handle.releasePointerCapture(d.pointerId); } catch (e) { /* ignore */ }
+      try { d.handle.releasePointerCapture(d.pointerId); } catch { /* ignore */ }
       frame.classList.remove('resizing', 'resizing-e', 'resizing-s', 'resizing-se');
       if (label) label.classList.add('hidden');
       var changed = d.rows !== d.startRows || d.cols !== d.startCols;
@@ -3093,7 +3083,7 @@ window.__frmMain = function(D) {
           colPitch: (grid.clientWidth + colGap) / gridCols,
           rowPitch: (grid.clientHeight + rowGap) / gridRows
         };
-        try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+        try { handle.setPointerCapture(e.pointerId); } catch { /* ignore */ }
         frame.classList.add('resizing', 'resizing-' + dir);
         showLabel(gridRows, gridCols);
       });
@@ -3120,7 +3110,7 @@ window.__frmMain = function(D) {
         e.preventDefault();
         e.stopPropagation();
         if (sizeDrag) return;
-        try { hideContextMenu(); hideElementContextMenu(); hideOutsideContextMenu(); } catch (err) { /* ignore */ }
+        try { hideContextMenu(); hideElementContextMenu(); hideOutsideContextMenu(); } catch { /* ignore */ }
         var menu = document.getElementById('resizeContextMenu');
         if (!menu) return;
         menu.querySelectorAll('[data-resize-action]').forEach(function(item) {
@@ -3291,7 +3281,7 @@ window.__frmMain = function(D) {
       if (!elResize) return;
       var d = elResize;
       elResize = null;
-      try { d.handle.releasePointerCapture(d.pointerId); } catch (e) { /* ignore */ }
+      try { d.handle.releasePointerCapture(d.pointerId); } catch { /* ignore */ }
       d.handle.classList.remove('active');
       d.el.classList.remove('el-resizing');
       d.el.setAttribute('draggable', 'true');
@@ -3323,7 +3313,7 @@ window.__frmMain = function(D) {
           x: e.clientX, y: e.clientY, start: start, box: start,
           minCols: elMinCols(el), colPitch: m.colPitch, rowPitch: m.rowPitch
         };
-        try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+        try { handle.setPointerCapture(e.pointerId); } catch { /* ignore */ }
         handle.classList.add('active');
         el.classList.add('el-resizing');
         showLabel(el, start);
@@ -3434,7 +3424,7 @@ window.__frmMain = function(D) {
       if (!boxResize) return;
       var d = boxResize;
       boxResize = null;
-      try { d.handle.releasePointerCapture(d.pointerId); } catch (e) { /* ignore */ }
+      try { d.handle.releasePointerCapture(d.pointerId); } catch { /* ignore */ }
       d.handle.classList.remove('active');
       d.box.classList.remove('box-resizing');
       if (label) label.classList.add('hidden');
@@ -3470,7 +3460,7 @@ window.__frmMain = function(D) {
           x: e.clientX, y: e.clientY, start: start, cur: start,
           minCols: boxMinCols(text), colPitch: m.colPitch, rowPitch: m.rowPitch
         };
-        try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+        try { handle.setPointerCapture(e.pointerId); } catch { /* ignore */ }
         handle.classList.add('active');
         box.classList.add('box-resizing');
         showLabel(box, start);
@@ -3564,7 +3554,7 @@ window.__frmMain = function(D) {
     if (!target) return;
     target.focus({ preventScroll: true });
     // Cursor at the end, nothing selected, so typing never wipes an existing value
-    try { var n = target.value.length; target.setSelectionRange(n, n); } catch (err) { /* e.g. number inputs */ }
+    try { var n = target.value.length; target.setSelectionRange(n, n); } catch { /* e.g. number inputs */ }
   }
 
   function restoreCanvasFocus() {
