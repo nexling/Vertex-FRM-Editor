@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { elementsInSelections, findElement, lineContinues } from './elementLookup';
 
 // The extension's install folder; the preview page's styles and script are in its media/ folder
 let extensionUri: vscode.Uri | undefined;
@@ -42,6 +43,9 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(onFocusEditor));
   // The extension activates when an FRM file opens, which can be after its editor got focus
   onFocusEditor(vscode.window.activeTextEditor);
+
+  // Cursor and selection in the FRM text select the matching elements in its preview
+  context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(onEditorSelection));
 
   // Cached lookups and watched folders depend on which folders are open
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -102,6 +106,72 @@ const readyPanels = new WeakSet<vscode.WebviewPanel>();
 // Documents whose preview shows the "introduce indexes" gate instead of the form
 const gatedDocs = new Set<string>();
 const REFRESH_DELAY_MS = 150;
+
+// ---- Code to preview selection ------------------------------------------------------------------
+const CURSOR_DELAY_MS = 50;
+// How long after an edit from the preview the editor's cursor may still move because of it
+const PREVIEW_EDIT_SETTLE_MS = 250;
+// Documents whose cursor moved and whose preview hasn't been told yet
+const cursorSyncPending = new Set<string>();
+const cursorTimerByDoc = new Map<string, ReturnType<typeof setTimeout>>();
+// Until this time, cursor moves the user did not make with mouse or keyboard are the preview's own doing
+const ignoreCursorUntil = new Map<string, number>();
+// Undo/redo started from the preview and still running
+const previewHistoryRuns = new Map<string, number>();
+// Messages from the preview that don't edit the file
+const NON_EDITING_COMMANDS = new Set([
+  'gateCancel', 'frmReady', 'frmTiming', 'frmSoftUpdateFailed', 'setZoom', 'setActiveTab', 'setGridOn',
+  'resolveFieldValues', 'showInSource', 'undo', 'redo', 'cancelTabOrder'
+]);
+
+function followsCursor(): boolean {
+  return vscode.workspace.getConfiguration('vertexFrmPreview').get<boolean>('followCursor', true);
+}
+
+function ignoreCursorMoves(key: string) {
+  ignoreCursorUntil.set(key, Date.now() + PREVIEW_EDIT_SETTLE_MS);
+}
+
+function onEditorSelection(e: vscode.TextEditorSelectionChangeEvent) {
+  const doc = e.textEditor.document;
+  const key = doc.uri.toString();
+  const panel = panelByDoc.get(key);
+  if (!panel || !isFrmFile(doc) || e.textEditor !== vscode.window.activeTextEditor) return;
+  const byUser = e.kind === vscode.TextEditorSelectionChangeKind.Mouse || e.kind === vscode.TextEditorSelectionChangeKind.Keyboard;
+  if (previewHistoryRuns.has(key)) return;
+  if (!byUser && (panel.active || Date.now() < (ignoreCursorUntil.get(key) ?? 0))) return;
+  queueCursorSync(panel, doc);
+}
+
+/** Tell the preview about the cursor shortly, once it has stopped moving. */
+function queueCursorSync(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
+  if (!followsCursor()) return;
+  const key = doc.uri.toString();
+  cursorSyncPending.add(key);
+  const existing = cursorTimerByDoc.get(key);
+  if (existing) clearTimeout(existing);
+  cursorTimerByDoc.set(key, setTimeout(() => {
+    cursorTimerByDoc.delete(key);
+    flushCursorSync(panel, doc);
+  }, CURSOR_DELAY_MS));
+}
+
+/** Send a pending cursor position, if the preview shows the current text; otherwise the next refresh sends it. */
+function flushCursorSync(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
+  const key = doc.uri.toString();
+  if (!cursorSyncPending.has(key) || cursorTimerByDoc.has(key)) return;
+  if (!readyPanels.has(panel) || gatedDocs.has(key) || doc.getText() !== shownTextByDoc.get(key)) return;
+  cursorSyncPending.delete(key);
+  if (!followsCursor()) return;
+  const isOurs = (ed: vscode.TextEditor | undefined) => ed?.document.uri.toString() === key;
+  const active = vscode.window.activeTextEditor;
+  const editor = isOurs(active) ? active : vscode.window.visibleTextEditors.find(isOurs);
+  if (!editor) return;
+  const selected = elementsInSelections(doc.getText().split(/\r?\n/), editor.selections.map(s => ({
+    startLine: s.start.line, endLine: s.end.line, endCharacter: s.end.character, activeLine: s.active.line
+  })));
+  panel.webview.postMessage({ command: 'frmSelectFromCode', ...selected });
+}
 // Full page loads not yet reported by the page: when the load began (Date.now()), whether it
 // created the panel, and how long the extension spent building the page
 const pageLoadByPanel = new WeakMap<vscode.WebviewPanel, { start: number; created: boolean; renderMs: number; file: string }>();
@@ -248,6 +318,11 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
     );
     const createdPanel = panel;
     panelByDoc.set(key, panel);
+    // Start on the element at the cursor, unless the cursor is still where a freshly opened file puts it
+    const openEditor = vscode.window.visibleTextEditors.find(ed => ed.document.uri.toString() === key);
+    if (openEditor && followsCursor() && !openEditor.selection.isEqual(new vscode.Selection(0, 0, 0, 0))) {
+      cursorSyncPending.add(key);
+    }
     pageLoadByPanel.set(panel, { start: openStart, created: true, renderMs: 0, file: vscode.workspace.asRelativePath(doc.uri) });
 
     // Update on document changes (registered once per panel)
@@ -275,6 +350,13 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
     gatedDocs.delete(key);
     shownTextByDoc.delete(key);
     pendingPreviewEdits.delete(key);
+    cursorSyncPending.delete(key);
+    ignoreCursorUntil.delete(key);
+    const cursorTimer = cursorTimerByDoc.get(key);
+    if (cursorTimer) {
+      clearTimeout(cursorTimer);
+      cursorTimerByDoc.delete(key);
+    }
     const timer = refreshTimerByDoc.get(key);
     if (timer) {
       clearTimeout(timer);
@@ -284,12 +366,14 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
 
     // Receive messages (future: editing from preview)
   panel.webview.onDidReceiveMessage((msg: any) => {
+      if (!NON_EDITING_COMMANDS.has(msg?.command) && msg?.type !== 'openTriggerProgram') ignoreCursorMoves(key);
       if (msg?.command === 'gateCancel') {
         createdPanel.dispose();
       } else if (msg?.command === 'autoIndex') {
         autoAddIndexes(doc);
       } else if (msg?.command === 'frmReady') {
         readyPanels.add(createdPanel);
+        flushCursorSync(createdPanel, doc);
       } else if (msg?.command === 'frmTiming') {
         logPageTiming(createdPanel, msg);
       } else if (msg?.command === 'frmSoftUpdateFailed') {
@@ -336,7 +420,7 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
       } else if (msg?.command === 'undo' || msg?.command === 'redo') {
         runDocumentHistory(doc, createdPanel, msg.command);
       } else if (msg?.command === 'showInSource') {
-        handleShowInSource(doc, msg);
+        handleShowInSource(doc, createdPanel, msg);
       } else if (msg?.command === 'addTrigger') {
         handleAddTrigger(doc, msg);
       } else if (msg?.type === 'editTrigger') {
@@ -637,24 +721,16 @@ function handleDeleteElement(doc: vscode.TextDocument, msg: any) {
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
 
-    // Find and remove the element line
-    let elementLineIndex = -1;
-    const elementPattern = new RegExp(`^\\s*${elementType}\\s*\\(\\s*${elementIndex}\\s*\\)\\s*=`, 'i');
-    
-    for (let i = 0; i < lines.length; i++) {
-      if (elementPattern.test(lines[i])) {
-        elementLineIndex = i;
-        break;
-      }
-    }
+    // Find the element's statement
+    const statement = findElement(lines, elementType, elementIndex);
 
-    if (elementLineIndex === -1) {
+    if (!statement) {
       vscode.window.showErrorMessage(`Could not find ${elementType}(${elementIndex})`);
       return;
     }
 
-    // Remove the element line
-    lines.splice(elementLineIndex, 1);
+    // Remove the whole statement, including `\` continuation lines
+    lines.splice(statement.startLine, statement.endLine - statement.startLine + 1);
 
     // Remove from group(1) if it's a field
     if (elementType === 'field') {
@@ -962,14 +1038,7 @@ function handleEditElement(doc: vscode.TextDocument, msg: any) {
     const elementIndex = msg.elementIndex;
 
     // Find the element line
-    let elementLineIndex = -1;
-    const regex = new RegExp(`^\\s*${elementType}\\s*\\(\\s*${elementIndex}\\s*\\)\\s*=`, 'i');
-    for (let i = 0; i < lines.length; i++) {
-      if (regex.test(lines[i])) {
-        elementLineIndex = i;
-        break;
-      }
-    }
+    const elementLineIndex = findElement(lines, elementType, elementIndex)?.startLine ?? -1;
 
     if (elementLineIndex === -1) {
       vscode.window.showErrorMessage(`Could not find ${elementType}(${elementIndex})`);
@@ -1271,6 +1340,8 @@ function handleDuplicateElement(doc: vscode.TextDocument, panel: vscode.WebviewP
  * and the text editor share one history, then hand focus back to the preview.
  */
 async function runDocumentHistory(doc: vscode.TextDocument, panel: vscode.WebviewPanel, command: 'undo' | 'redo') {
+  const key = doc.uri.toString();
+  previewHistoryRuns.set(key, (previewHistoryRuns.get(key) ?? 0) + 1);
   try {
     const visible = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === doc.uri.toString());
     await vscode.window.showTextDocument(doc, { viewColumn: visible?.viewColumn ?? vscode.ViewColumn.One, preserveFocus: false });
@@ -1279,10 +1350,13 @@ async function runDocumentHistory(doc: vscode.TextDocument, panel: vscode.Webvie
     vscode.window.showErrorMessage(`Failed to ${command}: ${error}`);
   } finally {
     panel.reveal(panel.viewColumn, false);
+    ignoreCursorMoves(key);
+    const left = (previewHistoryRuns.get(key) ?? 1) - 1;
+    if (left > 0) previewHistoryRuns.set(key, left); else previewHistoryRuns.delete(key);
   }
 }
 
-function handleShowInSource(doc: vscode.TextDocument, msg: any) {
+function handleShowInSource(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: any) {
   try {
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
@@ -1290,14 +1364,7 @@ function handleShowInSource(doc: vscode.TextDocument, msg: any) {
     const elementIndex = msg.elementIndex;
 
     // Find the line that contains this element
-    let elementLineIndex = -1;
-    const regex = new RegExp(`^\\s*${elementType}\\s*\\(\\s*${elementIndex}\\s*\\)\\s*=`, 'i');
-    for (let i = 0; i < lines.length; i++) {
-      if (regex.test(lines[i])) {
-        elementLineIndex = i;
-        break;
-      }
-    }
+    const elementLineIndex = findElement(lines, elementType, elementIndex)?.startLine ?? -1;
 
     if (elementLineIndex === -1) {
       vscode.window.showWarningMessage(`Could not find ${elementType}(${elementIndex}) in source`);
@@ -1313,6 +1380,7 @@ function handleShowInSource(doc: vscode.TextDocument, msg: any) {
       editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
       // Focus the text editor
       vscode.window.showTextDocument(doc, { viewColumn: editor.viewColumn, preserveFocus: false });
+      queueCursorSync(panel, doc);
     } else {
       // If editor is not visible, open it
       vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One }).then(editor => {
@@ -1320,6 +1388,7 @@ function handleShowInSource(doc: vscode.TextDocument, msg: any) {
         const range = new vscode.Range(line, 0, line, lines[line].length);
         editor.selection = new vscode.Selection(range.start, range.end);
         editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+        queueCursorSync(panel, doc);
       });
     }
   } catch (error) {
@@ -1747,10 +1816,10 @@ function scheduleRefresh(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
       scheduleRefresh(panel, doc);
       return;
     }
-    if (doc.getText() === shownTextByDoc.get(key)) {
-      return;
+    if (doc.getText() !== shownTextByDoc.get(key)) {
+      updateWebview(panel, doc);
     }
-    updateWebview(panel, doc);
+    flushCursorSync(panel, doc);
   }, REFRESH_DELAY_MS));
 }
 
@@ -1874,11 +1943,6 @@ function extractProgramFromTail(tail: string): string | undefined {
   const head = match[1];
   const args = match[2] ? match[2].replace(/\s+\(/, '(') : '';
   return `${head}${args}`.trim();
-}
-
-/** True if a logical FRM statement continues onto the next line. */
-function lineContinues(line: string): boolean {
-  return line.trimEnd().endsWith('\\');
 }
 
 /** Flatten `\`-continued lines in source for regex-based parsing. */
@@ -2466,15 +2530,14 @@ function parseFrm(src: string): FrmModel {
   }
 
   // trigger= target program flag (e.g., trigger= 1 sylomer_edit.prg p)
-  const triggerRegex = /^\s*trigger\s*=\s*(\$?[\w]+)\s+([^\s]+)\s+([^\s\n]*)/gim;
+  // Stays on one line, so a missing flag doesn't take the next line's first word
+  const triggerRegex = /^[ \t]*trigger[ \t]*=[ \t]*(\$?[\w]+)[ \t]+([^\s]+)(?:[ \t]+([^\s]*))?/gim;
   let trm: RegExpExecArray | null;
-  const textLines = text.split('\n');
   while ((trm = triggerRegex.exec(text))) {
     const target = trm[1].trim();
     const program = trm[2].trim();
-    const flag = trm[3].trim();
-    // Find line number for editing
-    const lineIndex = textLines.findIndex(line => line.includes(trm![0]));
+    const flag = (trm[3] ?? '').trim();
+    const lineIndex = text.slice(0, trm.index).split('\n').length - 1;
     triggers.push({ target, program, flag, line: lineIndex });
   }
 
@@ -3292,7 +3355,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
       }
     }
     return `
-    <div class="trigger-item" data-trigger-idx="${idx}" data-trigger-line="${t.line}" data-trigger-program="${escapeAttr(t.program)}">
+    <div class="trigger-item" data-trigger-idx="${idx}" data-trigger-line="${t.line}" data-trigger-target="${escapeAttr(t.target)}" data-trigger-program="${escapeAttr(t.program)}">
       <div class="trigger-target">→ ${targetDisplay}</div>
       <div class="trigger-program">${escapeHtml(t.program)} ${escapeHtml(t.flag)}</div>
       <div class="trigger-actions">
@@ -3316,7 +3379,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     }
     // const valueSummary = f.values.length > 0 ? ` | values ${f.values.length}` : '';
     return `
-    <div class="trigger-item hidden-field-item" draggable="true" data-type="field" data-field-idx="${fieldIdx}" data-row="${f.row}" data-col="${f.col}" data-span="${Math.max(1, f.len + (f.values.length > 0 ? 2 : 0))}" onclick="showHiddenFieldInSource(${fieldIdx})" title="Drag onto the preview to unhide, or click to show in source">
+    <div class="trigger-item hidden-field-item" draggable="true" data-type="field" data-field-idx="${fieldIdx}"${f.index == null ? ' data-no-index="1"' : ''} data-field-name="${escapeAttr(f.name)}" data-row="${f.row}" data-col="${f.col}" data-span="${Math.max(1, f.len + (f.values.length > 0 ? 2 : 0))}" onclick="showHiddenFieldInSource(${fieldIdx})" title="Drag onto the preview to unhide, or click to show in source">
       <div class="trigger-target">Field ${fieldIdx} - ${escapeHtml(f.name)}</div>
       <div class="trigger-actions">
         <button class="trigger-action-btn delete" onclick="deleteHiddenField(event, ${fieldIdx})" title="Delete">×</button>
@@ -3425,9 +3488,9 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
               </h4>
               ${triggersHtml || '<div class="sidebar-empty">No triggers.</div>'}
             </div>
-            <div class="triggers-panel">
+            <div class="triggers-panel" id="hiddenFieldsPanel">
               <h4>Hidden Fields (${hiddenFields.length})</h4>
-              ${hiddenFields.length > 0 ? '<div class="sidebar-note">Drag a hidden field onto the preview to place it back on the form.</div>' : ''}
+              <div class="sidebar-note">Drag a field here to hide it; drag it onto the form to show it.</div>
               ${hiddenFieldsHtml || '<div class="sidebar-empty">No hidden fields.</div>'}
             </div>
             ${model.tabOrder && model.tabOrder.length > 0 ? `
@@ -3842,12 +3905,15 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
       </div>
     </div>
 
+    <div id="selectionNotice" class="selection-notice hidden" role="status"></div>
+
     <!-- Keyboard Shortcuts -->
     <div id="shortcutsModal" class="modal-overlay hidden">
       <div class="modal shortcuts-modal">
         <h3>Keyboard Shortcuts</h3>
         <div class="shortcuts-grid">
           <h4>Selected element</h4>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+click</span><span>Add to or remove from the selection</span>
           <span><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span><span>Move one cell</span>
           <span><kbd>Shift</kbd>+<kbd>Arrow</kbd></span><span>Stretch (fields, images, previews)</span>
           <span><kbd>F2</kbd> / <kbd>Enter</kbd></span><span>Edit</span>

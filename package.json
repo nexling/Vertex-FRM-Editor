@@ -72,6 +72,11 @@
           "type": "boolean",
           "default": true,
           "description": "Bring an FRM file's existing preview to the front when you switch back to that file."
+        },
+        "vertexFrmPreview.followCursor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Select the elements at the text cursor or selection in the FRM preview."
         }
       }
     }

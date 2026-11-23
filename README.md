@@ -9,7 +9,11 @@ This lightweight VS Code extension adds a live preview for Vertex FRM form files
 - Webview shows a simple form UI reflecting `field()` entries with list choices
 - Drag the form's right edge, bottom edge or bottom-right corner to set `port_size= rows cols` (snaps to whole cells). Right-click a handle to set width, height or both back to auto (0).
 - Stretch elements instead of typing sizes: drag a field's right edge to change `len`, or its left edge to move `col` and change `len` together. Images and previews stretch from all edges and corners (`rows`/`cols`, left/top also move the start). Shift+Arrow stretches the selected element by one cell. Snaps to whole cells; one Ctrl+Z undoes it.
+- Drag a field onto the Hidden Fields panel to hide it (sets its position to `1000 1000`); drag it from the panel onto the form to show it again. One Ctrl+Z undoes it.
 - Updates as you type
+- Click in the code to select in the preview: the element defined at the cursor is selected, and a text selection or several cursors select several. Hidden fields and bottom-bar buttons are only highlighted. The form tab switches and the preview scrolls when needed; focus stays in the editor.
+- Put the text cursor on a `trigger=` line, or hover a trigger in the preview's list, to highlight the field it fires from and the buttons that set that field (`0` highlights all fields and their buttons, `$...` outlines the form). Only a highlight: the selection is not changed by hovering.
+- Ctrl+click elements in the preview to select several. Editing keys work on one selected element at a time.
 - Keyboard shortcuts (press `?` or the ⌨ button in the preview for the full list; ⌘ instead of Ctrl on Mac):
   - Selected element: arrows move, Shift+Arrow stretches, F2/Enter edits, Ctrl+D duplicates one row below, Del/Backspace deletes, Esc deselects
   - Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: undo/redo in the FRM file (same history as the text editor)
@@ -20,6 +24,7 @@ This lightweight VS Code extension adds a live preview for Vertex FRM form files
 Settings:
 - `vertexFrmPreview.autoOpen` (default `true`): automatically open a preview when an FRM file gets focus and has no preview yet. The new preview takes focus.
 - `vertexFrmPreview.autoReveal` (default `true`): bring an FRM file's existing preview to the front when you switch back to that file. Focus stays in the editor. When off, the preview stays where it is (it still updates live).
+- `vertexFrmPreview.followCursor` (default `true`): select the elements at the text cursor in the preview. Never opens or reveals a preview.
 - `vertexFrmPreview.showZoomControls` (default `true`): show zoom buttons and slider in the preview titlebar.
 
 The "Open FRM Preview" command always opens/reveals and focuses the preview, regardless of these settings.
