@@ -1,5 +1,6 @@
 .vscode/**
 src/**
+test/**
 out/**/*.map
 out/extension - Copy*
 **/*.vsix

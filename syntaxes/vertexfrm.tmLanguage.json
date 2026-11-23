@@ -1,10 +1,131 @@
 {
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Vertex FRM",
   "scopeName": "source.vertexfrm",
   "patterns": [
-    { "match": "^\\s*!.*$", "name": "comment.line.exclamation.vertexfrm" },
-    { "match": "\\b(field|group|header|charset|port_size|text|trigger)\\b", "name": "keyword.control.vertexfrm" },
-    { "match": "\"[^\"]*\"", "name": "string.quoted.double.vertexfrm" },
-    { "match": "\\b[0-9]+\\b", "name": "constant.numeric.vertexfrm" },
-    { "match": "[{}()=]", "name": "punctuation.vertexfrm" }
-  ]
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#variables"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.todo.vertexfrm",
+          "match": "(?:^|;)\\s*!.*TODO.*$"
+        },
+        {
+          "name": "comment.line.problem.vertexfrm",
+          "match": "(?:^|;)\\s*!.*PROBLEM.*$"
+        },
+        {
+          "name": "comment.line.temporary.vertexfrm",
+          "match": "(?:^|;)\\s*!.*TEMP.*$"
+        },
+        {
+          "name": "comment.line.debug.vertexfrm",
+          "match": "(?:^|;)\\s*!.*DEBUG.*$"
+        },
+        {
+          "name": "comment.line.old.vertexfrm",
+          "match": "(?:^|;)\\s*!.*OLD.*$"
+        },
+        {
+          "name": "comment.line.new.vertexfrm",
+          "match": "(?:^|;)\\s*!.*NEW.*$"
+        },
+        {
+          "name": "comment.line.question.vertexfrm",
+          "match": "(?:^|;)\\s*!.*QUEST.*$"
+        },
+        {
+          "name": "comment.line.info.vertexfrm",
+          "match": "(?:^|;)\\s*!.*INFO.*$"
+        },
+        {
+          "name": "comment.line.exclamation.vertexfrm",
+          "match": "(?:^|;)\\s*!.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.hash.vertexfrm",
+          "begin": "^###",
+          "end": "###$"
+        },
+        {
+          "name": "string.quoted.double.vertexfrm",
+          "begin": "\"",
+          "end": "\"|$",
+          "patterns": [
+            {
+              "name": "constant.character.escape.vertexfrm",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.strsyntax.vertexfrm",
+          "match": "(?i)^\\s*charset\\b.*"
+        },
+        {
+          "name": "support.function.vertexfrm",
+          "match": "(?i)^\\s*(?:opt_\\w+|\\w+_of_field|save_label|cancel_button|ok_button|sort_mode|sort_order|preview|language|connection_of_field|mat_prop_attributes|connection|confirm_ok|cancel_label|ok_label|listboxbutton_of_field|image|master_control|button|tab_order|text|field|pushbutton|text_font|field_font|port_size|vxdbase_winstyle|header|page_header|has_pulldowns|group|trigger|status_bar|revision|help_label|help_file|filter_row|help_button|page_listview|save_button|option_button|bgimage)\\b(?=\\s*(?:\\(|=|$))"
+        },
+        {
+          "name": "support.function.vertexfrm",
+          "match": "\\b(?:RADIO|CHECKBOX)\\b"
+        }
+      ]
+    },
+    "variables": {
+      "patterns": [
+        {
+          "name": "variable.string.vertexfrm",
+          "match": "\\b[A-Za-z][A-Za-z0-9_]*\\$"
+        },
+        {
+          "name": "variable.other.vertexfrm",
+          "match": "\\$?\\b[A-Za-z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.vertexfrm",
+          "match": "\\b\\d+(?:\\.\\d+)?\\b"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.semicolon.vertexfrm",
+          "match": ";"
+        }
+      ]
+    }
+  }
 }

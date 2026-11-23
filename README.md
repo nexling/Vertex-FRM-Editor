@@ -1,8 +1,20 @@
-# Vertex FRM Preview (Workspace-local)
+# Vertex FRM
 
-This lightweight VS Code extension adds a live preview for Vertex FRM form files.
+This VS Code extension supports Vertex FRM form files (`.frm`, `.vxf`, `.form`, `.vf`): a live, editable preview plus language features in the text editor. It replaces the separate Vertex-FRM extension; uninstall that one.
 
-- Syntax highlighting for .frm and files named `closet`
+## Text editor
+
+- Syntax colours, including tagged comments (`TODO`, `PROBLEM`, `TEMP`, `DEBUG`, `OLD`, `NEW`, `QUEST`, `INFO`). The FRM-specific colours work under any theme.
+- Completion and hover help for keywords, at the start of a line, and `RADIO`/`CHECKBOX` on button lines.
+- Problems, updated as you type:
+  - Errors: malformed `port_size`, `text_font`, `field_font`, `vxdbase_winstyle` or `header`; duplicate indexes; a field in no group; a group with an undeclared field.
+  - Warnings: `opt_*`, `tab_order` or `trigger` referring to an item that doesn't exist; `button` and `pushbutton` in the same form.
+  - Information: an item on no tab (only once the form has an `opt_*` list of that kind; hidden items and bottom-bar buttons are skipped); fields but no group.
+- Commands "FRM: Renumber fields", "FRM: Renumber texts" and "FRM: Renumber buttons" number the items in file order and update `group`, `opt_*`, `tab_order` and `trigger` references. List order is kept. With a selection, only the selected lines are numbered, from their lowest index, skipping indexes in use. `connection_of_field` and other `*_of_field` lines are not changed; a warning lists them.
+- "FRM: Convert all pushbuttons to buttons" (also a quick fix and a preview banner) for forms that mix both. A pushbutton whose index a button also uses gets the next free one; tab lists follow.
+
+## Preview
+
 - Command: "Open FRM Preview" (appears in editor title bar for FRM files)
 - Command: "FRM: Sort sections" (command palette / editor right-click) reorders the file into section order: `charset`, header block, `text`, `field`, `group`, `button`, `image`, `preview`, `opt_*`, `tab_order`, `trigger`. Lines added from the preview are always inserted in their section.
 - Indexes required: the preview only works with `text(n)=`, `button(n)=` and `pushbutton(n)=` lines. If a form has any of these without an index, opening the preview shows a prompt instead of the form: **Auto-add indexes** numbers them (next free index in file order; `button`/`pushbutton` share one sequence; existing indexes are never changed; one Ctrl+Z undoes it), **Cancel** closes the preview. An unindexed line typed while the preview is open is shown locked, with a banner offering the same auto-add.
@@ -22,6 +34,7 @@ This lightweight VS Code extension adds a live preview for Vertex FRM form files
   - Tab-order mode: Enter confirms, Esc cancels
 
 Settings:
+- `vertexFrmPreview.diagnostics` (default `true`): show problems found in FRM files.
 - `vertexFrmPreview.autoOpen` (default `true`): automatically open a preview when an FRM file gets focus and has no preview yet. The new preview takes focus.
 - `vertexFrmPreview.autoReveal` (default `true`): bring an FRM file's existing preview to the front when you switch back to that file. Focus stays in the editor. When off, the preview stays where it is (it still updates live).
 - `vertexFrmPreview.followCursor` (default `true`): select the elements at the text cursor in the preview. Never opens or reveals a preview.
@@ -39,8 +52,11 @@ Notes:
 2. Build: `npm run compile` (or `npm run watch`).
 3. Press F5 to launch an Extension Development Host. Open a FRM file and click "Open FRM Preview" in the editor title.
 
+Run the tests with `npm test`.
+
 Where things are:
 - `src/extension.ts`: the extension. Parses the FRM file (`parseFrm`), renders the form's markup and data (`renderPreview`), and applies edits from the preview to the file.
+- `src/languageFeatures.ts`: completion, hover, problems and renumber commands. The logic is in `keywords.ts` (help text), `keywordContext.ts`, `diagnostics.ts`, `renumber.ts` and `frmStatements.ts`, which don't depend on VS Code and are tested in `test/`.
 - `media/preview.css` and `media/preview.js`: the preview page's styles and script, plain files that need no build step. The page loads them once; each refresh sends a `frmUpdate` message with the new markup and data. `preview.js` patches the page to match the new markup, keeping elements that are still there, and runs the page logic (`window.__frmMain(data)`) again. The logic may add listeners freely: all of them are removed before it runs again.
 
 #### TODO:

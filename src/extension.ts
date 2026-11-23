@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { elementsInSelections, findElement, lineContinues } from './elementLookup';
+import { newButtonKeyword } from './frmStatements';
+import { convertButtons, registerLanguageFeatures, usesMixedButtons } from './languageFeatures';
 
 // The extension's install folder; the preview page's styles and script are in its media/ folder
 let extensionUri: vscode.Uri | undefined;
@@ -9,12 +11,12 @@ function mediaRoot(): vscode.Uri {
   return vscode.Uri.joinPath(extensionUri!, 'media');
 }
 
-// "Vertex FRM Preview" output channel; shows how long each preview took to appear
+// "Vertex FRM" output channel; shows how long each preview took to appear
 let log: vscode.LogOutputChannel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   extensionUri = context.extensionUri;
-  log = vscode.window.createOutputChannel('Vertex FRM Preview', { log: true });
+  log = vscode.window.createOutputChannel('Vertex FRM', { log: true });
   context.subscriptions.push(log);
   // The extension starts once VS Code is up (onStartupFinished), so read the files every first
   // preview needs now instead of while it opens. Deferred so activation itself stays quick.
@@ -27,6 +29,7 @@ export function activate(context: vscode.ExtensionContext) {
   const openCmd = vscode.commands.registerCommand('vertexFrmPreview.open', () => openPreview(context));
   context.subscriptions.push(openCmd);
   context.subscriptions.push(vscode.commands.registerCommand('vertexFrmPreview.sortSections', sortSectionsCommand));
+  registerLanguageFeatures(context);
 
   // Auto-open / auto-reveal when a vertex-frm file is focused (each controlled by a setting)
   const onFocusEditor = (ed: vscode.TextEditor | undefined) => {
@@ -71,7 +74,7 @@ export function deactivate() {}
 
 function isFrmFile(doc: vscode.TextDocument) {
   const ext = doc.uri.fsPath.split('.').pop()?.toLowerCase();
-  return doc.languageId === 'vertex-frm' || ext === 'frm';
+  return doc.languageId === 'vertexfrm' || ext === 'frm';
 }
 
 function openPreview(context: vscode.ExtensionContext) {
@@ -105,6 +108,8 @@ const pendingPreviewEdits = new Map<string, number>();
 const readyPanels = new WeakSet<vscode.WebviewPanel>();
 // Documents whose preview shows the "introduce indexes" gate instead of the form
 const gatedDocs = new Set<string>();
+// Documents whose button/pushbutton banner was closed; shown again when the preview is reopened
+const mixedButtonsDismissed = new Set<string>();
 const REFRESH_DELAY_MS = 150;
 
 // ---- Code to preview selection ------------------------------------------------------------------
@@ -121,7 +126,7 @@ const previewHistoryRuns = new Map<string, number>();
 // Messages from the preview that don't edit the file
 const NON_EDITING_COMMANDS = new Set([
   'gateCancel', 'frmReady', 'frmTiming', 'frmSoftUpdateFailed', 'setZoom', 'setActiveTab', 'setGridOn',
-  'resolveFieldValues', 'showInSource', 'undo', 'redo', 'cancelTabOrder'
+  'resolveFieldValues', 'showInSource', 'undo', 'redo', 'cancelTabOrder', 'dismissMixedButtons'
 ]);
 
 function followsCursor(): boolean {
@@ -348,6 +353,7 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
     activeTabByDoc.delete(key);
     gridOnByDoc.delete(key);
     gatedDocs.delete(key);
+    mixedButtonsDismissed.delete(key);
     shownTextByDoc.delete(key);
     pendingPreviewEdits.delete(key);
     cursorSyncPending.delete(key);
@@ -371,6 +377,11 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         createdPanel.dispose();
       } else if (msg?.command === 'autoIndex') {
         autoAddIndexes(doc);
+      } else if (msg?.command === 'convertButtons') {
+        convertButtons(doc);
+      } else if (msg?.command === 'dismissMixedButtons') {
+        mixedButtonsDismissed.add(key);
+        updateWebview(createdPanel, doc);
       } else if (msg?.command === 'frmReady') {
         readyPanels.add(createdPanel);
         flushCursorSync(createdPanel, doc);
@@ -597,11 +608,11 @@ function handleAddElement(doc: vscode.TextDocument, msg: any) {
       if (kind === 'checkbox') {
         const name = msg.name || 'VAR';
         const value = msg.value || '1;0';
-        newLine = `pushbutton(${nextIndex})= ${msg.row} ${msg.col} "${label}" CHECKBOX ${name}=${value}`;
+        newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" CHECKBOX ${name}=${value}`;
       } else if (kind === 'radio') {
         const name = msg.name || 'VAR';
         const value = msg.value || '1;0';
-        newLine = `pushbutton(${nextIndex})= ${msg.row} ${msg.col} "${label}" RADIO ${name}=${value}`;
+        newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" RADIO ${name}=${value}`;
       } else {
         // General button
         if (msg.program) {
@@ -610,14 +621,14 @@ function handleAddElement(doc: vscode.TextDocument, msg: any) {
           if (!program.startsWith('@')) {
             program = '@' + program;
           }
-          newLine = `pushbutton(${nextIndex})= ${msg.row} ${msg.col} "${label}" ${program} P`;
+          newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" ${program} P`;
         } else if (msg.name) {
           // Variable assignment (less common for general buttons, but supported)
           const value = msg.value || '1';
-          newLine = `pushbutton(${nextIndex})= ${msg.row} ${msg.col} "${label}" ${msg.name}=${value}`;
+          newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" ${msg.name}=${value}`;
         } else {
           // Basic button with no action
-          newLine = `pushbutton(${nextIndex})= ${msg.row} ${msg.col} "${label}"`;
+          newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}"`;
         }
       }
     } else if (elementType === 'preview') {
@@ -668,11 +679,13 @@ function handleAddElement(doc: vscode.TextDocument, msg: any) {
       } else if (elementType === 'field') {
         optKey = 'opt_field';
       } else if (elementType === 'pushbutton') {
-        optKey = 'opt_pushbutton';
+        optKey = `opt_${newButtonKeyword(lines)}`;
       }
       
       if (optKey) {
-        const optRegex = new RegExp(`^\\s*${optKey}\\s*\\(\\s*${tabId}\\s*\\)\\s*=`, 'i');
+        // An existing list is used whichever way it spells opt_button
+        const optName = elementType === 'pushbutton' ? 'opt_(?:push)?button' : optKey;
+        const optRegex = new RegExp(`^\\s*${optName}\\s*\\(\\s*${tabId}\\s*\\)\\s*=`, 'i');
         let foundOpt = false;
         
         for (let i = 0; i < updatedLines.length; i++) {
@@ -686,7 +699,7 @@ function handleAddElement(doc: vscode.TextDocument, msg: any) {
               return numA - numB;
             });
             const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(updatedLines[i]) : undefined;
-            replaceContinuedStatement(updatedLines, i, formatIndexStatement(`${optKey}(${tabId})`, sortedItems, wrapAt));
+            replaceContinuedStatement(updatedLines, i, formatIndexStatement(statementKeyword(updatedLines[i]), sortedItems, wrapAt));
             foundOpt = true;
             break;
           }
@@ -1079,16 +1092,18 @@ function handleEditElement(doc: vscode.TextDocument, msg: any) {
       }
       newLine = `field(${elementIndex})= ${formattedName} ${type} ${msg.row} ${msg.col} ${len} ${ignore}${valuesStr}`;
     } else if (elementType === 'pushbutton') {
+      // Keep the spelling the line already uses
+      const buttonKeyword = lines[elementLineIndex].match(/^\s*((?:push)?button)\b/i)?.[1] ?? 'button';
       const label = msg.label || '';
       const kind = msg.kind || 'select';
       if (kind === 'checkbox') {
         const name = msg.name || 'VAR';
         const value = msg.value || '1;0';
-        newLine = `pushbutton(${elementIndex})= ${msg.row} ${msg.col} "${label}" CHECKBOX ${name}=${value}`;
+        newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" CHECKBOX ${name}=${value}`;
       } else if (kind === 'radio') {
         const name = msg.name || 'VAR';
         const value = msg.value || '1';
-        newLine = `pushbutton(${elementIndex})= ${msg.row} ${msg.col} "${label}" RADIO ${name}=${value}`;
+        newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" RADIO ${name}=${value}`;
       } else {
         // General button
         if (msg.program) {
@@ -1097,14 +1112,14 @@ function handleEditElement(doc: vscode.TextDocument, msg: any) {
           if (!program.startsWith('@')) {
             program = '@' + program;
           }
-          newLine = `pushbutton(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${program} P`;
+          newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${program} P`;
         } else if (msg.name) {
           // Variable assignment (less common for general buttons, but supported)
           const value = msg.value || '1';
-          newLine = `pushbutton(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${msg.name}=${value}`;
+          newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${msg.name}=${value}`;
         } else {
           // Basic button with no action
-          newLine = `pushbutton(${elementIndex})= ${msg.row} ${msg.col} "${label}"`;
+          newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}"`;
         }
       }
     } else if (elementType === 'preview') {
@@ -1179,7 +1194,7 @@ function handleMoveElement(doc: vscode.TextDocument, msg: any) {
     const tabsToAdd = targetTabIds === 'all' ? model.tabs.map(t => t.id) : targetTabIds;
 
     // Add to each target tab's opt_ list
-    const optKeyword = elementType === 'pushbutton' ? 'opt_pushbutton' : `opt_${elementType}`;
+    const optKeyword = elementType === 'pushbutton' ? `opt_${newButtonKeyword(lines)}` : `opt_${elementType}`;
     
     for (const targetTabId of tabsToAdd) {
       const targetOptPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*${targetTabId}\\s*\\)\\s*=`, 'i');
@@ -1782,7 +1797,8 @@ function updateWebview(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
   const initialGridOn = gridOnByDoc.get(doc.uri.toString());
   const availableTriggerPrograms = getAvailableTriggerPrograms();
   const showZoomControls = vscode.workspace.getConfiguration('vertexFrmPreview').get<boolean>('showZoomControls', true);
-  const parts = renderPreview(model, { initialZoom, initialActiveTab: initialTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed });
+  const mixedButtons = !mixedButtonsDismissed.has(key) && usesMixedButtons(text);
+  const parts = renderPreview(model, { initialZoom, initialActiveTab: initialTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed, mixedButtons });
   shownTextByDoc.set(doc.uri.toString(), text);
   if (readyPanels.has(panel)) {
     // Patch the loaded page in place: no reload (which flashes), and the styles and script aren't sent again
@@ -3189,6 +3205,8 @@ interface PreviewOptions {
   availableTriggerPrograms: string[];
   showZoomControls: boolean;
   unindexed: { texts: number; buttons: number };
+  /** Show the banner offering to convert pushbuttons to buttons. */
+  mixedButtons: boolean;
 }
 
 /** One render of the form: the page body's markup and the data its script runs with. */
@@ -3202,7 +3220,7 @@ interface PreviewParts {
  * so a refresh only sends this body and data; the page patches its body to match.
  */
 function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
-  const { initialZoom, initialActiveTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed } = opts;
+  const { initialZoom, initialActiveTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed, mixedButtons } = opts;
   const unindexedMsg = unindexed.texts + unindexed.buttons > 0 ? unindexedMessage(unindexed) : null;
 
   const texts = model.texts.map(t => {
@@ -3423,6 +3441,11 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     ${unindexedMsg ? `<div class="unindexed-strip">
       <span class="msg">${escapeHtml(unindexedMsg.title)}<span class="detail">${escapeHtml(unindexedMsg.detail)}</span></span>
       <button onclick="window.__frmVscodeApi && window.__frmVscodeApi.postMessage({ command: 'autoIndex' })">Auto-add indexes</button>
+    </div>` : ''}
+    ${mixedButtons ? `<div class="unindexed-strip">
+      <span class="msg">A form can not use both button and pushbutton. Do you want to convert all pushbuttons to buttons?</span>
+      <button onclick="window.__frmVscodeApi && window.__frmVscodeApi.postMessage({ command: 'convertButtons' })">Convert</button>
+      <button onclick="window.__frmVscodeApi && window.__frmVscodeApi.postMessage({ command: 'dismissMixedButtons' })">Dismiss</button>
     </div>` : ''}
     <div class="window">
       <div class="titlebar">
