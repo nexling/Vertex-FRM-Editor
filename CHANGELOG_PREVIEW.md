@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-11-23
+
+### Added
+
+- The Vertex-FRM extension is merged into this one: syntax colours, completion, hover help, problems and renumber commands, without a language server. The display name is now "Vertex FRM". A notice asks to uninstall the old extension if it is still installed.
+- Problems for duplicate indexes and for `opt_*`, `tab_order` and `trigger` lines that refer to missing items. Setting `vertexFrmPreview.diagnostics` turns all problems off.
+- Forms that mix `button` and `pushbutton` get a warning with a quick fix, a banner in the preview and a "Convert all pushbuttons to buttons" command.
+- FRM colours apply under any theme. The `FRM-Theme-Dark` and `FRM-Theme-Dark-Vector` themes are gone.
+
+### Changed
+
+- The renumber commands are now `vertexFrmPreview.renumberFields`, `renumberTexts` and `renumberButtons`.
+- Buttons added in the preview are written as `button`, unless the form only uses `pushbutton`. Editing a button keeps its spelling.
+- Completion and hover only apply where a keyword can stand, not in labels or comments.
+
+### Fixed
+
+- The check for items on no tab stopped after the first statement.
+- The group check needed every group to list every field, and read numbers in comments as fields.
+- Renumbering fields now updates triggers, keeps the group's browse order and leaves the third fixed group value of `revision= 2` alone.
+- Renumbering buttons includes `button` and `opt_button`. Renumbering a selection no longer creates duplicate indexes.
+- The preview opens automatically for `.vxf`, `.form` and `.vf` files too.
+
 ## 2026-11-21
 
 ### Added

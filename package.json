@@ -1,7 +1,7 @@
 {
   "name": "vertex-frm-preview",
-  "displayName": "Vertex FRM Preview",
-  "description": "Live preview for Vertex FRM form files inside VS Code",
+  "displayName": "Vertex FRM",
+  "description": "Vertex FRM form files: live preview and editing, syntax colours, completion, hover help and diagnostics",
   "version": "0.0.1",
   "repository": {
     "type": "git",
@@ -12,15 +12,24 @@
     "vscode": "^1.85.0"
   },
   "categories": [
+    "Programming Languages",
     "Other"
   ],
   "contributes": {
     "languages": [
       {
         "id": "vertexfrm",
+        "aliases": [
+          "Vertex FRM",
+          "vertexfrm"
+        ],
         "extensions": [
-          ".frm"
-        ]
+          ".frm",
+          ".vxf",
+          ".form",
+          ".vf"
+        ],
+        "configuration": "./language-configuration.json"
       }
     ],
     "commands": [
@@ -31,6 +40,22 @@
       {
         "command": "vertexFrmPreview.sortSections",
         "title": "FRM: Sort sections"
+      },
+      {
+        "command": "vertexFrmPreview.renumberFields",
+        "title": "FRM: Renumber fields"
+      },
+      {
+        "command": "vertexFrmPreview.renumberTexts",
+        "title": "FRM: Renumber texts"
+      },
+      {
+        "command": "vertexFrmPreview.renumberButtons",
+        "title": "FRM: Renumber buttons"
+      },
+      {
+        "command": "vertexFrmPreview.convertPushbuttons",
+        "title": "FRM: Convert all pushbuttons to buttons"
       }
     ],
     "menus": {
@@ -38,6 +63,22 @@
         {
           "command": "vertexFrmPreview.sortSections",
           "when": "resourceLangId == vertexfrm || resourceExtname == .frm"
+        },
+        {
+          "command": "vertexFrmPreview.renumberFields",
+          "when": "editorLangId == vertexfrm"
+        },
+        {
+          "command": "vertexFrmPreview.renumberTexts",
+          "when": "editorLangId == vertexfrm"
+        },
+        {
+          "command": "vertexFrmPreview.renumberButtons",
+          "when": "editorLangId == vertexfrm"
+        },
+        {
+          "command": "vertexFrmPreview.convertPushbuttons",
+          "when": "editorLangId == vertexfrm"
         }
       ],
       "editor/context": [
@@ -56,7 +97,7 @@
       ]
     },
     "configuration": {
-      "title": "Vertex FRM Preview",
+      "title": "Vertex FRM",
       "properties": {
         "vertexFrmPreview.showZoomControls": {
           "type": "boolean",
@@ -72,7 +113,103 @@
           "type": "boolean",
           "default": true,
           "description": "Bring an FRM file's existing preview to the front when you switch back to that file."
+        },
+        "vertexFrmPreview.followCursor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Select the elements at the text cursor or selection in the FRM preview."
+        },
+        "vertexFrmPreview.diagnostics": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Show problems found in FRM files."
         }
+      }
+    },
+    "grammars": [
+      {
+        "language": "vertexfrm",
+        "scopeName": "source.vertexfrm",
+        "path": "./syntaxes/vertexfrm.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "editor.tokenColorCustomizations": {
+        "textMateRules": [
+          {
+            "scope": "comment.line.todo.vertexfrm",
+            "settings": {
+              "foreground": "#0bc402"
+            }
+          },
+          {
+            "scope": "comment.line.problem.vertexfrm",
+            "settings": {
+              "foreground": "#acc74a"
+            }
+          },
+          {
+            "scope": "comment.line.temporary.vertexfrm",
+            "settings": {
+              "foreground": "#929a75"
+            }
+          },
+          {
+            "scope": "comment.line.debug.vertexfrm",
+            "settings": {
+              "foreground": "#c7784a"
+            }
+          },
+          {
+            "scope": "comment.line.old.vertexfrm",
+            "settings": {
+              "foreground": "#879787"
+            }
+          },
+          {
+            "scope": "comment.line.new.vertexfrm",
+            "settings": {
+              "foreground": "#c3f8c3"
+            }
+          },
+          {
+            "scope": "comment.line.question.vertexfrm",
+            "settings": {
+              "foreground": "#a19311"
+            }
+          },
+          {
+            "scope": "comment.line.info.vertexfrm",
+            "settings": {
+              "foreground": "#2591c4"
+            }
+          },
+          {
+            "scope": "variable.string.vertexfrm",
+            "settings": {
+              "foreground": "#2581b3"
+            }
+          },
+          {
+            "scope": "string.hash.vertexfrm",
+            "settings": {
+              "foreground": "#4FC1FF"
+            }
+          },
+          {
+            "scope": "keyword.strsyntax.vertexfrm",
+            "settings": {
+              "foreground": "#eb8989"
+            }
+          },
+          {
+            "scope": "punctuation.separator.semicolon.vertexfrm",
+            "settings": {
+              "foreground": "#960000"
+            }
+          }
+        ]
       }
     }
   },
@@ -84,7 +221,8 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -p . -w",
-    "package": "vsce package"
+    "package": "vsce package",
+    "test": "tsc -p . && node --test \"test/*.test.js\""
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",

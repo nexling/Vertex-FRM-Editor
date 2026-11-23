@@ -22,6 +22,7 @@
 
   var pending = null;
   var retryTimer = null;
+  window.__frmUpdatePending = function() { return pending !== null; };
 
   function isBusy() {
     try { return !!(window.__frmHooks && window.__frmHooks.isBusy()); } catch (e) { return false; }
@@ -133,8 +134,8 @@
 
   function applyUpdate(msg) {
     try {
-      var carry = { selectionKey: null };
-      try { if (window.__frmHooks) carry.selectionKey = window.__frmHooks.getSelectionKey(); } catch (e) { /* ignore */ }
+      var carry = { selection: null };
+      try { if (window.__frmHooks) carry.selection = window.__frmHooks.getSelection(); } catch (e) { /* ignore */ }
       var scrollX = window.scrollX;
       var scrollY = window.scrollY;
 
@@ -409,6 +410,31 @@ window.__frmMain = function(D) {
       });
     } catch (e) { /* ignore */ }
   }
+  function switchTab(id) {
+    currentActiveTab = id;
+    applyTab(id);
+    fitTextSpans();
+    updateSelectionNotice();
+    try {
+      if (vscodeApi && vscodeApi.postMessage) {
+        vscodeApi.postMessage({ command: 'setActiveTab', id: id });
+      }
+      if (vscodeApi && vscodeApi.setState) {
+        var prev = (vscodeApi.getState && vscodeApi.getState()) || {};
+        vscodeApi.setState(Object.assign({}, prev, { activeTabId: id }));
+      }
+    } catch (e) { /* ignore */ }
+  }
+  // Tabs an element is shown on; null when it doesn't depend on the tab
+  function tabsOfElement(el) {
+    var type = el.getAttribute('data-type');
+    var lists = { text: tabTexts, field: tabFields, pushbutton: tabPushButtons, image: tabImages }[type];
+    var index = elementIndexOf(el);
+    if (!tabs.length || !lists || index === null) return null;
+    return tabs.filter(function(t) {
+      return (lists[t.id] || []).map(Number).indexOf(index) >= 0;
+    }).map(function(t) { return t.id; });
+  }
   if (tabs.length) {
     var firstId = tabs[0].id;
     var restoreId;
@@ -424,19 +450,7 @@ window.__frmMain = function(D) {
     if (tabsEl) {
       tabsEl.querySelectorAll('.tab').forEach(function(tb){
         tb.addEventListener('click', function(){
-          var id = Number(tb.getAttribute('data-tab-id'));
-          currentActiveTab = id;
-          applyTab(id);
-          fitTextSpans();
-          try {
-            if (vscodeApi && vscodeApi.postMessage) {
-              vscodeApi.postMessage({ command: 'setActiveTab', id: id });
-            }
-            if (vscodeApi && vscodeApi.setState) {
-              var prev = (vscodeApi.getState && vscodeApi.getState()) || {};
-              vscodeApi.setState(Object.assign({}, prev, { activeTabId: id }));
-            }
-          } catch (e) { /* ignore */ }
+          switchTab(Number(tb.getAttribute('data-tab-id')));
         });
       });
     }
@@ -946,10 +960,7 @@ window.__frmMain = function(D) {
           case 'delete-element':
             if (vscodeApi && vscodeApi.postMessage && elementIndex) {
               vscodeApi.postMessage({ command: 'deleteElement', elementType: elementType, elementIndex: elementIndex });
-              if (selectedElement === elementContextMenuState.element) {
-                selectedElement = null;
-                selectedElementKey = null;
-              }
+              removeFromSelection(elementContextMenuState.element);
             }
             break;
           case 'show-in-source':
@@ -2093,12 +2104,26 @@ window.__frmMain = function(D) {
   // Drag and Drop functionality
   var draggedElement = null;
   var dragOffset = { x: 0, y: 0 };
-  var selectedElement = null;
-  var selectedElementKey = (window.__frmCarry && window.__frmCarry.selectionKey) || null; // Store selection key for persistence
+  var selectedElements = []; // every selected element
+  var selectedElement = null; // the primary one: last clicked, or the one at the code cursor
+  var codeTriggers = []; // triggers at the code cursor: { target, idx }, idx = row in the trigger list
+  var hoverTrigger = null; // the trigger list row under the mouse, shown instead of codeTriggers
+  var visualElements = []; // hidden fields and bottom-bar buttons highlighted from the code; never acted on
 
   function setupDragAndDrop() {
     var grid = document.querySelector('.grid');
     if (!grid) return;
+    var hiddenPanel = document.getElementById('hiddenFieldsPanel');
+
+    // Only fields on the form can be hidden; one without an index can't be moved in the file
+    function canHide(element) {
+      return !!element && element.getAttribute('data-type') === 'field' &&
+        !element.classList.contains('hidden-field-item') && !element.hasAttribute('data-no-index');
+    }
+
+    function clearHiddenPanel() {
+      if (hiddenPanel) hiddenPanel.classList.remove('hide-drop-ready', 'hide-drop-over');
+    }
 
     // Add click selection and dragstart listeners to all draggable elements
     document.querySelectorAll('.draggable').forEach(function(element) {
@@ -2113,10 +2138,13 @@ window.__frmMain = function(D) {
           return; // Let the event bubble up
         }
         e.stopPropagation();
-        selectElement(this);
+        if ((e.ctrlKey || e.metaKey) && !tabOrderMode) toggleElement(this);
+        else selectElement(this);
       });
       
       element.addEventListener('dragstart', function(e) {
+        // Dragging moves this element only
+        if (selectedElements.length !== 1 || selectedElement !== this) setSelection([this], this);
         draggedElement = this;
         this.classList.add('dragging');
         
@@ -2127,6 +2155,7 @@ window.__frmMain = function(D) {
         
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/html', this.outerHTML);
+        if (hiddenPanel && canHide(this)) hiddenPanel.classList.add('hide-drop-ready');
       });
 
       element.addEventListener('dragend', function(e) {
@@ -2134,6 +2163,7 @@ window.__frmMain = function(D) {
         draggedElement = null;
         grid.classList.remove('drag-over');
         hideDropTarget();
+        clearHiddenPanel();
       });
     });
 
@@ -2243,6 +2273,31 @@ window.__frmMain = function(D) {
         sendPositionUpdate(type, draggedElement, newRow, newCol, !isHiddenFieldSource);
       }
     });
+
+    // Dropping a field on the Hidden Fields panel hides it. Anything else is not accepted as a drop,
+    // so the browser shows its "not allowed" cursor.
+    if (hiddenPanel) {
+      hiddenPanel.addEventListener('dragover', function(e) {
+        if (!canHide(draggedElement)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        this.classList.add('hide-drop-over');
+      });
+
+      hiddenPanel.addEventListener('dragleave', function(e) {
+        if (!this.contains(e.relatedTarget)) this.classList.remove('hide-drop-over');
+      });
+
+      hiddenPanel.addEventListener('drop', function(e) {
+        if (!canHide(draggedElement)) return;
+        e.preventDefault();
+        clearHiddenPanel();
+        // Arrow keys and Delete must not act on an element that is no longer visible
+        draggedElement.blur();
+        removeFromSelection(draggedElement);
+        sendPositionUpdate('field', draggedElement, 1000, 1000, false);
+      });
+    }
   }
 
   function updateElementPosition(element, newRow, newCol) {
@@ -2306,82 +2361,289 @@ window.__frmMain = function(D) {
     vscodeApi.postMessage(data);
   }
 
+  function elementKey(el) {
+    var type = el.getAttribute('data-type');
+    var index = elementIndexOf(el);
+    return type + ':' + (index === null ? 'no-idx' : index);
+  }
+
+  // The form element for a key; visual = its row in the Hidden Fields panel or its bottom-bar button instead
+  function findByKey(key, visual) {
+    var parts = key.split(':');
+    var cls = { text: 'text', field: 'field', pushbutton: 'push', image: 'image', preview: 'preview' }[parts[0]];
+    if (!cls) return null;
+    var attr = 'data-' + cls + '-idx';
+    var idx = parts[1] === 'no-idx' ? ':not([' + attr + '])' : '[' + attr + '="' + parts[1] + '"]';
+    if (!visual) return document.querySelector('.grid > .' + cls + '.draggable' + idx);
+    if (parts[0] === 'field') return document.querySelector('.hidden-field-item' + idx);
+    if (parts[0] === 'pushbutton') return document.querySelector('.bottom-bar-button' + idx);
+    return null;
+  }
+
+  function setSelection(els, primary, visual, triggers) {
+    selectedElements.forEach(function(el) { el.classList.remove('selected', 'primary'); });
+    visualElements.forEach(function(el) { el.classList.remove('code-highlight'); });
+    selectedElements = els;
+    selectedElement = primary;
+    visualElements = visual || [];
+    codeTriggers = triggers || [];
+    selectedElements.forEach(function(el) {
+      el.classList.add('selected');
+      if (el === primary) el.classList.add('primary');
+    });
+    visualElements.forEach(function(el) { el.classList.add('code-highlight'); });
+    document.body.classList.toggle('multi-selected', els.length > 1);
+    window.__frmCodeSelection = null; // a selection made here replaces one still waiting from the code
+    showTriggers();
+  }
+
+  function clearSelection() {
+    setSelection([], null);
+  }
+
   function selectElement(element) {
-    // Remove selection from previously selected element
-    if (selectedElement) {
-      selectedElement.classList.remove('selected');
-    }
-    
-    // Select new element and store its key for persistence
-    selectedElement = element;
-    element.classList.add('selected');
+    setSelection([element], element);
     element.focus();
-    
-    // Store selection key for persistence across updates
-    var type = element.getAttribute('data-type');
-    var key = null;
-    if (type === 'text') {
-      key = element.getAttribute('data-text-idx') || 'text-no-idx';
-    } else if (type === 'field') {
-      key = element.getAttribute('data-field-idx') || 'field-no-idx';
-    } else if (type === 'pushbutton') {
-      key = element.getAttribute('data-push-idx') || 'push-no-idx';
-    } else if (type === 'image') {
-      key = element.getAttribute('data-image-idx') || 'image-no-idx';
-    } else if (type === 'preview') {
-      key = element.getAttribute('data-preview-idx') || 'preview-no-idx';
+  }
+
+  function toggleElement(element) {
+    if (selectedElements.indexOf(element) >= 0) {
+      removeFromSelection(element);
+      return;
     }
-    selectedElementKey = type + ':' + key;
+    setSelection(selectedElements.concat(element), element);
+    element.focus();
+  }
+
+  function removeFromSelection(element) {
+    var rest = selectedElements.filter(function(el) { return el !== element; });
+    if (rest.length === selectedElements.length) return;
+    setSelection(rest, selectedElement === element ? rest[rest.length - 1] || null : selectedElement);
+  }
+
+  // Selected elements on other form tabs stay selected but can't be seen
+  function isOnOtherTab(el) {
+    return el.classList.contains('hidden');
+  }
+
+  // Shows how many elements are selected; with a hint for a moment when a key could not act on them
+  function updateSelectionNotice(hint) {
+    var notice = document.getElementById('selectionNotice');
+    if (!notice) return;
+    clearTimeout(window.__frmNoticeTimer);
+    var count = selectedElements.length;
+    var away = selectedElements.filter(isOnOtherTab).length;
+    var text = '';
+    if (count > 1) text = count + ' selected' + (away ? ', ' + away + ' on other tabs' : '');
+    if (hint) {
+      text = count > 1 ? count + ' selected: select one to edit' : 'The selected element is on another tab';
+      window.__frmNoticeTimer = setTimeout(onCurrentPage(function() { updateSelectionNotice(); }), 2000);
+    }
+    if (!hint) text = [text].concat(triggerNotices()).filter(Boolean).join(' \u00b7 ');
+    notice.textContent = text;
+    notice.classList.toggle('hidden', !text);
+  }
+
+  // Editing keys act on exactly one element, which must be in view on this tab
+  function editKeysBlocked() {
+    if (selectedElements.length <= 1 && !(selectedElement && isOnOtherTab(selectedElement))) return false;
+    updateSelectionNotice(true);
+    return true;
+  }
+
+  function getSelection() {
+    return {
+      keys: selectedElements.map(elementKey),
+      primary: selectedElement ? elementKey(selectedElement) : null,
+      visual: visualElements.map(elementKey),
+      triggers: codeTriggers
+    };
+  }
+
+  function found(el, i, all) {
+    return !!el && all.indexOf(el) === i;
   }
 
   function restoreSelection() {
-    if (!selectedElementKey) return;
-    
-    var parts = selectedElementKey.split(':');
-    var type = parts[0];
-    var key = parts[1];
-    
-    var selector;
-    if (type === 'text') {
-      if (key === 'text-no-idx') {
-        selector = '.text:not([data-text-idx])';
-      } else {
-        selector = '.text[data-text-idx="' + key + '"]';
-      }
-    } else if (type === 'field') {
-      if (key === 'field-no-idx') {
-        selector = '.field:not([data-field-idx])';
-      } else {
-        selector = '.field[data-field-idx="' + key + '"]';
-      }
-    } else if (type === 'pushbutton') {
-      if (key === 'push-no-idx') {
-        selector = '.push:not([data-push-idx])';
-      } else {
-        selector = '.push[data-push-idx="' + key + '"]';
-      }
-    } else if (type === 'image') {
-      if (key === 'image-no-idx') {
-        selector = '.image:not([data-image-idx])';
-      } else {
-        selector = '.image[data-image-idx="' + key + '"]';
-      }
-    } else if (type === 'preview') {
-      if (key === 'preview-no-idx') {
-        selector = '.preview:not([data-preview-idx])';
-      } else {
-        selector = '.preview[data-preview-idx="' + key + '"]';
-      }
+    var carry = window.__frmCarry && window.__frmCarry.selection;
+    var waiting = window.__frmCodeSelection;
+    if (carry) {
+      var els = carry.keys.map(function(k) { return findByKey(k); }).filter(found);
+      var primary = carry.primary ? findByKey(carry.primary) : null;
+      if (els.indexOf(primary) < 0) primary = els[els.length - 1] || null;
+      // Focus is left alone to avoid interrupting keyboard navigation
+      setSelection(els, primary, carry.visual.map(function(k) { return findByKey(k, true); }).filter(found),
+        // A trigger that was edited or deleted is no longer the one that was highlighted
+        carry.triggers.filter(function(t) {
+          var row = t.idx === null ? null : triggerRow(t.idx);
+          return t.idx === null || (row && row.getAttribute('data-trigger-target') === t.target);
+        }));
+    } else {
+      showTriggers();
     }
-    
-    if (selector) {
-      var element = document.querySelector(selector);
-      if (element) {
-        selectedElement = element;
-        element.classList.add('selected');
-        // Don't call focus() here to avoid interrupting keyboard navigation
-      }
+    window.__frmCodeSelection = waiting;
+  }
+
+  // ---- Triggers: highlight what they fire from --------------------------------------------------
+  function list(selector) {
+    return Array.prototype.slice.call(document.querySelectorAll(selector));
+  }
+
+  function triggerRow(idx) {
+    return document.querySelector('.trigger-item[data-trigger-idx="' + idx + '"]');
+  }
+
+  function varName(el, attr) {
+    return (el.getAttribute(attr) || '').replace(/^\$/, '').toLowerCase();
+  }
+
+  // Fields a trigger fires from (0 = all), and the buttons that set those fields
+  function triggerTargets(target) {
+    var none = { fields: [], buttons: [] };
+    if (!/^\d+$/.test(target)) return none;
+    var index = Number(target);
+    var fields = list('.grid > .field.draggable, .hidden-field-item').filter(function(el) {
+      return index === 0 || (!el.hasAttribute('data-no-index') && elementIndexOf(el) === index);
+    });
+    var names = fields.map(function(el) { return varName(el, 'data-field-name'); });
+    var buttons = list('.grid > .push[data-pb-action="variable"], .bottom-bar-button[data-pb-action="variable"]').filter(function(el) {
+      var name = varName(el, 'data-pb-name');
+      return name && names.indexOf(name) >= 0;
+    });
+    return { fields: fields, buttons: buttons };
+  }
+
+  function activeTriggers() {
+    return hoverTrigger ? [hoverTrigger] : codeTriggers;
+  }
+
+  // Highlight only: never changes the selection, so keys can't act on these elements
+  function showTriggers() {
+    list('.trigger-highlight').forEach(function(el) { el.classList.remove('trigger-highlight'); });
+    activeTriggers().forEach(function(t) {
+      var on = triggerTargets(t.target);
+      var els = on.fields.concat(on.buttons);
+      if (t.target.charAt(0) === '$') els = els.concat(list('.window'));
+      if (t.idx !== null) els = els.concat(triggerRow(t.idx) || []);
+      els.forEach(function(el) { el.classList.add('trigger-highlight'); });
+    });
+    updateSelectionNotice();
+  }
+
+  function triggerNotices() {
+    var notes = [];
+    var fields = [];
+    activeTriggers().forEach(function(t) {
+      if (t.target.charAt(0) === '$') return;
+      var on = triggerTargets(t.target).fields;
+      var note = 'Field ' + t.target + ' not found';
+      if (!on.length && t.target !== '0' && notes.indexOf(note) < 0) notes.push(note);
+      on.forEach(function(el) { if (fields.indexOf(el) < 0) fields.push(el); });
+    });
+    var away = fields.filter(isOnOtherTab).length;
+    if (away) notes.unshift(fields.length + (fields.length === 1 ? ' field, ' : ' fields, ') + away + ' not on this tab');
+    return notes;
+  }
+
+  // From the code, a trigger on one field brings that field (or a button that sets it) into view
+  function revealTrigger(target) {
+    if (target === '0') return;
+    var on = triggerTargets(target);
+    var els = on.fields.concat(on.buttons);
+    if (els.length && els.every(isOnOtherTab)) {
+      var withTab = els.filter(function(el) { return (tabsOfElement(el) || []).length; })[0];
+      if (withTab) switchTab(tabsOfElement(withTab)[0]);
     }
+    revealFromCode(els.filter(function(el) { return !isOnOtherTab(el); })[0] || null);
+  }
+
+  function setupTriggerHover() {
+    function hover(row) {
+      hoverTrigger = row && !draggedElement && !sizeDrag && !elResize && !boxResize && !tabOrderMode
+        ? { target: row.getAttribute('data-trigger-target'), idx: Number(row.getAttribute('data-trigger-idx')) } : null;
+      showTriggers();
+    }
+    list('.trigger-item[data-trigger-target]').forEach(function(row) {
+      row.addEventListener('mouseenter', function() { hover(row); });
+      row.addEventListener('mouseleave', function() { hover(null); });
+    });
+    // After a refresh the mouse may still be on a row
+    var under = document.querySelector('.trigger-item[data-trigger-target]:hover');
+    if (under) hover(under);
+  }
+
+  // ---- Selection from the code: the elements at the text cursor --------------------------------
+  function codeSelectionBlocked() {
+    return window.__frmUpdatePending() || inlineEdit || boxResize || !window.__frmHooks || window.__frmHooks.isBusy();
+  }
+
+  function tryCodeSelection() {
+    clearTimeout(window.__frmCodeSelectionTimer);
+    if (!window.__frmCodeSelection) return;
+    if (codeSelectionBlocked()) {
+      window.__frmCodeSelectionTimer = setTimeout(onCurrentPage(tryCodeSelection), 200);
+      return;
+    }
+    applyCodeSelection(window.__frmCodeSelection);
+  }
+
+  // Never takes focus: the user is in the text editor
+  function applyCodeSelection(msg) {
+    var triggers = (msg.triggers || []).map(function(t) {
+      var row = document.querySelector('.trigger-item[data-trigger-line="' + t.line + '"]');
+      return { target: t.target, line: t.line, idx: row ? Number(row.getAttribute('data-trigger-idx')) : null };
+    });
+    var real = []; // { el, at }
+    var visual = [];
+    msg.keys.forEach(function(key, at) {
+      var el = findByKey(key);
+      if (el && !el.hasAttribute('data-no-index')) {
+        var on = tabsOfElement(el);
+        if (!on || on.length) real.push({ el: el, at: at });
+        return;
+      }
+      el = findByKey(key, true);
+      if (el) visual.push({ el: el, at: at });
+    });
+    var at = msg.keys.indexOf(msg.primary);
+    var primary = real.reduce(function(best, r) {
+      return !best || Math.abs(r.at - at) < Math.abs(best.at - at) ? r : best;
+    }, null);
+    primary = primary ? primary.el : null;
+    var visualPrimary = visual.filter(function(v) { return v.at === at; })[0];
+
+    setSelection(real.map(function(r) { return r.el; }), primary, visual.map(function(v) { return v.el; }), triggers);
+    var main = triggers.filter(function(t) { return t.line === msg.primaryTrigger; })[0];
+    if (main) {
+      revealTrigger(main.target);
+      return;
+    }
+    if (primary && isOnOtherTab(primary)) {
+      var on = tabsOfElement(primary);
+      if (on && on.length) switchTab(on[0]);
+    }
+    revealFromCode(visualPrimary ? visualPrimary.el : primary);
+  }
+
+  var revealWhenShown = null;
+  function revealFromCode(el) {
+    // A covered preview has no layout to scroll; do it when it is shown
+    var hiddenPage = document.hidden || !window.innerHeight;
+    revealWhenShown = hiddenPage ? el : null;
+    if (el && !hiddenPage) el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+  }
+
+  function setupCodeSelection() {
+    window.addEventListener('message', function(ev) {
+      var msg = ev.data;
+      if (msg && msg.command === 'frmSelectFromCode' && Array.isArray(msg.keys)) {
+        window.__frmCodeSelection = msg;
+        tryCodeSelection();
+      }
+    });
+    function revealNow() { if (revealWhenShown) revealFromCode(revealWhenShown); }
+    document.addEventListener('visibilitychange', revealNow);
+    window.addEventListener('resize', revealNow);
   }
 
   function moveSelectedElement(deltaRow, deltaCol) {
@@ -2437,7 +2699,11 @@ window.__frmMain = function(D) {
 
     // Add global keyboard event listener
     document.addEventListener('keydown', function(e) {
-      if (!selectedElement || shortcutsBlocked(e)) return;
+      if ((!selectedElement && !visualElements.length && !codeTriggers.length) || shortcutsBlocked(e)) return;
+      if (/^(Arrow(Up|Down|Left|Right)|Delete|Backspace)$/.test(e.key)) {
+        if (!selectedElement) return;
+        if (editKeysBlocked()) { e.preventDefault(); return; }
+      }
       
       // Shift+Arrow stretches instead of moving
       if (e.shiftKey && /^Arrow(Up|Down|Left|Right)$/.test(e.key)) {
@@ -2466,12 +2732,8 @@ window.__frmMain = function(D) {
           handled = true;
           break;
         case 'Escape':
-          if (selectedElement) {
-            selectedElement.classList.remove('selected');
-            selectedElement = null;
-            selectedElementKey = null;
-            handled = true;
-          }
+          clearSelection();
+          handled = true;
           break;
         case 'Delete':
         case 'Backspace':
@@ -2493,8 +2755,7 @@ window.__frmMain = function(D) {
             if (index) {
               if (vscodeApi && vscodeApi.postMessage) {
                 vscodeApi.postMessage({ command: 'deleteElement', elementType: type, elementIndex: parseInt(index) });
-                selectedElement = null;
-                selectedElementKey = null;
+                clearSelection();
               }
             }
             handled = true;
@@ -2510,12 +2771,9 @@ window.__frmMain = function(D) {
     
     // Deselect when clicking on empty area (not when using a dialog or menu)
     document.addEventListener('click', function(e) {
-      if (e.target.closest('.modal-overlay, .context-menu')) return;
-      if (!e.target.closest('.draggable') && selectedElement) {
-        selectedElement.classList.remove('selected');
-        selectedElement = null;
-        selectedElementKey = null;
-      }
+      // Switching form tabs keeps the selection
+      if (e.target.closest('.modal-overlay, .context-menu, .tabs')) return;
+      if (!e.target.closest('.draggable')) clearSelection();
     });
   }
 
@@ -3446,7 +3704,7 @@ window.__frmMain = function(D) {
   // Same column, one row down; stays put when that would leave the form
   function duplicateSelectedElement() {
     var el = selectedElement;
-    if (!el || tabOrderMode || !vscodeApi || !vscodeApi.postMessage) return;
+    if (!el || tabOrderMode || !vscodeApi || !vscodeApi.postMessage || editKeysBlocked()) return;
     var type = el.getAttribute('data-type');
     var index = elementIndexOf(el);
     var row = parseInt(el.getAttribute('data-row'), 10);
@@ -3544,7 +3802,7 @@ window.__frmMain = function(D) {
     }
     if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedElement &&
         !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
-      openElementEditor(selectedElement);
+      if (!editKeysBlocked()) openElementEditor(selectedElement);
       consumeKey(e);
     }
   }
@@ -3603,10 +3861,12 @@ window.__frmMain = function(D) {
   setupContextMenu();
   setupDragAndDrop();
   setupKeyboardNavigation();
+  setupCodeSelection();
   fitTextSpans();
   
   // Restore selection if it existed before this update
   restoreSelection();
+  setupTriggerHover();
   window.__frmCarry = null;
 
   // Hooks for the bootstrap's in-place updates
@@ -3614,10 +3874,11 @@ window.__frmMain = function(D) {
     isBusy: function() {
       return !!draggedElement || !!sizeDrag || !!elResize || tabOrderMode ||!!document.querySelector('.modal-overlay:not(.hidden)');
     },
-    getSelectionKey: function() {
-      return pendingSelectionKey || (selectedElement ? selectedElementKey : null);
+    getSelection: function() {
+      return pendingSelectionKey ? { keys: [pendingSelectionKey], primary: pendingSelectionKey, visual: [], triggers: [] } : getSelection();
     }
   };
+  tryCodeSelection(); // one that waited for this update
 };
 
 window.__frmMain(JSON.parse(document.getElementById('frmData').textContent));

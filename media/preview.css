@@ -209,6 +209,15 @@ body.tab-order-active .box-resize { display: none !important; }
 .draggable { cursor: grab; transition: box-shadow 0.2s ease; outline: none; }
 .draggable:hover { box-shadow: 0 0 0 2px var(--vscode-focusBorder, #0078d4); }
 .draggable.selected { box-shadow: 0 0 0 3px var(--vscode-focusBorder, #0078d4); background-color: rgba(0, 120, 212, 0.1); }
+body.multi-selected .draggable.selected:not(.primary) { box-shadow: 0 0 0 1.5px var(--vscode-focusBorder, #0078d4); }
+.hidden-field-item.code-highlight, .bottom-bar-button.code-highlight { outline: 2px dashed var(--vscode-focusBorder, #0078d4); outline-offset: 1px; }
+/* What a trigger fires from: light blue, so it never looks like a selection */
+.window { --trigger-blue: #4db5ff; }
+.grid > .trigger-highlight, .bottom-bar-button.trigger-highlight, .trigger-item.trigger-highlight, .window.trigger-highlight { outline: 2px dashed var(--trigger-blue); outline-offset: 3px; }
+.grid > .trigger-highlight, .grid > .trigger-highlight :is(input, select, .btn), .bottom-bar-button.trigger-highlight { background-color: rgba(77, 181, 255, 0.22); }
+.trigger-item.trigger-highlight { outline-offset: -2px; background: rgba(77, 181, 255, 0.22); }
+.code-highlight.trigger-highlight { box-shadow: 0 0 0 2px var(--vscode-focusBorder, #0078d4); }
+.selection-notice { position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 500; padding: 4px 10px; border-radius: 3px; font-size: 12px; pointer-events: none; background: var(--vscode-editorWidget-background, #252526); color: var(--vscode-editorWidget-foreground, #cccccc); border: 1px solid var(--vscode-focusBorder, #0078d4); }
 .draggable.dragging { cursor: grabbing; opacity: 0.8; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
 .delete-button { position: absolute; top: -8px; right: -8px; width: 16px; height: 16px; background: #c42b1c; color: #fff; border-radius: 50%; opacity: 0; transition: opacity 0.2s ease; cursor: pointer; z-index: 10; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: bold; line-height: 1; }
 .draggable:hover .delete-button, .draggable.selected .delete-button { opacity: 1; }
@@ -520,11 +529,23 @@ body.tab-order-active .box-resize { display: none !important; }
   font-size: 11px;
   position: relative;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 .trigger-item:hover {
   border-color: var(--vscode-focusBorder, #0078d4);
   box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+}
+#hiddenFieldsPanel.hide-drop-ready {
+  outline: 2px dashed var(--vscode-focusBorder, #0078d4);
+  outline-offset: -2px;
+}
+#hiddenFieldsPanel.hide-drop-over {
+  outline-style: solid;
+  background: rgba(0, 120, 212, 0.15);
+}
+#hiddenFieldsPanel.hide-drop-over h4::after {
+  content: 'Drop to hide';
+  color: var(--vscode-focusBorder, #0078d4);
 }
 .hidden-field-item {
   cursor: grab;
