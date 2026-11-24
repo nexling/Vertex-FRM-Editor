@@ -20,18 +20,26 @@ This VS Code extension supports Vertex FRM form files (`.frm`, `.vxf`, `.form`, 
 - Indexes required: the preview only works with `text(n)=`, `button(n)=` and `pushbutton(n)=` lines. If a form has any of these without an index, opening the preview shows a prompt instead of the form: **Auto-add indexes** numbers them (next free index in file order; `button`/`pushbutton` share one sequence; existing indexes are never changed; one Ctrl+Z undoes it), **Cancel** closes the preview. An unindexed line typed while the preview is open is shown locked, with a banner offering the same auto-add.
 - Webview shows a simple form UI reflecting `field()` entries with list choices
 - Drag the form's right edge, bottom edge or bottom-right corner to set `port_size= rows cols` (snaps to whole cells). Right-click a handle to set width, height or both back to auto (0).
+- Toolbox: click a tool and then a cell, or drag the tool onto the form, to add a text, field, button, checkbox, radio button, preview or image. Drag on the form instead of clicking to set the size of a field, preview or image. Double-click a tool to add several; Esc or right-click stops. Move the toolbox by its header, flip it, or hide it to an icon; its place is remembered for all forms. Right-click > Add and the keys T, F, B, C, R, P and I do the same without the toolbox.
+- The image dialog lists the files in `custom/forms/images` and `system/forms/images`; other names and `$DIR` paths can be typed.
 - Stretch elements instead of typing sizes: drag a field's right edge to change `len`, or its left edge to move `col` and change `len` together. Images and previews stretch from all edges and corners (`rows`/`cols`, left/top also move the start). Shift+Arrow stretches the selected element by one cell. Snaps to whole cells; one Ctrl+Z undoes it.
 - Drag a field onto the Hidden Fields panel to hide it (sets its position to `1000 1000`); drag it from the panel onto the form to show it again. One Ctrl+Z undoes it.
 - Updates as you type
 - Click in the code to select in the preview: the element defined at the cursor is selected, and a text selection or several cursors select several. Hidden fields and bottom-bar buttons are only highlighted. The form tab switches and the preview scrolls when needed; focus stays in the editor.
 - Put the text cursor on a `trigger=` line, or hover a trigger in the preview's list, to highlight the field it fires from and the buttons that set that field (`0` highlights all fields and their buttons, `$...` outlines the form). Only a highlight: the selection is not changed by hovering.
-- Ctrl+click elements in the preview to select several. Editing keys work on one selected element at a time.
+- Select several elements: Ctrl+click or Shift+click adds or removes one, dragging on empty space selects everything completely inside the box (with Ctrl or Shift: adds), Ctrl+A selects all on the current tab. Arrows, dragging, Ctrl+D, Delete and the right-click menu act on the whole selection, each as one undo step. A group stops at the form's edge as a whole. Selected elements on other form tabs are left alone. Drag selected fields onto the Hidden Fields panel to hide them all.
+- Copy, cut and paste within a form and between forms with Ctrl+C, Ctrl+X and Ctrl+V. The clipboard holds plain FRM lines, so it also works to and from the text editor.
+  - Click a row in the Triggers or Hidden Fields list to select it, Ctrl+click or Shift+click to add it to the selection; double-click shows it in the source. Delete works on these too. Bottom-bar buttons can't be copied.
+  - The top-left corner goes to the cell under the pointer; with the pointer away from the form, the original place is used, or the first free row below. What is pasted moves as a whole to stay inside the form, and goes on the active tab.
+  - Pasted lines get the next free index. The first paste of a cut in the same form keeps the indexes. Tab order is not copied.
+  - A pasted trigger follows its field when that is pasted with it. Otherwise it keeps its field number; in a form without that field it is skipped, as is a trigger the form already has.
 - Keyboard shortcuts (press `?` or the ⌨ button in the preview for the full list; ⌘ instead of Ctrl on Mac):
-  - Selected element: arrows move, Shift+Arrow stretches, F2/Enter edits, Ctrl+D duplicates one row below, Del/Backspace deletes, Esc deselects
+  - Selected elements: arrows move, Ctrl+D duplicates one row below (a group: below itself), Ctrl+C/Ctrl+X/Ctrl+V copy, cut and paste, Del/Backspace deletes, Esc deselects. One element: Shift+Arrow stretches, F2/Enter edits
+  - Zoom: Ctrl+scroll / Ctrl+= / Ctrl+- (5%; scroll keeps the point under the cursor), Ctrl+0 reset to 100%, Ctrl+1 fit the form to the panel. The Fit button in the titlebar does the same as Ctrl+1. Keys work even if the zoom slider is hidden.
   - Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: undo/redo in the FRM file (same history as the text editor)
   - Dialogs: Esc cancels, Ctrl+Enter confirms, Tab stays inside the dialog; clicking outside closes it (asks first if anything changed)
   - Context menus: ↑/↓ and Enter, Esc closes
-  - Tab-order mode: Enter confirms, Esc cancels
+  - Tab-order mode: click fields, field-setting buttons (RADIO/CHECKBOX/NAME=value) or Hidden Fields rows; Enter confirms, Esc cancels
 
 Settings:
 - `vertexFrmPreview.diagnostics` (default `true`): show problems found in FRM files.

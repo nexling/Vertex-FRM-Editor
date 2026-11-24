@@ -136,6 +136,9 @@ body { font-family: 'Times New Roman', Times, serif; padding: 12px; color: rgba(
 }
 .grid-frame.resizing .grid { outline: 2px dashed var(--vscode-focusBorder, #0078d4); outline-offset: 1px; }
 body.tab-order-active .resize-handle { display: none; }
+body.tab-order-active .delete-button,
+body.tab-order-active .trigger-action-btn.delete { display: none !important; }
+body.tab-order-active .hidden-field-item { cursor: pointer; }
 .resize-size-label {
   position: absolute; right: 0; bottom: -26px; z-index: 60; padding: 2px 6px; border-radius: 3px;
   background: rgba(0,0,0,.75); color: #fff; font: 11px/1.4 sans-serif; font-variant-numeric: tabular-nums;
@@ -210,6 +213,8 @@ body.tab-order-active .box-resize { display: none !important; }
 .draggable:hover { box-shadow: 0 0 0 2px var(--vscode-focusBorder, #0078d4); }
 .draggable.selected { box-shadow: 0 0 0 3px var(--vscode-focusBorder, #0078d4); background-color: rgba(0, 120, 212, 0.1); }
 body.multi-selected .draggable.selected:not(.primary) { box-shadow: 0 0 0 1.5px var(--vscode-focusBorder, #0078d4); }
+.trigger-item { user-select: none; }
+.trigger-item.selected { box-shadow: 0 0 0 3px var(--vscode-focusBorder, #0078d4); background-color: #d9ebf9; }
 .hidden-field-item.code-highlight, .bottom-bar-button.code-highlight { outline: 2px dashed var(--vscode-focusBorder, #0078d4); outline-offset: 1px; }
 /* What a trigger fires from: light blue, so it never looks like a selection */
 .window { --trigger-blue: #4db5ff; }
@@ -217,6 +222,9 @@ body.multi-selected .draggable.selected:not(.primary) { box-shadow: 0 0 0 1.5px 
 .grid > .trigger-highlight, .grid > .trigger-highlight :is(input, select, .btn), .bottom-bar-button.trigger-highlight { background-color: rgba(77, 181, 255, 0.22); }
 .trigger-item.trigger-highlight { outline-offset: -2px; background: rgba(77, 181, 255, 0.22); }
 .code-highlight.trigger-highlight { box-shadow: 0 0 0 2px var(--vscode-focusBorder, #0078d4); }
+/* Box selection */
+.marquee { position: fixed; z-index: 400; pointer-events: none; box-sizing: border-box; border: 1px dashed var(--vscode-focusBorder, #0078d4); background: rgba(0, 120, 212, .12); }
+body.marquee-selecting { user-select: none; }
 .selection-notice { position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 500; padding: 4px 10px; border-radius: 3px; font-size: 12px; pointer-events: none; background: var(--vscode-editorWidget-background, #252526); color: var(--vscode-editorWidget-foreground, #cccccc); border: 1px solid var(--vscode-focusBorder, #0078d4); }
 .draggable.dragging { cursor: grabbing; opacity: 0.8; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
 .delete-button { position: absolute; top: -8px; right: -8px; width: 16px; height: 16px; background: #c42b1c; color: #fff; border-radius: 50%; opacity: 0; transition: opacity 0.2s ease; cursor: pointer; z-index: 10; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: bold; line-height: 1; }
@@ -229,7 +237,8 @@ body.multi-selected .draggable.selected:not(.primary) { box-shadow: 0 0 0 1.5px 
 .text { align-self: center; white-space: nowrap; padding: 0; font-family: inherit; font-size: inherit; line-height: 1em; height: 1em; }
 /* Text hugs its rendered width; fitTextSpans() sizes the grid span to match */
 .grid > .text { justify-self: start; width: max-content; min-width: var(--col-w); }
-.field { display: flex; align-items: center; padding: 0; }
+/* Fields hug the input vertically so hover/selection rings follow the control, not the grid cell */
+.field { display: flex; align-items: center; padding: 0; align-self: center; height: calc(1em + 2px); }
 .field select, .field input {
   width: 100%; padding: 0; margin: 0; border: 0; outline: 1px solid var(--vscode-input-border);
   background: rgba(255, 255, 255, 1); color: rgba(0,0,0,1);
@@ -630,7 +639,8 @@ body.multi-selected .draggable.selected:not(.primary) { box-shadow: 0 0 0 1.5px 
   font-weight: 600;
 }
 .field .tab-order-badge,
-.push .tab-order-badge {
+.push .tab-order-badge,
+.hidden-field-item .tab-order-badge {
   position: absolute;
   top: -10px;
   left: -10px;
@@ -665,3 +675,63 @@ body.multi-selected .draggable.selected:not(.primary) { box-shadow: 0 0 0 1.5px 
   z-index: 101;
   box-sizing: border-box;
 }
+
+/* Toolbox */
+.toolbox, .toolbox-show {
+  position: fixed; z-index: 300; box-sizing: border-box;
+  color: var(--vscode-editorWidget-foreground, #333); background: var(--vscode-editorWidget-background, #f3f3f3);
+  border: 1px solid var(--vscode-contrastBorder, var(--vscode-editorWidget-border, #999)); border-radius: 5px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.3);
+}
+.toolbox { display: flex; flex-direction: column; user-select: none; }
+.toolbox.horizontal { flex-direction: row-reverse; }
+.toolbox-header { display: flex; flex-wrap: wrap; cursor: move; touch-action: none; padding: 2px; justify-content: center; }
+.toolbox:not(.horizontal) .toolbox-header { border-bottom: 1px solid var(--vscode-editorWidget-border, #999); width: 40px; align-self: stretch; box-sizing: border-box; min-width: 100%; }
+.toolbox.horizontal .toolbox-header { border-left: 1px solid var(--vscode-editorWidget-border, #999); flex-direction: row; align-items: center; flex-wrap: nowrap; }
+.toolbox-grip { width: 100%; height: 8px; margin: 1px 2px 2px; background: radial-gradient(circle, currentColor 1px, transparent 1.3px) 0 0 / 5px 4px; opacity: .5; }
+.toolbox.horizontal .toolbox-grip { width: 8px; height: 24px; margin: 0 3px; background-size: 4px 5px; }
+.toolbox-ctrl { width: 18px; height: 18px; padding: 1px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 3px; background: none; color: inherit; cursor: pointer; }
+.toolbox-ctrl svg { width: 13px; height: 13px; }
+.toolbox-tools { display: grid; gap: 2px; padding: 3px; grid-template-columns: 32px; justify-content: center; }
+.toolbox.two-lines .toolbox-tools { grid-template-columns: 32px 32px; }
+.toolbox.horizontal .toolbox-tools { grid-auto-flow: column; grid-template-columns: none; grid-template-rows: 32px; grid-auto-columns: 32px; }
+.toolbox.horizontal.two-lines .toolbox-tools { grid-template-rows: 32px 32px; }
+.toolbox-tool { position: relative; width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 4px; background: none; color: inherit; cursor: grab; touch-action: none; }
+.toolbox-tool svg { width: 20px; height: 20px; margin: -2px 3px 0 -3px; }
+.toolbox-key {
+  position: absolute; right: 0; bottom: 0; min-width: 11px; height: 12px; padding: 0 1px; border-radius: 6px; box-sizing: border-box;
+  font: 600 8px/12px var(--vscode-font-family, sans-serif); text-align: center; pointer-events: none;
+  background: var(--vscode-badge-background, #616161); color: var(--vscode-badge-foreground, #fff);
+}
+.toolbox-tool:hover, .toolbox-ctrl:hover, .toolbox-show:hover { background-color: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.25)); }
+.toolbox-tool.armed { background-color: var(--vscode-button-background, #0078d4); color: var(--vscode-button-foreground, #fff); }
+.toolbox-tool.armed.sticky { border-color: currentColor; box-shadow: 0 0 0 1px var(--vscode-focusBorder, #0078d4); }
+.toolbox-tool:focus-visible, .toolbox-ctrl:focus-visible, .toolbox-show:focus-visible { outline: 1px solid var(--vscode-focusBorder, #0078d4); outline-offset: -1px; }
+.toolbox-show { width: 34px; height: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; touch-action: none; }
+.toolbox-show:hover { background-color: var(--vscode-editorWidget-background, #e0e0e0); border-color: var(--vscode-focusBorder, #0078d4); }
+.toolbox-show svg { width: 22px; height: 22px; pointer-events: none; }
+body.tab-order-active .toolbox, body.tab-order-active .toolbox-show { display: none; }
+body.tool-dragging .toolbox, body.tool-dragging .toolbox-show, body.element-dragging .toolbox, body.element-dragging .toolbox-show { opacity: .3; pointer-events: none; }
+body.tool-armed .grid-frame, body.tool-armed .grid-frame * { cursor: crosshair !important; }
+body.tool-armed .grid-frame .inline-edit { cursor: text !important; }
+body.tool-dragging, body.tool-dragging * { user-select: none; }
+body.tool-dragging * { cursor: crosshair !important; }
+body.tool-dragging.tool-no-drop * { cursor: not-allowed !important; }
+.drop-target-outline[data-size]::after {
+  content: attr(data-size); position: absolute; right: 0; top: 100%; margin-top: 3px; padding: 2px 6px; border-radius: 3px;
+  background: rgba(0,0,0,.75); color: #fff; font: 11px/1.4 sans-serif; white-space: nowrap;
+}
+
+/* Image dialog */
+.image-list { height: 190px; overflow-y: auto; border: 1px solid var(--vscode-input-border, #ccc); border-radius: 3px; color: #000; background: #fff; font-size: 12px; }
+.image-list-item { display: flex; align-items: center; gap: 8px; padding: 3px 6px; cursor: pointer; }
+.image-list-item:hover { background: rgba(0, 120, 212, .1); }
+.image-list-item.kbd-active, .image-list-item.active { background: rgba(0, 120, 212, .2); }
+.image-list-thumb { flex: none; width: 36px; height: 28px; object-fit: contain; display: flex; align-items: center; justify-content: center; font-size: 9px; color: #555; border: 1px solid rgba(0,0,0,.12); box-sizing: border-box; background: #fff; }
+.image-list-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-list-origin { font-size: 11px; color: rgba(0,0,0,.6); }
+.image-list-note { padding: 6px 8px; color: rgba(0,0,0,.6); }
+.image-modes { display: grid; gap: 3px; }
+.modal-field .image-modes label { font-weight: normal; display: flex; align-items: center; gap: 6px; }
+.modal-field .image-modes input { padding: 0; }
+#imageModal .modal { max-height: calc(100vh - 16px); overflow-y: auto; box-sizing: border-box; }

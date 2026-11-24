@@ -186,6 +186,11 @@ window.__frmMain = function(D) {
   } catch { /* ignore */ }
   var currentZoom = 1;
   var currentGridOn = true;
+  var ZOOM_MIN = 0.5;
+  var ZOOM_MAX = 10;
+  var ZOOM_STEP = 0.05;
+  var WHEEL_NOTCH = 80;
+  var wheelAcc = 0;
 
   function setColWidth(){
     try {
@@ -275,8 +280,14 @@ window.__frmMain = function(D) {
     } catch { /* ignore */ }
   }
 
+  function snapZoom(z) {
+    var n = Math.round((Number(z) || 1) / ZOOM_STEP) * ZOOM_STEP;
+    n = Math.round(n * 100) / 100;
+    return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, n));
+  }
+
   function applyZoom(z, silent){
-    var clamped = Math.max(0.5, Math.min(10, Number(z) || 1));
+    var clamped = snapZoom(z);
     currentZoom = clamped;
     root.style.setProperty('--frm-font-size', (basePx * currentZoom) + 'px');
     var lbl = document.getElementById('zoomLabel');
@@ -287,6 +298,83 @@ window.__frmMain = function(D) {
     if (!silent && vscodeApi && vscodeApi.postMessage) {
       vscodeApi.postMessage({ command: 'setZoom', zoom: currentZoom });
     }
+  }
+
+  function zoomGestureBlocked() {
+    return !!(draggedElement || sizeDrag || elResize || boxResize || marquee);
+  }
+
+  function applyZoomAnchored(z, clientX, clientY) {
+    var grid = document.querySelector('.grid');
+    var r0 = grid ? grid.getBoundingClientRect() : null;
+    var gx = r0 ? clientX - r0.left : 0;
+    var gy = r0 ? clientY - r0.top : 0;
+    var w0 = r0 && r0.width > 0 ? r0.width : 0;
+    var h0 = r0 && r0.height > 0 ? r0.height : 0;
+    applyZoom(z);
+    if (!grid || !(w0 > 0) || !(h0 > 0)) return;
+    var r1 = grid.getBoundingClientRect();
+    window.scrollBy(r1.left - (clientX - gx * (r1.width / w0)), r1.top - (clientY - gy * (r1.height / h0)));
+  }
+
+  function zoomBy(steps, clientX, clientY) {
+    if (zoomGestureBlocked()) return;
+    var next = snapZoom(currentZoom + steps * ZOOM_STEP);
+    if (next === currentZoom) return;
+    if (typeof clientX === 'number' && typeof clientY === 'number') applyZoomAnchored(next, clientX, clientY);
+    else applyZoom(next);
+  }
+
+  function fitZoomToWindow() {
+    if (zoomGestureBlocked()) return;
+    var win = document.querySelector('.window');
+    var grid = document.querySelector('.grid-frame') || document.querySelector('.grid');
+    if (!win || !grid) return;
+    var bodyStyle = getComputedStyle(document.body);
+    var wr = win.getBoundingClientRect();
+    var gr = grid.getBoundingClientRect();
+    var docTop = wr.top + window.scrollY;
+    var docLeft = wr.left + window.scrollX;
+    var availW = document.documentElement.clientWidth - docLeft - (parseFloat(bodyStyle.paddingRight) || 0);
+    var availH = document.documentElement.clientHeight - docTop - (parseFloat(bodyStyle.paddingBottom) || 0);
+    if (!(availW > 0) || !(availH > 0) || !(gr.width > 0) || !(gr.height > 0) || !(currentZoom > 0)) {
+      applyZoom(1);
+      window.scrollTo(0, 0);
+      return;
+    }
+    var extraW = wr.width - gr.width;
+    var extraH = wr.height - gr.height;
+    var zW = (availW - extraW) / (gr.width / currentZoom);
+    var zH = (availH - extraH) / (gr.height / currentZoom);
+    var z = Math.min(zW, zH);
+    applyZoom(isFinite(z) && z > 0 ? z : 1);
+    window.scrollTo(0, 0);
+  }
+
+  var lastZoomAction = '';
+  var lastZoomAt = 0;
+  function handleZoomAction(action, clientX, clientY) {
+    var now = 0;
+    try { now = performance.now(); } catch (e) { now = Date.now(); }
+    // Host keybindings and the page's keydown can both fire for one press
+    if (action === lastZoomAction && now - lastZoomAt < 25) return;
+    lastZoomAction = action;
+    lastZoomAt = now;
+    if (action === 'in') zoomBy(1, clientX, clientY);
+    else if (action === 'out') zoomBy(-1, clientX, clientY);
+    else if (action === 'reset') { if (!zoomGestureBlocked()) applyZoom(1); }
+    else if (action === 'fit') fitZoomToWindow();
+  }
+
+  function zoomActionFromKey(e) {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return null;
+    var key = e.key;
+    var code = e.code;
+    if (!e.shiftKey && (key === '0' || code === 'Digit0' || code === 'Numpad0')) return 'reset';
+    if (!e.shiftKey && (key === '1' || code === 'Digit1' || code === 'Numpad1')) return 'fit';
+    if (code === 'Equal' || code === 'NumpadAdd' || key === '=' || key === '+') return 'in';
+    if (code === 'Minus' || code === 'NumpadSubtract' || key === '-' || key === '_') return 'out';
+    return null;
   }
 
   function applyGrid(on, silent){
@@ -329,6 +417,28 @@ window.__frmMain = function(D) {
         applyZoom(v);
       });
     }
+    var fitBtn = document.getElementById('zoomFit');
+    if (fitBtn) {
+      fitBtn.addEventListener('click', function() { fitZoomToWindow(); });
+    }
+    window.addEventListener('wheel', function(e) {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (zoomGestureBlocked()) return;
+      var dy = e.deltaY;
+      if (e.deltaMode === 1) dy *= 16;
+      else if (e.deltaMode === 2) dy *= 80;
+      wheelAcc += dy;
+      while (wheelAcc <= -WHEEL_NOTCH) {
+        wheelAcc += WHEEL_NOTCH;
+        zoomBy(1, e.clientX, e.clientY);
+      }
+      while (wheelAcc >= WHEEL_NOTCH) {
+        wheelAcc -= WHEEL_NOTCH;
+        zoomBy(-1, e.clientX, e.clientY);
+      }
+    }, { passive: false, capture: true });
     var gt = document.getElementById('gridToggle');
     if (gt) {
       gt.addEventListener('change', function(){
@@ -359,6 +469,11 @@ window.__frmMain = function(D) {
   var tabFields = D.tabFields;
   var tabPushButtons = D.tabPushButtons;
   var tabImages = D.tabImages;
+  var tabPreviews = D.tabPreviews;
+  // A preview on no tab's list is shown on all of them
+  function previewOnTabs(idx) {
+    return tabs.some(function(t) { return (tabPreviews[t.id] || []).map(Number).indexOf(idx) >= 0; });
+  }
   var initialActiveTab = D.initialActiveTab;
   var currentActiveTab = null; // Track the currently active tab
   function applyTab(tabId){
@@ -407,6 +522,12 @@ window.__frmMain = function(D) {
         if (imageSet.has(idx)) el.classList.remove('hidden');
         else el.classList.add('hidden');
       });
+      // Show/hide previews
+      var previewSet = new Set((tabPreviews[tabId] || []).map(Number));
+      document.querySelectorAll('.grid .preview').forEach(function(el){
+        var idx = Number(el.getAttribute('data-preview-idx') || NaN);
+        el.classList.toggle('hidden', previewOnTabs(idx) && !previewSet.has(idx));
+      });
     } catch { /* ignore */ }
   }
   function switchTab(id) {
@@ -429,6 +550,7 @@ window.__frmMain = function(D) {
     var type = el.getAttribute('data-type');
     var lists = { text: tabTexts, field: tabFields, pushbutton: tabPushButtons, image: tabImages }[type];
     var index = elementIndexOf(el);
+    if (type === 'preview' && index !== null && previewOnTabs(index)) lists = tabPreviews;
     if (!tabs.length || !lists || index === null) return null;
     return tabs.filter(function(t) {
       return (lists[t.id] || []).map(Number).indexOf(index) >= 0;
@@ -509,10 +631,23 @@ window.__frmMain = function(D) {
       }
     }
 
+    // On a selected group: only what acts on all of it
+    var group = actionTargets();
+    if (group.length < 2 || group.indexOf(element) < 0) group = null;
+    elementContextMenuState.group = group;
+    menu.querySelectorAll('[data-action="edit-element"], [data-action="show-in-source"]').forEach(function(item) {
+      item.classList.toggle('hidden', !!group);
+    });
+    if (group && moveItem) moveItem.classList.add('hidden');
+    ['Duplicate', 'Delete'].forEach(function(name) {
+      var label = menu.querySelector('[data-action="' + name.toLowerCase() + '-element"] .label');
+      if (label) label.textContent = group ? name + ' ' + group.length + ' elements' : name;
+    });
+
     // Texts toggle their box from here
     var boxItem = document.getElementById('toggleBoxMenuItem');
     if (boxItem) {
-      var isText = elementType === 'text' && isFinite(elementIndex);
+      var isText = !group && elementType === 'text' && isFinite(elementIndex);
       boxItem.classList.toggle('hidden', !isText);
       if (isText) boxItem.textContent = element && element.hasAttribute('data-box-rows') ? 'Remove Box' : 'Add Box';
     }
@@ -689,10 +824,9 @@ window.__frmMain = function(D) {
         elementData.name = dataName;
       }
       var dataValue = element.getAttribute('data-pb-value');
-      if (dataValue) {
-        elementData.value = dataValue;
-      }
-      if (!dataValue) {
+      if (dataValue !== null) {
+        elementData.value = dataValue; // '' sets the variable to blank
+      } else {
         if (elementData.kind === 'checkbox') {
           elementData.value = '1;0';
         } else if (elementData.kind === 'radio') {
@@ -722,6 +856,11 @@ window.__frmMain = function(D) {
       const colsAttr = element.getAttribute('data-preview-cols');
       elementData.rows = rowsAttr ? parseInt(rowsAttr) : 25;
       elementData.cols = colsAttr ? parseInt(colsAttr) : 72;
+    } else if (elementType === 'image') {
+      elementData.file = (element.getAttribute('data-image-file') || '').replace(/^"|"$/g, '');
+      elementData.mode = element.getAttribute('data-image-mode') || '0';
+      elementData.rows = parseInt(element.getAttribute('data-image-rows'), 10);
+      elementData.cols = parseInt(element.getAttribute('data-image-cols'), 10);
     }
 
     return { type: elementType, index: elementIndex, data: elementData };
@@ -768,6 +907,10 @@ window.__frmMain = function(D) {
       }
     });
 
+    function addHere(tool) {
+      addElementAt(tool, contextMenuState.row, contextMenuState.col, null);
+    }
+
     // Handle context menu item clicks
     document.querySelectorAll('#contextMenu .context-menu-item[data-action]').forEach(function(item) {
       item.addEventListener('click', function(e) {
@@ -779,32 +922,13 @@ window.__frmMain = function(D) {
         hideContextMenu();
         
         switch(action) {
-          case 'add-text':
-            startNewTextEdit(contextMenuState.row, contextMenuState.col);
-            break;
-          case 'add-field':
-            showModal('fieldModal');
-            document.getElementById('fieldName').focus();
-            break;
-          case 'add-button-select':
-            contextMenuState.buttonType = 'select';
-            setupButtonModal('General Button');
-            showModal('buttonModal');
-            break;
-          case 'add-button-checkbox':
-            contextMenuState.buttonType = 'checkbox';
-            setupButtonModal('Checkbox');
-            showModal('buttonModal');
-            break;
-          case 'add-button-radio':
-            contextMenuState.buttonType = 'radio';
-            setupButtonModal('Radio Button');
-            showModal('buttonModal');
-            break;
-          case 'add-preview':
-            showModal('previewModal');
-            document.getElementById('previewPath').focus();
-            break;
+          case 'add-text': addHere('text'); break;
+          case 'add-field': addHere('field'); break;
+          case 'add-button-select': addHere('button'); break;
+          case 'add-button-checkbox': addHere('checkbox'); break;
+          case 'add-button-radio': addHere('radio'); break;
+          case 'add-preview': addHere('preview'); break;
+          case 'add-image': addHere('image'); break;
         }
       });
     });
@@ -910,7 +1034,7 @@ window.__frmMain = function(D) {
               if (elementData.name) {
                 document.getElementById('buttonVariable').value = elementData.name;
               }
-              if (elementData.value) {
+              if (elementData.value != null) {
                 document.getElementById('buttonValue').value = elementData.value;
               } else if (elementData.kind === 'checkbox') {
                 document.getElementById('buttonValue').value = '1;0';
@@ -936,6 +1060,8 @@ window.__frmMain = function(D) {
               document.getElementById('previewModal').setAttribute('data-edit-index', elementIndex);
               showModal('previewModal');
               document.getElementById('previewPath').focus();
+            } else if (elementType === 'image' && isFinite(elementIndex)) {
+              openImageModal({ index: elementIndex, data: elementData }, null);
             }
             break;
           case 'move-element':
@@ -951,16 +1077,15 @@ window.__frmMain = function(D) {
             if (elementContextMenuState.element) toggleTextBox(elementContextMenuState.element);
             break;
           case 'duplicate-element':
-            if (elementContextMenuState.element) {
+            if (elementContextMenuState.group) {
+              duplicateSelected();
+            } else if (elementContextMenuState.element) {
               selectElement(elementContextMenuState.element);
-              duplicateSelectedElement();
+              duplicateSelected();
             }
             break;
           case 'delete-element':
-            if (vscodeApi && vscodeApi.postMessage && elementIndex) {
-              vscodeApi.postMessage({ command: 'deleteElement', elementType: elementType, elementIndex: elementIndex });
-              removeFromSelection(elementContextMenuState.element);
-            }
+            deleteElements(elementContextMenuState.group || [elementContextMenuState.element].filter(Boolean));
             break;
           case 'show-in-source':
             // Send message to VS Code to reveal the line in the editor
@@ -982,6 +1107,7 @@ window.__frmMain = function(D) {
     setupFieldModal();
     setupButtonModal();
     setupPreviewModal();
+    setupImageModal();
     setupMoveModal();
     setupTriggerModal();
 
@@ -1226,7 +1352,7 @@ window.__frmMain = function(D) {
     host.style.gridColumn = col + ' / span 1';
     grid.appendChild(host);
     openInlineInput(host, '', function(v) {
-      if (v == null) { host.remove(); restoreCanvasFocus(); return; }
+      if (v == null) { host.remove(); restoreCanvasFocus(); disarm(); return; }
       host.textContent = v; // shown until the preview refreshes
       restoreCanvasFocus();
       if (!vscodeApi || !vscodeApi.postMessage) return;
@@ -1636,7 +1762,7 @@ window.__frmMain = function(D) {
           }
 
           data.name = variable;
-          data.value = value || '1;0';
+          data.value = contextMenuState.buttonType === 'checkbox' ? value || '1;0' : value;
         } else {
           // For general button, get action
           var actionTypeVal = document.getElementById('buttonActionType').value;
@@ -1662,7 +1788,7 @@ window.__frmMain = function(D) {
             }
             
             data.name = variable;
-            data.value = value || '1';
+            data.value = value;
           }
         }
 
@@ -2048,26 +2174,31 @@ window.__frmMain = function(D) {
   }
 
   function deleteTrigger(idx, line, target, program, flag) {
+    if (tabOrderMode) return;
     if (vscodeApi && vscodeApi.postMessage) {
       vscodeApi.postMessage({ type: 'deleteTrigger', target: target, program: program, flag: flag });
     }
   }
 
   function deleteHiddenField(event, fieldIndex) {
+    if (tabOrderMode) {
+      if (event) { event.stopPropagation(); event.preventDefault(); }
+      return;
+    }
     if (event) {
       event.stopPropagation();
       event.preventDefault();
     }
     if (vscodeApi && vscodeApi.postMessage) {
       vscodeApi.postMessage({
-        command: 'deleteElement',
-        elementType: 'field',
-        elementIndex: fieldIndex
+        command: 'deleteElements',
+        elements: [{ type: 'field', index: fieldIndex }]
       });
     }
   }
 
   function showHiddenFieldInSource(fieldIndex) {
+    if (tabOrderMode) return;
     if (vscodeApi && vscodeApi.postMessage) {
       vscodeApi.postMessage({
         command: 'showInSource',
@@ -2100,11 +2231,612 @@ window.__frmMain = function(D) {
   window.deleteHiddenField = deleteHiddenField;
   window.showHiddenFieldInSource = showHiddenFieldInSource;
 
+  // ---- Image dialog -------------------------------------------------------------------------------
+  var IMAGE_LIST_MAX = 200;
+  var imageFiles = null; // from the extension: { name, custom, src }; null until they arrive
+  var imageEditing = null; // the edited image's { index, data }; null when adding
+  var imageSizeTouched = false; // the size was drawn or typed, so choosing a file leaves it alone
+
+  function splitImageMode(expr) {
+    if (!/^\d+(\+\d+)*$/.test(expr)) return null;
+    return expr.split('+').reduce(function(all, n) { return all | Number(n); }, 0);
+  }
+
+  function joinImageMode(bits) {
+    var parts = [];
+    for (var bit = 1; bit <= bits; bit *= 2) if (bits & bit) parts.push(bit);
+    return parts.join('+') || '0';
+  }
+
+  // Rows and columns an image of this many pixels covers at 100% zoom, shrunk to fit below and right of its cell
+  function imageCells(width, height, row, col) {
+    var probe = document.createElement('div');
+    probe.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap;line-height:1;font:' + basePx + 'px "Times New Roman",Times,serif';
+    probe.innerHTML = '<span>A</span><div style="height:var(--row-h)"></div>';
+    document.body.appendChild(probe);
+    var colW = Math.max(1, probe.firstChild.getBoundingClientRect().width - 1);
+    var rowH = Math.max(1, probe.lastChild.getBoundingClientRect().height);
+    probe.remove();
+    var maxRows = Math.max(1, gridRows - row + 1), maxCols = Math.max(1, gridCols - col + 1);
+    var scale = Math.min(1, maxCols * colW / width, maxRows * rowH / height);
+    return {
+      rows: Math.max(1, Math.min(maxRows, Math.round(height * scale / rowH))),
+      cols: Math.max(1, Math.min(maxCols, Math.round(width * scale / colW)))
+    };
+  }
+
+  function openImageModal(editing, size) {
+    var modal = document.getElementById('imageModal');
+    if (!modal) return;
+    imageEditing = editing;
+    imageSizeTouched = !!(editing || size);
+    var data = editing ? editing.data : { file: '', rows: size ? size.rows : 10, cols: size ? size.cols : 20, mode: '1+2' };
+    document.getElementById('imageModalTitle').textContent = editing ? 'Edit Image' : 'Add Image';
+    document.getElementById('imageFile').value = data.file;
+    document.getElementById('imageRows').value = data.rows;
+    document.getElementById('imageCols').value = data.cols;
+    var bits = splitImageMode(data.mode);
+    document.getElementById('imageModes').classList.toggle('hidden', bits === null);
+    list('#imageModes input').forEach(function(box) { box.checked = bits !== null && !!(bits & Number(box.value)); });
+    document.getElementById('imageModeNote').textContent = bits === null ? 'Type ' + data.mode + ' is kept as written' : '';
+    document.getElementById('imageHint').textContent = '';
+    imageFiles = null;
+    renderImageList();
+    showModal('imageModal');
+    if (vscodeApi) {
+      window.__frmImageListRequest = (window.__frmImageListRequest || 0) + 1;
+      vscodeApi.postMessage({ command: 'listImages', requestId: window.__frmImageListRequest });
+    }
+    checkImageName();
+  }
+
+  function renderImageList() {
+    var box = document.getElementById('imageList');
+    if (!box) return;
+    box.textContent = '';
+    function note(text) {
+      var n = document.createElement('div');
+      n.className = 'image-list-note';
+      n.textContent = text;
+      box.appendChild(n);
+    }
+    if (!imageFiles) { note('Loading…'); return; }
+    var typed = document.getElementById('imageFile').value.trim().toLowerCase();
+    var exact = imageFiles.some(function(f) { return f.name.toLowerCase() === typed; });
+    // A chosen file shows the whole list again, so another one can be picked
+    var shown = imageFiles.filter(function(f) { return exact || f.name.toLowerCase().indexOf(typed) >= 0; });
+    if (!shown.length) note(imageFiles.length ? 'No file name contains this' : 'No images in custom/forms/images or system/forms/images');
+    var at = exact ? shown.findIndex(function(f) { return f.name.toLowerCase() === typed; }) : 0;
+    var from = Math.max(0, Math.min(at - IMAGE_LIST_MAX / 2, shown.length - IMAGE_LIST_MAX));
+    var current = null;
+    shown.slice(from, from + IMAGE_LIST_MAX).forEach(function(f) {
+      var item = document.createElement('div');
+      item.className = 'image-list-item';
+      item.setAttribute('role', 'option');
+      item.setAttribute('data-name', f.name);
+      var thumb;
+      if (/\.tiff?$/i.test(f.name)) {
+        thumb = document.createElement('span');
+        thumb.textContent = 'TIF';
+      } else {
+        thumb = document.createElement('img');
+        thumb.loading = 'lazy';
+        thumb.alt = '';
+        thumb.src = f.src;
+      }
+      thumb.className = 'image-list-thumb';
+      var name = document.createElement('span');
+      name.className = 'image-list-name';
+      name.textContent = f.name;
+      var origin = document.createElement('span');
+      origin.className = 'image-list-origin';
+      origin.textContent = f.custom ? 'custom' : 'system';
+      item.append(thumb, name, origin);
+      if (f.name.toLowerCase() === typed) {
+        item.classList.add('active');
+        item.setAttribute('aria-selected', 'true');
+        current = item;
+      }
+      box.appendChild(item);
+    });
+    if (shown.length > IMAGE_LIST_MAX) note(shown.length + ' files; type to narrow the list');
+    if (current) box.scrollTop = current.offsetTop - box.offsetTop - 60;
+  }
+
+  // Is the typed file there, and how large is it
+  function checkImageName() {
+    var name = document.getElementById('imageFile').value.trim();
+    var hint = document.getElementById('imageHint');
+    var id = window.__frmImageRequest = (window.__frmImageRequest || 0) + 1;
+    hint.textContent = /^\$/.test(name) ? 'Files in a $DIR path are not shown in the preview' : '';
+    if (!name || /^\$/.test(name) || !vscodeApi) return;
+    vscodeApi.postMessage({ command: 'resolveImage', name: name, requestId: id });
+  }
+
+  function onImageMessage(msg) {
+    var modal = document.getElementById('imageModal');
+    if (!modal || modal.classList.contains('hidden')) return;
+    if (msg.command === 'imagesListed' && msg.requestId === window.__frmImageListRequest) {
+      imageFiles = msg.images || [];
+      renderImageList();
+    } else if (msg.command === 'imageResolved' && msg.requestId === window.__frmImageRequest) {
+      if (!msg.src) {
+        document.getElementById('imageHint').textContent = 'Not found in custom/forms/images or system/forms/images';
+        return;
+      }
+      if (imageSizeTouched) return;
+      var img = new Image();
+      img.onload = onCurrentPage(function() {
+        if (imageSizeTouched || msg.requestId !== window.__frmImageRequest || !img.naturalWidth || !img.naturalHeight) return;
+        var cells = imageCells(img.naturalWidth, img.naturalHeight, contextMenuState.row, contextMenuState.col);
+        document.getElementById('imageRows').value = cells.rows;
+        document.getElementById('imageCols').value = cells.cols;
+      });
+      img.src = msg.src;
+    }
+  }
+
+  function setupImageModal() {
+    var modal = document.getElementById('imageModal');
+    if (!modal) return;
+    var file = document.getElementById('imageFile');
+    var box = document.getElementById('imageList');
+    var timer;
+    function changed() {
+      renderImageList();
+      clearTimeout(timer);
+      window.__frmImageRequest = (window.__frmImageRequest || 0) + 1; // answers for the previous name no longer count
+      document.getElementById('imageHint').textContent = '';
+      timer = setTimeout(checkImageName, 200);
+    }
+    function pick(item) {
+      file.value = item.getAttribute('data-name');
+      changed();
+      file.focus();
+    }
+    file.addEventListener('input', changed);
+    file.addEventListener('keydown', function(e) {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      var items = list('#imageList .image-list-item');
+      var at = items.findIndex(function(i) { return i.classList.contains('kbd-active'); });
+      if (e.key === 'Enter' && at >= 0) {
+        e.preventDefault();
+        pick(items[at]);
+      } else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && items.length) {
+        e.preventDefault();
+        if (at < 0) at = items.findIndex(function(i) { return i.classList.contains('active'); });
+        var next = Math.max(0, Math.min(items.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
+        items.forEach(function(i, n) { i.classList.toggle('kbd-active', n === next); });
+        items[next].scrollIntoView({ block: 'nearest' });
+      }
+    });
+    box.addEventListener('mousedown', function(e) { if (e.target.closest('.image-list-item')) e.preventDefault(); });
+    box.addEventListener('click', function(e) {
+      var item = e.target.closest('.image-list-item');
+      if (item) pick(item);
+    });
+    ['imageRows', 'imageCols'].forEach(function(id) {
+      document.getElementById(id).addEventListener('input', function() { imageSizeTouched = true; });
+    });
+    window.addEventListener('message', function(ev) {
+      if (ev.data && (ev.data.command === 'imagesListed' || ev.data.command === 'imageResolved')) onImageMessage(ev.data);
+    });
+
+    modal.querySelector('[data-action="cancel"]').addEventListener('click', function() { hideModal('imageModal'); });
+    modal.querySelector('[data-action="confirm-image"]').addEventListener('click', function() {
+      var name = file.value.replace(/["{}]/g, '').trim();
+      var rows = parseInt(document.getElementById('imageRows').value, 10);
+      var cols = parseInt(document.getElementById('imageCols').value, 10);
+      if (!name) {
+        document.getElementById('imageHint').textContent = 'Enter a file name';
+        file.focus();
+        return;
+      }
+      if (!(rows >= 1) || !(cols >= 1)) return;
+      var old = imageEditing ? imageEditing.data : null;
+      var oldBits = old ? splitImageMode(old.mode) : 0;
+      var bits = oldBits;
+      if (bits !== null) {
+        list('#imageModes input').forEach(function(b) { bits = b.checked ? bits | Number(b.value) : bits & ~Number(b.value); });
+      }
+      var data;
+      if (old) {
+        // Only what changed, so the rest of the line stays as written
+        data = { command: 'editElement', elementType: 'image', elementIndex: imageEditing.index };
+        if (name !== old.file) data.file = name;
+        if (rows !== old.rows) data.rows = rows;
+        if (cols !== old.cols) data.cols = cols;
+        if (bits !== oldBits) data.mode = joinImageMode(bits);
+      } else {
+        data = {
+          command: 'addElement', elementType: 'image', row: contextMenuState.row, col: contextMenuState.col,
+          file: name, rows: rows, cols: cols, mode: joinImageMode(bits), activeTabId: tabs.length > 0 ? currentActiveTab : undefined
+        };
+      }
+      hideModal('imageModal');
+      if (vscodeApi && Object.keys(data).length > 3) vscodeApi.postMessage(data);
+    });
+  }
+
+  // ---- Adding elements ----------------------------------------------------------------------------
+  // Opens the dialog for a new element, or the inline input for a text. size ({ rows, cols }) is what was drawn, if anything.
+  function addElementAt(tool, row, col, size) {
+    if (tabOrderMode) return;
+    contextMenuState.row = row;
+    contextMenuState.col = col;
+    ['fieldModal', 'buttonModal', 'previewModal'].forEach(function(id) {
+      var modal = document.getElementById(id);
+      // Left behind when an edit was cancelled
+      if (modal) ['data-edit-mode', 'data-edit-index', 'data-nameformat'].forEach(function(a) { modal.removeAttribute(a); });
+    });
+    switch (tool) {
+      case 'text':
+        startNewTextEdit(row, col);
+        break;
+      case 'field':
+        clearFieldModal();
+        document.getElementById('fieldModalTitle').textContent = 'Add Field';
+        if (size) document.getElementById('fieldLen').value = size.cols;
+        showModal('fieldModal');
+        document.getElementById('fieldName').focus();
+        break;
+      case 'button':
+      case 'checkbox':
+      case 'radio':
+        clearButtonModal();
+        contextMenuState.buttonType = tool === 'button' ? 'select' : tool;
+        document.getElementById('buttonValue').value = tool === 'checkbox' ? '1;0' : '1';
+        setupButtonModal({ button: 'General Button', checkbox: 'Checkbox', radio: 'Radio Button' }[tool]);
+        showModal('buttonModal');
+        break;
+      case 'preview':
+        document.getElementById('previewModalTitle').textContent = 'Add Preview';
+        document.getElementById('previewPath').value = '';
+        document.getElementById('previewField').value = '';
+        document.getElementById('previewRows').value = size ? size.rows : 25;
+        document.getElementById('previewCols').value = size ? size.cols : 72;
+        document.getElementById('previewMode').value = '0';
+        document.getElementById('previewPortType').value = 'PORT_2D';
+        document.getElementById('previewPortStyle').value = 'SIMPLE';
+        showModal('previewModal');
+        document.getElementById('previewPath').focus();
+        break;
+      case 'image':
+        openImageModal(null, size);
+        break;
+    }
+  }
+
+  // ---- Toolbox ------------------------------------------------------------------------------------
+  // Click a tool to arm it (double-click: for several), then click a cell or drag out a size; or drag the tool onto
+  // the form. window.__frmArmed ({ tool, sticky }) and window.__frmToolbox (place and look) outlive a refresh.
+  var TOOL_KEYS = { t: 'text', f: 'field', b: 'button', c: 'checkbox', r: 'radio', p: 'preview', i: 'image' };
+  // Size of a tool dropped on the form, before its dialog says otherwise
+  var DROP_SIZES = { field: { rows: 1, cols: 10 }, preview: { rows: 25, cols: 72 }, image: { rows: 10, cols: 20 } };
+  var DRAG_THRESHOLD = 4;
+  var placing = null; // drawing a new element's place: { tool, pointerId, from, to }
+  var toolDrag = null; // a tool dragged from the toolbox: { tool, pointerId, startX, startY, active }
+  var toolboxDrag = null; // the toolbox being moved: { el, pointerId, startX, startY, corner, moved }
+  var swallowClick = false; // the click that ends a placement or drag must not do anything else
+  var pointer = window.__frmPointer || null; // last mouse position: { x, y }; outlives a refresh
+
+  function cellAt(x, y) {
+    var m = getGridMetrics();
+    if (!m) return null;
+    var row = Math.floor((y - m.rect.top) / m.rowPitch) + 1;
+    var col = Math.floor((x - m.rect.left) / m.colPitch) + 1;
+    return row >= 1 && row <= m.rows && col >= 1 && col <= m.cols ? { row: row, col: col } : null;
+  }
+
+  function nearestCell(x, y) {
+    var m = getGridMetrics();
+    return {
+      row: Math.max(1, Math.min(m.rows, Math.floor((y - m.rect.top) / m.rowPitch) + 1)),
+      col: Math.max(1, Math.min(m.cols, Math.floor((x - m.rect.left) / m.colPitch) + 1))
+    };
+  }
+
+  function showPlacement(cell, rows, cols, label) {
+    var outline = document.getElementById('dropTargetOutline');
+    var m = getGridMetrics();
+    if (!outline || !m) return;
+    outline.classList.toggle('hidden', !cell);
+    if (label) outline.setAttribute('data-size', label); else outline.removeAttribute('data-size');
+    if (cell) placeOnGrid(outline, m, cell.row, cell.col, Math.min(rows || 1, m.rows - cell.row + 1), Math.min(cols || 1, m.cols - cell.col + 1));
+  }
+
+  // What has been drawn so far; size is null for a plain click
+  function drawnPlacement() {
+    var from = placing.from, to = placing.to;
+    var sized = DROP_SIZES[placing.tool];
+    var moved = from.col !== to.col || (placing.tool !== 'field' && from.row !== to.row);
+    if (!sized || !moved) return { row: from.row, col: from.col, size: null };
+    var rows = placing.tool === 'field' ? 1 : Math.abs(to.row - from.row) + 1;
+    return {
+      row: placing.tool === 'field' ? from.row : Math.min(from.row, to.row), col: Math.min(from.col, to.col),
+      size: { rows: rows, cols: Math.abs(to.col - from.col) + 1 }
+    };
+  }
+
+  function arm(tool, sticky) {
+    hideAllContextMenus();
+    window.__frmArmed = { tool: tool, sticky: !!sticky };
+    showArmed();
+  }
+
+  function disarm() {
+    window.__frmArmed = null;
+    showArmed();
+  }
+
+  function showArmed() {
+    var armed = window.__frmArmed;
+    document.body.classList.toggle('tool-armed', !!armed);
+    list('.toolbox-tool').forEach(function(b) {
+      var on = !!armed && armed.tool === b.getAttribute('data-tool');
+      b.classList.toggle('armed', on);
+      b.classList.toggle('sticky', on && armed.sticky);
+      b.setAttribute('aria-pressed', String(on));
+    });
+    if (!armed && !placing && !toolDrag) showPlacement(null);
+  }
+
+  // Stop drawing, dragging a tool or moving the toolbox. Returns whether there was anything to stop.
+  function cancelToolDrags() {
+    var was = placing || toolDrag || toolboxDrag;
+    if (!was) return false;
+    if (placing || (toolDrag && toolDrag.active) || toolboxDrag) swallowClick = true;
+    if (toolboxDrag) { window.__frmToolbox = toolboxDrag.before; layoutToolbox(); }
+    placing = toolDrag = toolboxDrag = null;
+    document.body.classList.remove('tool-dragging', 'tool-no-drop');
+    showPlacement(null);
+    return true;
+  }
+
+  function armedIgnores(e) {
+    return !!topModal() || !e.target.closest || e.clientX >= document.documentElement.clientWidth || e.clientY >= document.documentElement.clientHeight ||
+      !!e.target.closest('.toolbox, .toolbox-show, .titlebar, .tabs, .side-panels, .unindexed-strip, .context-menu, .inline-edit');
+  }
+
+  function pointerCell() {
+    var over = pointer && document.elementFromPoint(pointer.x, pointer.y);
+    return over && over.closest('.grid') ? cellAt(pointer.x, pointer.y) : null;
+  }
+
+  // Single-key shortcut: add at the cell under the pointer, or arm the tool when there is none
+  function useToolKey(key) {
+    var tool = TOOL_KEYS[key];
+    if (!tool) return false;
+    var cell = pointerCell();
+    var armed = window.__frmArmed;
+    disarm();
+    if (cell) addElementAt(tool, cell.row, cell.col, null);
+    else if (!armed || armed.tool !== tool) arm(tool, false);
+    return true;
+  }
+
+  function layoutToolbox() {
+    var box = document.getElementById('toolbox');
+    var show = document.getElementById('toolboxShow');
+    var s = window.__frmToolbox;
+    if (!box || !show || !s) return;
+    var vw = document.documentElement.clientWidth, vh = document.documentElement.clientHeight;
+    box.classList.toggle('hidden', s.hidden);
+    show.classList.toggle('hidden', !s.hidden);
+    box.classList.toggle('horizontal', s.horizontal);
+    box.classList.remove('two-lines');
+    var el = s.hidden ? show : box;
+    if (!s.hidden && (s.horizontal ? box.offsetWidth > vw : box.offsetHeight > vh)) box.classList.add('two-lines');
+    var w = el.offsetWidth, h = el.offsetHeight;
+    // x and y say where its top right corner is, where the hide button and the icon of the hidden toolbox are
+    var right = s.fromRight ? vw - s.x : s.x;
+    var top = s.fromBottom ? vh - s.y : s.y;
+    el.style.left = Math.max(0, Math.min(vw - w, right - w)) + 'px';
+    el.style.top = Math.max(0, Math.min(vh - h, top)) + 'px';
+  }
+
+  function toolboxCorner() {
+    var r = document.getElementById(window.__frmToolbox.hidden ? 'toolboxShow' : 'toolbox').getBoundingClientRect();
+    return { right: r.right, top: r.top };
+  }
+
+  function withCorner(state, corner) {
+    var vw = document.documentElement.clientWidth, vh = document.documentElement.clientHeight;
+    var fromRight = corner.right > vw / 2, fromBottom = corner.top > vh / 2;
+    return Object.assign({}, state, {
+      fromRight: fromRight, fromBottom: fromBottom,
+      x: Math.round(fromRight ? vw - corner.right : corner.right), y: Math.round(fromBottom ? vh - corner.top : corner.top)
+    });
+  }
+
+  function changeToolbox(change) {
+    window.__frmToolbox = Object.assign(withCorner(window.__frmToolbox, toolboxCorner()), change);
+    layoutToolbox();
+    saveToolbox();
+  }
+
+  function saveToolbox() {
+    // Where it ended up: the panel's edges may have pushed it
+    window.__frmToolbox = Object.assign(withCorner(window.__frmToolbox, toolboxCorner()), { at: Date.now() });
+    if (vscodeApi) vscodeApi.postMessage({ command: 'setToolbox', state: window.__frmToolbox });
+  }
+
+  function setupToolbox() {
+    var box = document.getElementById('toolbox');
+    var show = document.getElementById('toolboxShow');
+    if (!box || !show) return;
+    // The latest change wins: one made here may be newer than this render, one from another preview older
+    if (!window.__frmToolbox || D.toolbox.at > window.__frmToolbox.at) window.__frmToolbox = D.toolbox;
+    layoutToolbox();
+    showArmed();
+    window.addEventListener('resize', layoutToolbox);
+
+    function capture(el, id) { try { el.setPointerCapture(id); } catch { /* ignore */ } }
+    document.getElementById('toolboxFlip').addEventListener('click', function() { changeToolbox({ horizontal: !window.__frmToolbox.horizontal }); });
+    document.getElementById('toolboxHide').addEventListener('click', function() {
+      disarm();
+      changeToolbox({ hidden: true });
+      show.focus({ preventScroll: true });
+    });
+    show.addEventListener('click', function() {
+      changeToolbox({ hidden: false });
+      document.getElementById('toolboxHide').focus({ preventScroll: true });
+    });
+    [box, show].forEach(function(el) {
+      el.addEventListener('contextmenu', function(e) { e.preventDefault(); e.stopPropagation(); });
+    });
+
+    // Move the toolbox by its header, or its icon when hidden
+    [box.querySelector('.toolbox-header'), show].forEach(function(handle) {
+      handle.addEventListener('pointerdown', function(e) {
+        if (e.button !== 0 || !e.isPrimary || e.target.closest('.toolbox-ctrl')) return;
+        toolboxDrag = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, corner: toolboxCorner(), before: window.__frmToolbox, moved: false };
+        capture(handle, e.pointerId);
+      });
+    });
+
+    // Tools: click to arm, double-click to keep armed, drag to drop one
+    list('.toolbox-tool').forEach(function(button) {
+      var tool = button.getAttribute('data-tool');
+      button.addEventListener('pointerdown', function(e) {
+        if (e.button !== 0 || !e.isPrimary) return;
+        toolDrag = { tool: tool, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, active: false };
+        capture(button, e.pointerId);
+      });
+      button.addEventListener('click', function(e) {
+        if (tabOrderMode) return;
+        if (e.detail === 2) arm(tool, true);
+        else if (window.__frmArmed && window.__frmArmed.tool === tool) disarm();
+        else arm(tool, false);
+      });
+    });
+
+    document.addEventListener('pointerdown', function(e) {
+      swallowClick = false;
+      if (!window.__frmArmed || armedIgnores(e)) return;
+      // Nothing under an armed tool reacts: no selecting, dragging or box selection
+      e.stopImmediatePropagation();
+      if (placing || e.button !== 0 || !e.isPrimary) return;
+      swallowClick = true;
+      var cell = cellAt(e.clientX, e.clientY);
+      if (!cell) return;
+      window.focus();
+      if (inlineEdit) {
+        // Closing an empty text input would end repeat mode
+        var armed = window.__frmArmed;
+        inlineEdit.finish(true);
+        window.__frmArmed = armed;
+        showArmed();
+      }
+      placing = { tool: window.__frmArmed.tool, pointerId: e.pointerId, from: cell, to: cell };
+      capture(document.documentElement, e.pointerId);
+      document.body.classList.add('tool-dragging');
+      showPlacement(cell);
+    }, true);
+
+    document.addEventListener('pointermove', function(e) {
+      pointer = window.__frmPointer = { x: e.clientX, y: e.clientY };
+      if (placing && e.pointerId === placing.pointerId) {
+        placing.to = DROP_SIZES[placing.tool] ? nearestCell(e.clientX, e.clientY) : placing.from;
+        var d = drawnPlacement();
+        showPlacement(d, d.size ? d.size.rows : 1, d.size ? d.size.cols : 1,
+          d.size ? (placing.tool === 'field' ? 'len ' + d.size.cols : d.size.rows + ' × ' + d.size.cols) : '');
+        return;
+      }
+      if (toolboxDrag && e.pointerId === toolboxDrag.pointerId) {
+        var dx = e.clientX - toolboxDrag.startX, dy = e.clientY - toolboxDrag.startY;
+        if (!toolboxDrag.moved && Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return;
+        toolboxDrag.moved = true;
+        window.__frmToolbox = withCorner(window.__frmToolbox, { right: toolboxDrag.corner.right + dx, top: toolboxDrag.corner.top + dy });
+        layoutToolbox();
+        return;
+      }
+      if (toolDrag && e.pointerId === toolDrag.pointerId) {
+        if (!toolDrag.active) {
+          if (Math.abs(e.clientX - toolDrag.startX) < DRAG_THRESHOLD && Math.abs(e.clientY - toolDrag.startY) < DRAG_THRESHOLD) return;
+          if (tabOrderMode) { toolDrag = null; return; }
+          toolDrag.active = true;
+          hideAllContextMenus();
+          disarm();
+          document.body.classList.add('tool-dragging');
+        }
+        var size = DROP_SIZES[toolDrag.tool] || { rows: 1, cols: 1 };
+        var over = cellAt(e.clientX, e.clientY);
+        showPlacement(over, size.rows, size.cols);
+        document.body.classList.toggle('tool-no-drop', !over);
+        return;
+      }
+      if (window.__frmArmed) showPlacement(armedIgnores(e) ? null : cellAt(e.clientX, e.clientY));
+    }, true);
+    document.documentElement.addEventListener('pointerleave', function() {
+      pointer = window.__frmPointer = null;
+      if (window.__frmArmed && !placing && !toolDrag) showPlacement(null);
+    });
+
+    document.addEventListener('pointerup', function(e) {
+      if (swallowClick) e.stopImmediatePropagation();
+      // The click comes before this
+      setTimeout(function() { swallowClick = false; }, 0);
+      if (placing && e.pointerId === placing.pointerId) {
+        var tool = placing.tool, drawn = drawnPlacement();
+        cancelToolDrags();
+        if (!window.__frmArmed || !window.__frmArmed.sticky) disarm();
+        addElementAt(tool, drawn.row, drawn.col, drawn.size);
+      } else if (toolboxDrag && e.pointerId === toolboxDrag.pointerId) {
+        var moved = toolboxDrag.moved;
+        toolboxDrag = null;
+        if (moved) { swallowClick = true; saveToolbox(); }
+      } else if (toolDrag && e.pointerId === toolDrag.pointerId) {
+        var drop = toolDrag.active ? cellAt(e.clientX, e.clientY) : null;
+        var dropped = toolDrag.tool;
+        if (!toolDrag.active) { toolDrag = null; return; }
+        cancelToolDrags();
+        if (drop) addElementAt(dropped, drop.row, drop.col, null);
+      }
+    }, true);
+    document.addEventListener('pointercancel', function() { cancelToolDrags(); }, true);
+    window.addEventListener('blur', function() { cancelToolDrags(); });
+
+    ['mousedown', 'dblclick', 'dragstart'].forEach(function(type) {
+      document.addEventListener(type, function(e) {
+        if (!placing && (!window.__frmArmed || armedIgnores(e))) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }, true);
+    });
+    document.addEventListener('click', function(e) {
+      if (!swallowClick) return;
+      swallowClick = false;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }, true);
+    // Right-click puts an armed tool away
+    document.addEventListener('contextmenu', function(e) {
+      if (!placing && (!window.__frmArmed || topModal() || (e.target.closest && e.target.closest('.inline-edit')))) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      cancelToolDrags();
+      disarm();
+    }, true);
+    // Cancelling a new element's dialog ends repeat mode
+    document.addEventListener('click', function(e) {
+      var cancel = e.target.closest && e.target.closest('.modal-overlay [data-action="cancel"]');
+      if (cancel && !cancel.closest('#shortcutsModal')) disarm();
+    }, true);
+
+    // Out of the way while form elements are dragged
+    document.body.classList.remove('element-dragging');
+    document.addEventListener('dragstart', function() { document.body.classList.add('element-dragging'); });
+    document.addEventListener('dragend', function() { document.body.classList.remove('element-dragging'); }, true);
+  }
+
   // Drag and Drop functionality
   var draggedElement = null;
+  var dragGroup = []; // the elements moved by the drag, draggedElement included
   var dragOffset = { x: 0, y: 0 };
   var selectedElements = []; // every selected element
   var selectedElement = null; // the primary one: last clicked, or the one at the code cursor
+  var selectedRows = []; // selected rows of the Triggers and Hidden Fields lists; copied, cut and deleted along with the elements
   var codeTriggers = []; // triggers at the code cursor: { target, idx }, idx = row in the trigger list
   var hoverTrigger = null; // the trigger list row under the mouse, shown instead of codeTriggers
   var visualElements = []; // hidden fields and bottom-bar buttons highlighted from the code; never acted on
@@ -2116,8 +2848,12 @@ window.__frmMain = function(D) {
 
     // Only fields on the form can be hidden; one without an index can't be moved in the file
     function canHide(element) {
-      return !!element && element.getAttribute('data-type') === 'field' &&
-        !element.classList.contains('hidden-field-item') && !element.hasAttribute('data-no-index');
+      return element.getAttribute('data-type') === 'field' &&
+        !element.classList.contains('hidden-field-item') && !isLocked(element);
+    }
+
+    function canHideDragged() {
+      return dragGroup.length > 0 && dragGroup.every(canHide);
     }
 
     function clearHiddenPanel() {
@@ -2137,13 +2873,16 @@ window.__frmMain = function(D) {
           return; // Let the event bubble up
         }
         e.stopPropagation();
-        if ((e.ctrlKey || e.metaKey) && !tabOrderMode) toggleElement(this);
+        if ((e.ctrlKey || e.metaKey || e.shiftKey) && !tabOrderMode) toggleElement(this);
         else selectElement(this);
       });
       
       element.addEventListener('dragstart', function(e) {
-        // Dragging moves this element only
-        if (selectedElements.length !== 1 || selectedElement !== this) setSelection([this], this);
+        if (tabOrderMode) { e.preventDefault(); return; }
+        // Dragging a selected element moves the whole selection, any other only itself
+        if (selectedElements.indexOf(this) < 0) setSelection([this], this);
+        dragGroup = actionTargets();
+        if (dragGroup.indexOf(this) < 0) dragGroup = [this];
         draggedElement = element;
         this.classList.add('dragging');
         
@@ -2153,12 +2892,13 @@ window.__frmMain = function(D) {
         
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/html', this.outerHTML);
-        if (hiddenPanel && canHide(this)) hiddenPanel.classList.add('hide-drop-ready');
+        if (hiddenPanel && canHideDragged()) hiddenPanel.classList.add('hide-drop-ready');
       });
 
       element.addEventListener('dragend', function() {
         this.classList.remove('dragging');
         draggedElement = null;
+        dragGroup = [];
         grid.classList.remove('drag-over');
         hideDropTarget();
         clearHiddenPanel();
@@ -2167,7 +2907,9 @@ window.__frmMain = function(D) {
 
     document.querySelectorAll('.hidden-field-item[draggable="true"]').forEach(function(element) {
       element.addEventListener('dragstart', function(e) {
+        if (tabOrderMode) { e.preventDefault(); return; }
         draggedElement = element;
+        dragGroup = [];
         this.classList.add('dragging');
         dragOffset.x = 0;
         dragOffset.y = 0;
@@ -2184,19 +2926,12 @@ window.__frmMain = function(D) {
       });
     });
 
-    function spanOf(start, end) {
-      var m = /span\s+(\d+)/.exec(String(end || ''));
-      if (m) return Math.max(1, parseInt(m[1], 10));
-      var s = parseInt(start, 10), n = parseInt(end, 10);
-      return (isFinite(s) && isFinite(n) && n > s) ? n - s : 1;
-    }
-
     // The cell the dragged element would land on for this pointer position
     function computeDropTarget(e) {
       var m = getGridMetrics();
       if (!m || !draggedElement) return null;
       var isHidden = draggedElement.classList.contains('hidden-field-item');
-      var colSpan, rowSpan, col, row;
+      var colSpan, rowSpan, col, row, dRow, dCol;
       if (isHidden) {
         colSpan = Math.max(1, parseInt(draggedElement.getAttribute('data-span'), 10) || 1);
         rowSpan = 1;
@@ -2204,12 +2939,17 @@ window.__frmMain = function(D) {
         col = Math.floor((e.clientX - m.rect.left) / m.colPitch) + 1;
         row = Math.floor((e.clientY - m.rect.top) / m.rowPitch) + 1;
       } else {
-        var st = draggedElement.style;
-        colSpan = spanOf(st.gridColumnStart, st.gridColumnEnd);
-        rowSpan = spanOf(st.gridRowStart, st.gridRowEnd);
+        colSpan = gridSpan(draggedElement, 'Column');
+        rowSpan = gridSpan(draggedElement, 'Row');
         // Snap the element's top-left corner (where its drag image is) to the nearest cell
         col = Math.round((e.clientX - dragOffset.x - m.rect.left) / m.colPitch) + 1;
         row = Math.round((e.clientY - dragOffset.y - m.rect.top) / m.rowPitch) + 1;
+      }
+      if (dragGroup.length > 1) {
+        // Everything moves by as much as the dragged element, as far as all of it stays inside the grid
+        dRow = row - parseInt(draggedElement.getAttribute('data-row'), 10);
+        dCol = col - parseInt(draggedElement.getAttribute('data-col'), 10) - colOffset(draggedElement);
+        return { m: m, moves: groupMoves(dragGroup, dRow, dCol, m.rows, m.cols, true) };
       }
       // Keep the whole element inside the current grid
       col = Math.max(1, Math.min(col, m.cols - colSpan + 1));
@@ -2223,11 +2963,25 @@ window.__frmMain = function(D) {
     function showDropTarget(t) {
       var outline = document.getElementById('dropTargetOutline');
       if (!outline || !t) return;
-      placeOnGrid(outline, t.m, t.row, t.col, t.rowSpan, t.colSpan);
+      var extra = list('.grid > .drop-target-outline.extra');
+      (t.moves || [t]).forEach(function(cell, i) {
+        var o = outline;
+        if (i > 0) {
+          o = extra[i - 1];
+          if (!o) {
+            o = document.createElement('div');
+            o.className = 'drop-target-outline extra';
+            grid.appendChild(o);
+          }
+        }
+        if (cell.el) placeOnGrid(o, t.m, cell.row, cell.col + colOffset(cell.el), gridSpan(cell.el, 'Row'), gridSpan(cell.el, 'Column'));
+        else placeOnGrid(o, t.m, cell.row, cell.col, cell.rowSpan, cell.colSpan);
+      });
       outline.classList.remove('hidden');
     }
 
     function hideDropTarget() {
+      list('.grid > .drop-target-outline.extra').forEach(function(o) { o.remove(); });
       var outline = document.getElementById('dropTargetOutline');
       if (outline) outline.classList.add('hidden');
     }
@@ -2255,20 +3009,12 @@ window.__frmMain = function(D) {
       if (!draggedElement) return;
       var target = computeDropTarget(e);
       if (!target) return;
-      var isHiddenFieldSource = draggedElement.classList.contains('hidden-field-item');
-      var newRow = target.row;
-      var newCol = target.fileCol;
-
-      // Update element position
-      var type = draggedElement.getAttribute('data-type');
-      var oldRow = parseInt(draggedElement.getAttribute('data-row'));
-      var oldCol = parseInt(draggedElement.getAttribute('data-col'));
-      
-      if (newRow !== oldRow || newCol !== oldCol) {
-        if (!isHiddenFieldSource) {
-          updateElementPosition(draggedElement, newRow, newCol);
-        }
-        sendPositionUpdate(type, draggedElement, newRow, newCol, !isHiddenFieldSource);
+      if (target.moves) {
+        commitMoves(target.moves);
+      } else if (draggedElement.classList.contains('hidden-field-item')) {
+        sendMoves([{ el: draggedElement, row: target.row, col: target.fileCol }], false);
+      } else {
+        commitMoves([{ el: draggedElement, row: target.row, col: target.fileCol }]);
       }
     });
 
@@ -2276,7 +3022,7 @@ window.__frmMain = function(D) {
     // so the browser shows its "not allowed" cursor.
     if (hiddenPanel) {
       hiddenPanel.addEventListener('dragover', function(e) {
-        if (!canHide(draggedElement)) return;
+        if (tabOrderMode || !canHideDragged()) return;
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
         this.classList.add('hide-drop-over');
@@ -2287,21 +3033,73 @@ window.__frmMain = function(D) {
       });
 
       hiddenPanel.addEventListener('drop', function(e) {
-        if (!canHide(draggedElement)) return;
+        if (!canHideDragged()) return;
         e.preventDefault();
         clearHiddenPanel();
         // Arrow keys and Delete must not act on an element that is no longer visible
         draggedElement.blur();
-        removeFromSelection(draggedElement);
-        sendPositionUpdate('field', draggedElement, 1000, 1000, false);
+        dragGroup.forEach(removeFromSelection);
+        sendMoves(dragGroup.map(function(el) { return { el: el, row: 1000, col: 1000 }; }), false);
       });
     }
   }
 
-  function updateElementPosition(element, newRow, newCol) {
+  // The drawn box of a boxed text label
+  function boxOf(element) {
+    if (element.getAttribute('data-type') !== 'text' || !element.hasAttribute('data-box-rows')) return null;
+    return document.querySelector('.grid > .box[data-text-idx="' + element.getAttribute('data-text-idx') + '"]') ||
+      document.querySelector('.grid > .box[data-row="' + element.getAttribute('data-row') + '"][data-col="' + element.getAttribute('data-col') + '"]');
+  }
+
+  // Cells an element covers; axis is 'Row' or 'Column'
+  function gridSpan(el, axis) {
+    var start = el.style['grid' + axis + 'Start'], end = el.style['grid' + axis + 'End'];
+    return Math.max(1, placementEnd(start, end) - (parseInt(start, 10) || 1) + 1);
+  }
+
+  // Where a group lands when moved by dRow, dCol: it stops as a whole at the form's edges. whole = keep whole
+  // elements inside (dragging) instead of only their first cell (arrow keys). An element already outside on that
+  // side neither stops the others nor moves further out.
+  function groupMoves(els, dRow, dCol, rows, cols, whole) {
+    function steps(axis, attr, max, wanted) {
+      var room = els.map(function(el) {
+        var fileStart = parseInt(el.getAttribute(attr), 10);
+        var start = axis === 'Column' && whole ? fileStart + colOffset(el) : fileStart;
+        return { before: fileStart - 1, after: max - (whole ? gridSpan(el, axis) - 1 : 0) - start };
+      });
+      var d = wanted;
+      room.forEach(function(r) {
+        if (d > 0 && r.after >= 0) d = Math.min(d, r.after);
+        if (d < 0) d = Math.max(d, -r.before);
+      });
+      if (d > 0 && room.every(function(r) { return r.after < 0; })) d = 0;
+      return room.map(function(r) { return d > 0 && r.after < 0 ? 0 : d; });
+    }
+    var byRow = steps('Row', 'data-row', rows, dRow);
+    var byCol = steps('Column', 'data-col', cols, dCol);
+    return els.map(function(el, i) {
+      return { el: el, row: parseInt(el.getAttribute('data-row'), 10) + byRow[i], col: parseInt(el.getAttribute('data-col'), 10) + byCol[i] };
+    });
+  }
+
+  // Draw moves ({ el, row, col }, file positions) and write them to the file as one undo step
+  function commitMoves(moves) {
+    var changed = moves.filter(function(mv) {
+      return !isLocked(mv.el) && (mv.row !== parseInt(mv.el.getAttribute('data-row'), 10) || mv.col !== parseInt(mv.el.getAttribute('data-col'), 10));
+    });
+    if (!changed.length) return;
+    // Boxes are found by position, so look them up before anything moves
+    var boxes = changed.map(function(mv) { return boxOf(mv.el); });
+    changed.forEach(function(mv, i) { updateElementPosition(mv.el, mv.row, mv.col, boxes[i]); });
+    updateOverflow(gridRows, gridCols);
+    sendMoves(changed, true);
+    noticeOtherTabs(changed.length + ' moved');
+  }
+
+  function updateElementPosition(element, newRow, newCol, box) {
     // A boxed text label carries its box along (the box sits at the label's file row/col)
     if (element.getAttribute('data-type') === 'text' && element.hasAttribute('data-box-rows')) {
-      var box = document.querySelector('.grid > .box[data-row="' + element.getAttribute('data-row') + '"][data-col="' + element.getAttribute('data-col') + '"]');
+      box = box || boxOf(element);
       if (box) {
         box.setAttribute('data-row', newRow);
         box.setAttribute('data-col', newCol);
@@ -2326,38 +3124,141 @@ window.__frmMain = function(D) {
     if (element.hasAttribute('data-box-rows')) fitBoxGaps();
   }
 
-  function sendPositionUpdate(type, element, newRow, newCol, alreadyDrawn) {
-    if (!vscodeApi || !vscodeApi.postMessage) return;
-    
-    var data = {
-      command: 'updatePosition',
-      type: type,
-      newRow: newRow,
-      newCol: newCol,
-      // false when the preview did not draw the move itself (e.g. dropped from the hidden list)
-      alreadyDrawn: alreadyDrawn !== false
+  // alreadyDrawn: false when the preview did not draw the move itself (e.g. dropped from the hidden list)
+  function sendMoves(moves, alreadyDrawn) {
+    moves = moves.filter(function(mv) { return !isLocked(mv.el); });
+    if (!moves.length || !vscodeApi || !vscodeApi.postMessage) return;
+    vscodeApi.postMessage({
+      command: 'moveElements',
+      moves: moves.map(function(mv) { return Object.assign(elementRef(mv.el), { row: mv.row, col: mv.col }); }),
+      alreadyDrawn: alreadyDrawn
+    });
+  }
+
+  function elementRef(el) {
+    return { type: el.getAttribute('data-type'), index: elementIndexOf(el) };
+  }
+
+  // Elements whose line has no index can't be found in the file
+  function isLocked(el) {
+    return elementIndexOf(el) === null || el.hasAttribute('data-no-index');
+  }
+
+  // What keys and drags act on: the selected elements in view on this tab
+  function actionTargets() {
+    return selectedElements.filter(function(el) { return !isOnOtherTab(el) && !isLocked(el); });
+  }
+
+  function isTriggerRow(row) {
+    return row.hasAttribute('data-trigger-target');
+  }
+
+  // The elements and list rows of a message to the extension
+  function statementRefs(els, rows) {
+    return {
+      elements: els.concat(rows.filter(function(row) { return !isTriggerRow(row); })).map(elementRef),
+      triggers: rows.filter(isTriggerRow).map(function(row) {
+        return {
+          line: Number(row.getAttribute('data-trigger-line')),
+          target: row.getAttribute('data-trigger-target'), program: row.getAttribute('data-trigger-program')
+        };
+      })
     };
-    
-    // Add type-specific identifiers
-    var idx;
-    if (type === 'text') {
-      idx = element.getAttribute('data-text-idx');
-      if (idx) data.index = parseInt(idx);
-    } else if (type === 'field') {
-      idx = element.getAttribute('data-field-idx');
-      if (idx) data.index = parseInt(idx);
-    } else if (type === 'pushbutton') {
-      idx = element.getAttribute('data-push-idx');
-      if (idx) data.index = parseInt(idx);
-    } else if (type === 'image') {
-      idx = element.getAttribute('data-image-idx');
-      if (idx) data.index = parseInt(idx);
-    } else if (type === 'preview') {
-      idx = element.getAttribute('data-preview-idx');
-      if (idx) data.index = parseInt(idx);
+  }
+
+  // What Delete, copy and cut act on
+  function actionRows() {
+    return selectedRows.filter(function(row) { return isTriggerRow(row) || !isLocked(row); });
+  }
+
+  // Keys that only work on elements leave selected rows alone
+  function noticeRows() {
+    if (selectedRows.length) showNotice('Selected triggers and hidden fields not changed');
+  }
+
+  function deleteElements(els, rows, command) {
+    rows = rows || [];
+    els = els.filter(function(el) { return !isLocked(el); });
+    if ((!els.length && !rows.length) || !vscodeApi || !vscodeApi.postMessage) return;
+    vscodeApi.postMessage(Object.assign({ command: command || 'deleteElements' }, statementRefs(els, rows)));
+    noticeOtherTabs((els.length + rows.length) + (command === 'cutElements' ? ' cut' : ' deleted'));
+    var rest = selectedElements.filter(function(el) { return els.indexOf(el) < 0; });
+    setSelection(rest, rest.indexOf(selectedElement) >= 0 ? selectedElement : rest[rest.length - 1] || null, null, null,
+      selectedRows.filter(function(row) { return rows.indexOf(row) < 0; }));
+  }
+
+  // Ctrl+C and Ctrl+X. False when nothing is selected.
+  function copySelected(cut) {
+    if (!selectedElements.length && !selectedRows.length) return false;
+    var els = actionTargets();
+    var rows = actionRows();
+    var total = els.length + rows.length;
+    if (!total) {
+      if (!groupKeysBlocked()) showNotice('Elements without an index can\'t be copied');
+    } else if (cut) {
+      deleteElements(els, rows, 'cutElements');
+    } else if (vscodeApi && vscodeApi.postMessage) {
+      vscodeApi.postMessage(Object.assign({ command: 'copyElements' }, statementRefs(els, rows)));
+      var away = selectedElements.filter(isOnOtherTab).length;
+      showNotice(total + ' copied' + (away ? ', ' + away + ' on other tabs not copied' : ''));
     }
-    
-    vscodeApi.postMessage(data);
+    return true;
+  }
+
+  function pasteElements() {
+    if (!vscodeApi || !vscodeApi.postMessage) return;
+    vscodeApi.postMessage({ command: 'pasteElements', cell: pointerCell(), rows: gridRows, cols: gridCols, tabId: tabs.length ? currentActiveTab : null });
+  }
+
+  // A row of the Triggers or Hidden Fields list, across refreshes. Equal triggers are told apart by their order.
+  function rowKeys(rows) {
+    var seen = {};
+    var keys = new Map();
+    list('.trigger-item').forEach(function(row) {
+      var key;
+      if (isTriggerRow(row)) {
+        var what = [row.getAttribute('data-trigger-target'), row.getAttribute('data-trigger-program'), row.querySelector('.trigger-program').textContent].join(' ');
+        seen[what] = (seen[what] || 0) + 1;
+        key = 'trigger:' + seen[what] + ':' + what;
+      } else {
+        key = elementKey(row);
+      }
+      keys.set(row, key);
+    });
+    return rows ? rows.map(function(row) { return keys.get(row); }) : keys;
+  }
+
+  function findRows(carry) {
+    var keys = carry.rows || [];
+    var lines = carry.triggerLines || [];
+    var rows = [];
+    if (keys.length || lines.length) {
+      rowKeys().forEach(function(key, row) {
+        if (keys.indexOf(key) >= 0 || (isTriggerRow(row) && lines.indexOf(Number(row.getAttribute('data-trigger-line'))) >= 0)) rows.push(row);
+      });
+    }
+    return rows;
+  }
+
+  function setupRowSelection() {
+    list('.trigger-item').forEach(function(row) {
+      row.addEventListener('click', function(e) {
+        if (tabOrderMode || e.target.closest('.trigger-actions')) return;
+        if (!(e.ctrlKey || e.metaKey || e.shiftKey)) {
+          setSelection([], null, null, null, [row]);
+          return;
+        }
+        setSelection(selectedElements, selectedElement, null, null, selectedRows.indexOf(row) >= 0
+          ? selectedRows.filter(function(r) { return r !== row; }) : selectedRows.concat(row));
+      });
+      row.addEventListener('dblclick', function(e) {
+        if (tabOrderMode || e.ctrlKey || e.metaKey || e.shiftKey || e.target.closest('.trigger-actions')) return;
+        if (!isTriggerRow(row)) showHiddenFieldInSource(elementIndexOf(row));
+        else if (vscodeApi && vscodeApi.postMessage) {
+          vscodeApi.postMessage({ command: 'showInSource', elementType: 'trigger', line: Number(row.getAttribute('data-trigger-line')) });
+        }
+      });
+    });
   }
 
   function elementKey(el) {
@@ -2379,7 +3280,10 @@ window.__frmMain = function(D) {
     return null;
   }
 
-  function setSelection(els, primary, visual, triggers) {
+  function setSelection(els, primary, visual, triggers, rows) {
+    selectedRows.forEach(function(row) { row.classList.remove('selected'); });
+    selectedRows = rows || [];
+    selectedRows.forEach(function(row) { row.classList.add('selected'); });
     selectedElements.forEach(function(el) { el.classList.remove('selected', 'primary'); });
     visualElements.forEach(function(el) { el.classList.remove('code-highlight'); });
     selectedElements = els;
@@ -2410,14 +3314,14 @@ window.__frmMain = function(D) {
       removeFromSelection(element);
       return;
     }
-    setSelection(selectedElements.concat(element), element);
+    setSelection(selectedElements.concat(element), element, null, null, selectedRows);
     element.focus();
   }
 
   function removeFromSelection(element) {
     var rest = selectedElements.filter(function(el) { return el !== element; });
     if (rest.length === selectedElements.length) return;
-    setSelection(rest, selectedElement === element ? rest[rest.length - 1] || null : selectedElement);
+    setSelection(rest, selectedElement === element ? rest[rest.length - 1] || null : selectedElement, null, null, selectedRows);
   }
 
   // Selected elements on other form tabs stay selected but can't be seen
@@ -2425,28 +3329,51 @@ window.__frmMain = function(D) {
     return el.classList.contains('hidden');
   }
 
-  // Shows how many elements are selected; with a hint for a moment when a key could not act on them
-  function updateSelectionNotice(hint) {
+  // Show a message for a moment, also across a refresh
+  function showNotice(text, ms) {
+    window.__frmNotice = { text: text, until: Date.now() + (ms || 2500) };
+    updateSelectionNotice();
+  }
+
+  // After a group action: tell when part of the selection was left alone
+  function noticeOtherTabs(done) {
+    var away = selectedElements.filter(isOnOtherTab).length;
+    if (away) showNotice(done + ', ' + away + ' on other tabs not changed');
+  }
+
+  // Shows how many elements are selected, or the message of showNotice
+  function updateSelectionNotice() {
     var notice = document.getElementById('selectionNotice');
     if (!notice) return;
     clearTimeout(window.__frmNoticeTimer);
-    var count = selectedElements.length;
+    var count = selectedElements.length + selectedRows.length;
     var away = selectedElements.filter(isOnOtherTab).length;
     var text = '';
-    if (count > 1) text = count + ' selected' + (away ? ', ' + away + ' on other tabs' : '');
-    if (hint) {
-      text = count > 1 ? count + ' selected: select one to edit' : 'The selected element is on another tab';
-      window.__frmNoticeTimer = setTimeout(onCurrentPage(function() { updateSelectionNotice(); }), 2000);
+    var left = window.__frmNotice ? window.__frmNotice.until - Date.now() : 0;
+    if (left > 0) {
+      text = window.__frmNotice.text;
+      window.__frmNoticeTimer = setTimeout(onCurrentPage(function() { updateSelectionNotice(); }), left);
+    } else {
+      window.__frmNotice = null;
+      if (count > 1) text = count + ' selected' + (away ? ', ' + away + ' on other tabs' : '');
+      text = [text].concat(triggerNotices()).filter(Boolean).join(' \u00b7 ');
     }
-    if (!hint) text = [text].concat(triggerNotices()).filter(Boolean).join(' \u00b7 ');
     notice.textContent = text;
     notice.classList.toggle('hidden', !text);
   }
 
-  // Editing keys act on exactly one element, which must be in view on this tab
+  // Editing and stretching act on exactly one element, which must be in view on this tab
   function editKeysBlocked() {
     if (selectedElements.length <= 1 && !(selectedElement && isOnOtherTab(selectedElement))) return false;
-    updateSelectionNotice(true);
+    showNotice(selectedElements.length > 1 ? selectedElements.length + ' selected: select one to edit' : 'The selected element is on another tab');
+    return true;
+  }
+
+  // Keys that act on all selected elements need at least one of them in view
+  function groupKeysBlocked() {
+    if (tabOrderMode && selectedElements.length > 1) return true;
+    if (!selectedElements.length || !selectedElements.every(isOnOtherTab)) return false;
+    showNotice(selectedElements.length > 1 ? 'The selected elements are on other tabs' : 'The selected element is on another tab');
     return true;
   }
 
@@ -2455,6 +3382,7 @@ window.__frmMain = function(D) {
       keys: selectedElements.map(elementKey),
       primary: selectedElement ? elementKey(selectedElement) : null,
       visual: visualElements.map(elementKey),
+      rows: rowKeys(selectedRows),
       triggers: codeTriggers
     };
   }
@@ -2466,6 +3394,12 @@ window.__frmMain = function(D) {
   function restoreSelection() {
     var carry = window.__frmCarry && window.__frmCarry.selection;
     var waiting = window.__frmCodeSelection;
+    if (carry && carry.otherwise && !carry.keys.some(function(k) { return findByKey(k); }) &&
+        !(carry.rows && !carry.keys.length && findRows(carry).length)) {
+      // The new elements may come with the next refresh; until then the selection stays
+      if (!carry.retried) pendingSelection = { keys: carry.keys, primary: carry.primary, visual: [], triggers: [], rows: carry.rows, triggerLines: carry.triggerLines, retried: true };
+      carry = carry.otherwise;
+    }
     if (carry) {
       var els = carry.keys.map(function(k) { return findByKey(k); }).filter(found);
       var primary = carry.primary ? findByKey(carry.primary) : null;
@@ -2476,7 +3410,7 @@ window.__frmMain = function(D) {
         carry.triggers.filter(function(t) {
           var row = t.idx === null ? null : triggerRow(t.idx);
           return t.idx === null || (row && row.getAttribute('data-trigger-target') === t.target);
-        }));
+        }), findRows(carry));
     } else {
       showTriggers();
     }
@@ -2645,19 +3579,16 @@ window.__frmMain = function(D) {
     window.addEventListener('resize', revealNow);
   }
 
-  function moveSelectedElement(deltaRow, deltaCol) {
-    if (!selectedElement) return;
-    
-    var currentRow = parseInt(selectedElement.getAttribute('data-row'));
-    var currentCol = parseInt(selectedElement.getAttribute('data-col'));
-    
-    var newRow = Math.max(1, Math.min(D.rows, currentRow + deltaRow));
-    var newCol = Math.max(1, Math.min(D.cols, currentCol + deltaCol));
-    
-    if (newRow !== currentRow || newCol !== currentCol) {
-      var type = selectedElement.getAttribute('data-type');
-      updateElementPosition(selectedElement, newRow, newCol);
-      sendPositionUpdate(type, selectedElement, newRow, newCol);
+  function moveSelected(deltaRow, deltaCol) {
+    var els = actionTargets();
+    if (els.length > 1) {
+      commitMoves(groupMoves(els, deltaRow, deltaCol, gridRows, gridCols, false));
+    } else if (els.length) {
+      commitMoves([{
+        el: els[0],
+        row: Math.max(1, Math.min(gridRows, parseInt(els[0].getAttribute('data-row'), 10) + deltaRow)),
+        col: Math.max(1, Math.min(gridCols, parseInt(els[0].getAttribute('data-col'), 10) + deltaCol))
+      }]);
     }
   }
 
@@ -2672,36 +3603,21 @@ window.__frmMain = function(D) {
       if (deleteBtn) {
         e.stopPropagation();
         e.preventDefault();
+        if (tabOrderMode) return;
         var element = deleteBtn.closest('.draggable');
-        if (element) {
-          var type = element.getAttribute('data-type');
-          var index = null;
-          if (type === 'text') {
-            index = element.getAttribute('data-text-idx');
-          } else if (type === 'field') {
-            index = element.getAttribute('data-field-idx');
-          } else if (type === 'pushbutton') {
-            index = element.getAttribute('data-push-idx');
-          } else if (type === 'image') {
-            index = element.getAttribute('data-image-idx');
-          } else if (type === 'preview') {
-            index = element.getAttribute('data-preview-idx');
-          }
-          if (index) {
-            if (vscodeApi && vscodeApi.postMessage) {
-              vscodeApi.postMessage({ command: 'deleteElement', elementType: type, elementIndex: parseInt(index) });
-            }
-          }
-        }
+        if (element) deleteElements([element]);
       }
     });
 
     // Add global keyboard event listener
     document.addEventListener('keydown', function(e) {
-      if ((!selectedElement && !visualElements.length && !codeTriggers.length) || shortcutsBlocked(e)) return;
+      if ((!selectedElement && !selectedRows.length && !visualElements.length && !codeTriggers.length) || shortcutsBlocked(e)) return;
       if (/^(Arrow(Up|Down|Left|Right)|Delete|Backspace)$/.test(e.key)) {
-        if (!selectedElement) return;
-        if (editKeysBlocked()) { e.preventDefault(); return; }
+        var deletesRows = !/^Arrow/.test(e.key) && actionRows().length > 0;
+        if (!deletesRows) noticeRows();
+        if (!selectedElement && !deletesRows) return;
+        var stretches = e.shiftKey && /^Arrow/.test(e.key);
+        if (deletesRows ? tabOrderMode : stretches ? editKeysBlocked() : groupKeysBlocked()) { e.preventDefault(); return; }
       }
       
       // Shift+Arrow stretches instead of moving
@@ -2715,19 +3631,19 @@ window.__frmMain = function(D) {
       
       switch(e.key) {
         case 'ArrowUp':
-          moveSelectedElement(-1, 0);
+          moveSelected(-1, 0);
           handled = true;
           break;
         case 'ArrowDown':
-          moveSelectedElement(1, 0);
+          moveSelected(1, 0);
           handled = true;
           break;
         case 'ArrowLeft':
-          moveSelectedElement(0, -1);
+          moveSelected(0, -1);
           handled = true;
           break;
         case 'ArrowRight':
-          moveSelectedElement(0, 1);
+          moveSelected(0, 1);
           handled = true;
           break;
         case 'Escape':
@@ -2736,27 +3652,8 @@ window.__frmMain = function(D) {
           break;
         case 'Delete':
         case 'Backspace':
-          if (selectedElement) {
-            e.preventDefault();
-            var type = selectedElement.getAttribute('data-type');
-            var index = null;
-            if (type === 'text') {
-              index = selectedElement.getAttribute('data-text-idx');
-            } else if (type === 'field') {
-              index = selectedElement.getAttribute('data-field-idx');
-            } else if (type === 'pushbutton') {
-              index = selectedElement.getAttribute('data-push-idx');
-            } else if (type === 'image') {
-              index = selectedElement.getAttribute('data-image-idx');
-            } else if (type === 'preview') {
-              index = selectedElement.getAttribute('data-preview-idx');
-            }
-            if (index) {
-              if (vscodeApi && vscodeApi.postMessage) {
-                vscodeApi.postMessage({ command: 'deleteElement', elementType: type, elementIndex: parseInt(index) });
-                clearSelection();
-              }
-            }
+          if (selectedElement || selectedRows.length) {
+            deleteElements(actionTargets(), actionRows());
             handled = true;
           }
           break;
@@ -2771,45 +3668,171 @@ window.__frmMain = function(D) {
     // Deselect when clicking on empty area (not when using a dialog or menu)
     document.addEventListener('click', function(e) {
       // Switching form tabs keeps the selection
-      if (e.target.closest('.modal-overlay, .context-menu, .tabs')) return;
-      if (!e.target.closest('.draggable')) clearSelection();
+      if (e.target.closest('.modal-overlay, .context-menu, .tabs, .toolbox, .toolbox-show')) return;
+      if (!e.target.closest('.draggable, .trigger-item')) clearSelection();
     });
+  }
+
+  // Box selection: drag on empty space to select everything inside the box
+  var marquee = null; // { x, y, startX, startY, pointerId, add, before, beforePrimary, active, cancelled }; x, y are relative to the grid
+  var MARQUEE_THRESHOLD = 4;
+
+  function canSelectInGroup(el) {
+    return !isOnOtherTab(el) && !isLocked(el);
+  }
+
+  function selectAll() {
+    var els = list('.grid > .draggable').filter(canSelectInGroup);
+    setSelection(els, els.indexOf(selectedElement) >= 0 ? selectedElement : els[els.length - 1] || null);
+    if (selectedElement) selectedElement.focus({ preventScroll: true });
+  }
+
+  // An element's place on screen; a boxed text includes its drawn box
+  function selectionRect(el) {
+    var r = el.getBoundingClientRect();
+    var box = boxOf(el);
+    var m = box && getGridMetrics();
+    if (!m) return r;
+    // The lines are drawn half a cell in from the box's edges
+    var b = box.getBoundingClientRect();
+    return {
+      left: Math.min(r.left, b.left + m.colWidth / 2), right: Math.max(r.right, b.right - m.colWidth / 2),
+      top: Math.min(r.top, b.top + m.rowHeight / 2), bottom: Math.max(r.bottom, b.bottom - m.rowHeight / 2)
+    };
+  }
+
+  function endMarquee(commit) {
+    if (!marquee) return;
+    var d = marquee;
+    document.body.classList.remove('marquee-selecting');
+    var overlay = document.getElementById('marquee');
+    if (overlay) overlay.classList.add('hidden');
+    try { document.documentElement.releasePointerCapture(d.pointerId); } catch { /* ignore */ }
+    marquee = null;
+    if (!d.active) return;
+    // The click that follows the release must not clear the selection
+    window.__frmSwallowClick = true;
+    if (!commit) {
+      setSelection(d.before, d.beforePrimary, null, null, d.beforeRows);
+      return;
+    }
+    if (selectedElement) selectedElement.focus({ preventScroll: true });
+  }
+
+  function updateMarquee(e) {
+    var d = marquee;
+    var grid = document.querySelector('.grid');
+    var overlay = document.getElementById('marquee');
+    if (!grid || !overlay) return;
+    var g = grid.getBoundingClientRect();
+    var x = d.x + g.left, y = d.y + g.top;
+    var box = { left: Math.min(x, e.clientX), right: Math.max(x, e.clientX), top: Math.min(y, e.clientY), bottom: Math.max(y, e.clientY) };
+    overlay.style.left = box.left + 'px';
+    overlay.style.top = box.top + 'px';
+    overlay.style.width = (box.right - box.left) + 'px';
+    overlay.style.height = (box.bottom - box.top) + 'px';
+    overlay.classList.remove('hidden');
+    var inside = list('.grid > .draggable').filter(function(el) {
+      if (!canSelectInGroup(el)) return false;
+      var r = selectionRect(el);
+      return r.left >= box.left - 0.5 && r.right <= box.right + 0.5 && r.top >= box.top - 0.5 && r.bottom <= box.bottom + 0.5;
+    });
+    var els = d.add ? d.before.concat(inside.filter(function(el) { return d.before.indexOf(el) < 0; })) : inside;
+    var same = els.length === selectedElements.length && els.every(function(el, i) { return el === selectedElements[i]; });
+    if (!d.add && selectedRows.length) same = false;
+    if (!same) setSelection(els, d.add && d.beforePrimary ? d.beforePrimary : els[els.length - 1] || null, null, null, d.add ? d.beforeRows : []);
+  }
+
+  function setupMarquee() {
+    document.addEventListener('pointerdown', function(e) {
+      window.__frmSwallowClick = false;
+      if (e.button !== 0 || !e.isPrimary || marquee || tabOrderMode || inlineEdit || topModal() || openContextMenu()) return;
+      // The page's own scrollbars
+      if (e.clientX >= document.documentElement.clientWidth || e.clientY >= document.documentElement.clientHeight) return;
+      if (e.target.closest('.draggable, .resize-handle, .el-resize, .box-resize, .titlebar, .tabs, .bottom-bar, .side-panels, ' +
+        '.context-menu, .unindexed-strip, .toolbox, input, select, textarea, button')) return;
+      var grid = document.querySelector('.grid');
+      if (!grid) return;
+      var g = grid.getBoundingClientRect();
+      marquee = {
+        x: e.clientX - g.left, y: e.clientY - g.top, startX: e.clientX, startY: e.clientY, pointerId: e.pointerId,
+        add: e.shiftKey || e.ctrlKey || e.metaKey, before: selectedElements, beforePrimary: selectedElement, beforeRows: selectedRows, active: false
+      };
+      document.body.classList.add('marquee-selecting');
+    });
+    document.addEventListener('pointermove', function(e) {
+      if (!marquee || e.pointerId !== marquee.pointerId) return;
+      if (!(e.buttons & 1)) { endMarquee(true); return; }
+      if (!marquee.active) {
+        if (Math.abs(e.clientX - marquee.startX) < MARQUEE_THRESHOLD && Math.abs(e.clientY - marquee.startY) < MARQUEE_THRESHOLD) return;
+        marquee.active = true;
+        // Only once it is a drag, so a plain click keeps its target
+        try { document.documentElement.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+      }
+      updateMarquee(e);
+    });
+    document.addEventListener('pointerup', function(e) {
+      if (marquee && e.pointerId === marquee.pointerId) endMarquee(true);
+      // The click comes before this; without one, later clicks must get through
+      setTimeout(function() { window.__frmSwallowClick = false; }, 0);
+    });
+    document.addEventListener('pointercancel', function(e) {
+      if (marquee && e.pointerId === marquee.pointerId) endMarquee(false);
+    });
+    window.addEventListener('blur', function() { endMarquee(false); });
+    document.addEventListener('click', function(e) {
+      if (!window.__frmSwallowClick) return;
+      window.__frmSwallowClick = false;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }, true);
   }
 
   // Tab Order Mode
   var tabOrderMode = false;
   var tabOrderSequence = [];
   
+  var TAB_ORDER_CONTROLS = '.field input, .field select, .push input, .push button, .bottom-bar-button input, .bottom-bar-button button';
+
   function enterTabOrderMode() {
     tabOrderMode = true;
+    disarm();
     tabOrderSequence = [];
     document.body.classList.add('tab-order-active');
     
     // Remove existing badges
     document.querySelectorAll('.tab-order-badge').forEach(function(el) { el.remove(); });
     
-    // Highlight all fields and buttons that affect fields
-    document.querySelectorAll('.field').forEach(function(el) {
-      el.classList.add('tab-order-mode');
+    // Controls must not react while picking: inert ones get no focus or keys, and clicks go to the element around them
+    list(TAB_ORDER_CONTROLS).forEach(function(el) { el.inert = true; });
+
+    // Highlight pickable fields, field-setting buttons, and Hidden Fields rows
+    list('.field, .hidden-field-item').forEach(function(el) {
+      if (!el.hasAttribute('data-no-index')) el.classList.add('tab-order-mode');
     });
-    document.querySelectorAll('.push[data-pb-action="variable"]').forEach(function(el) {
-      el.classList.add('tab-order-mode');
+    list('.push[data-pb-action="variable"]:not([data-unindexed])').forEach(function(el) {
+      var field = fieldElForName(el.getAttribute('data-pb-name'));
+      if (field && !field.hasAttribute('data-no-index')) el.classList.add('tab-order-mode');
     });
   }
   
   function exitTabOrderMode() {
     tabOrderMode = false;
     document.body.classList.remove('tab-order-active');
-    document.querySelectorAll('.field').forEach(function(el) {
-      el.classList.remove('tab-order-mode');
-    });
-    document.querySelectorAll('.push').forEach(function(el) {
+    list(TAB_ORDER_CONTROLS).forEach(function(el) { el.inert = false; });
+    document.querySelectorAll('.tab-order-mode').forEach(function(el) {
       el.classList.remove('tab-order-mode');
     });
     document.querySelectorAll('.tab-order-badge').forEach(function(el) { el.remove(); });
   }
   
   function addFieldToTabOrder(fieldElement) {
+    if (!fieldElement) return;
+    // The number of a field without an index is made up and may be another field's
+    if (fieldElement.hasAttribute('data-no-index')) {
+      showNotice('This field has no index');
+      return;
+    }
     var fieldIndex = parseInt(fieldElement.getAttribute('data-field-idx'), 10);
     if (isNaN(fieldIndex)) return;
     
@@ -2826,46 +3849,45 @@ window.__frmMain = function(D) {
     }
   }
   
-  function addButtonToTabOrder(buttonElement) {
-    // Get the field name that this button affects
-    var fieldName = buttonElement.getAttribute('data-pb-name');
-    if (!fieldName) return;
-    
-    // Find the corresponding field by name
-    var fieldEl = document.querySelector('.field[data-field-name="' + fieldName + '"]');
-    if (!fieldEl) return;
-    
-    // Add that field to the tab order
-    addFieldToTabOrder(fieldEl);
+  function fieldElForName(fieldName) {
+    if (!fieldName) return null;
+    var attr = '[data-field-name="' + CSS.escape(fieldName) + '"]';
+    var indexed = attr + ':not([data-no-index])';
+    return document.querySelector('.field' + indexed) || document.querySelector('.hidden-field-item' + indexed) ||
+      document.querySelector('.field' + attr) || document.querySelector('.hidden-field-item' + attr);
   }
-  
+
+  function addButtonToTabOrder(buttonElement) {
+    var name = buttonElement.getAttribute('data-pb-name');
+    var fieldEl = fieldElForName(name);
+    if (fieldEl) addFieldToTabOrder(fieldEl);
+    else if (name) showNotice('No field ' + name + ' on this form');
+  }
+
+  function placeTabOrderBadge(el, order) {
+    if (!el) return;
+    var badge = document.createElement('div');
+    badge.className = 'tab-order-badge';
+    badge.textContent = String(order + 1);
+    el.style.position = 'relative';
+    el.appendChild(badge);
+  }
+
   function updateTabOrderBadges() {
-    // Remove all existing badges
     document.querySelectorAll('.tab-order-badge').forEach(function(el) { el.remove(); });
-    
-    // Add badges for fields in sequence
+
     tabOrderSequence.forEach(function(fieldIndex, order) {
-      var fieldEl = document.querySelector('.field[data-field-idx="' + fieldIndex + '"]');
-      if (fieldEl) {
-        var fieldName = fieldEl.getAttribute('data-field-name');
-        
-        // Add badge to the field
-        var badge = document.createElement('div');
-        badge.className = 'tab-order-badge';
-        badge.textContent = String(order + 1);
-        fieldEl.style.position = 'relative';
-        fieldEl.appendChild(badge);
-        
-        // Add badges to all buttons that affect this field
-        if (fieldName) {
-          document.querySelectorAll('.push[data-pb-name="' + fieldName + '"]').forEach(function(btnEl) {
-            var btnBadge = document.createElement('div');
-            btnBadge.className = 'tab-order-badge';
-            btnBadge.textContent = String(order + 1);
-            btnEl.style.position = 'relative';
-            btnEl.appendChild(btnBadge);
-          });
-        }
+      var idxAttr = '[data-field-idx="' + fieldIndex + '"]:not([data-no-index])';
+      var fieldEl = document.querySelector('.field' + idxAttr);
+      var hiddenEl = document.querySelector('.hidden-field-item' + idxAttr);
+      var fieldName = (fieldEl && fieldEl.getAttribute('data-field-name')) ||
+        (hiddenEl && hiddenEl.getAttribute('data-field-name'));
+      placeTabOrderBadge(fieldEl, order);
+      placeTabOrderBadge(hiddenEl, order);
+      if (fieldName) {
+        document.querySelectorAll('.push[data-pb-name="' + CSS.escape(fieldName) + '"]').forEach(function(btnEl) {
+          placeTabOrderBadge(btnEl, order);
+        });
       }
     });
   }
@@ -2937,26 +3959,27 @@ window.__frmMain = function(D) {
     }
   }, true); // Use capture phase
 
-  // Modify field click handler to support tab order mode (capture phase)
+  // Pick a field, its Hidden Fields row, or a field-setting button (capture, before source/delete)
   document.addEventListener('click', function(e) {
     if (!tabOrderMode) return;
-    
-    var fieldEl = e.target.closest('.field');
+
+    var fieldEl = e.target.closest('.field, .hidden-field-item');
     if (fieldEl) {
       e.preventDefault();
       e.stopPropagation();
+      e.stopImmediatePropagation();
       addFieldToTabOrder(fieldEl);
-      return false;
+      return;
     }
-    
+
     var buttonEl = e.target.closest('.push');
     if (buttonEl) {
       e.preventDefault();
       e.stopPropagation();
-      addButtonToTabOrder(buttonEl);
-      return false;
+      e.stopImmediatePropagation();
+      if (buttonEl.getAttribute('data-pb-action') === 'variable') addButtonToTabOrder(buttonEl);
     }
-  }, true); // Use capture phase
+  }, true);
   
   // Handle tab order context menu actions (bubble phase, after capture)
   document.addEventListener('click', function(e) {
@@ -3300,7 +4323,7 @@ window.__frmMain = function(D) {
 
       handle.addEventListener('pointerdown', function(e) {
         if (e.button !== 0 || tabOrderMode || document.querySelector('.modal-overlay:not(.hidden)')) return;
-        if (!canStretch(el)) return;
+        if (!canStretch(el) || e.ctrlKey || e.metaKey || e.shiftKey) return; // with a modifier it is a click to select
         var m = getGridMetrics();
         if (!m) return;
         e.preventDefault();
@@ -3334,7 +4357,7 @@ window.__frmMain = function(D) {
 
       handle.addEventListener('pointerup', function() { endStretch(true); });
       handle.addEventListener('pointercancel', function() { endStretch(false); });
-      handle.addEventListener('click', function(e) { e.stopPropagation(); });
+      handle.addEventListener('click', function(e) { if (!e.ctrlKey && !e.metaKey && !e.shiftKey) e.stopPropagation(); });
       handle.addEventListener('dragstart', function(e) { e.preventDefault(); });
     });
 
@@ -3514,7 +4537,7 @@ window.__frmMain = function(D) {
   // ---------------------------------------------------------------------
   // Keyboard shortcuts, modal keyboard/backdrop handling, context-menu navigation
   // ---------------------------------------------------------------------
-  var pendingSelectionKey = null; // the extension names a new element (e.g. a duplicate) to select after the next refresh
+  var pendingSelection = null; // { keys, primary }: new elements (duplicates) the extension wants selected after the next refresh
   var backdropPress = null;
 
   function isVisible(el) {
@@ -3691,22 +4714,39 @@ window.__frmMain = function(D) {
     return m ? parseInt(m[1], 10) : 1;
   }
 
-  // Same column, one row down; stays put when that would leave the form
-  function duplicateSelectedElement() {
-    var el = selectedElement;
-    if (!el || tabOrderMode || !vscodeApi || !vscodeApi.postMessage || editKeysBlocked()) return;
-    var type = el.getAttribute('data-type');
-    var index = elementIndexOf(el);
-    var row = parseInt(el.getAttribute('data-row'), 10);
-    if (!type || !index || !isFinite(row)) return;
-    var newRow = row + rowSpanOfElement(el) <= D.rows ? row + 1 : row;
-    vscodeApi.postMessage({ command: 'duplicateElement', elementType: type, elementIndex: index, row: newRow });
+  // Rows an element's copy must clear; a drawn box reaches into one more row than its size
+  function coveredRows(el) {
+    return rowSpanOfElement(el) + (el.hasAttribute('data-box-rows') ? 1 : 0);
   }
 
-  // Same as choosing Edit in the element's context menu (images have no edit dialog)
+  // Same column. One element: one row down; stays put when that would leave the form.
+  // A group: below itself, or as far down as fits.
+  function duplicateSelected() {
+    if (tabOrderMode || !vscodeApi || !vscodeApi.postMessage || groupKeysBlocked()) return;
+    noticeRows();
+    var els = actionTargets();
+    if (!els.length) return;
+    var rowOf = function(el) { return parseInt(el.getAttribute('data-row'), 10); };
+    var down;
+    if (els.length === 1) {
+      down = rowOf(els[0]) + rowSpanOfElement(els[0]) <= gridRows ? 1 : 0;
+    } else {
+      var top = Math.min.apply(null, els.map(rowOf));
+      var bottom = Math.max.apply(null, els.map(function(el) { return rowOf(el) + coveredRows(el) - 1; }));
+      down = Math.max(0, Math.min(bottom - top + 1, gridRows - bottom));
+    }
+    noticeOtherTabs(els.length + ' duplicated');
+    vscodeApi.postMessage({
+      command: 'duplicateElements',
+      elements: els.map(function(el) { return Object.assign(elementRef(el), { row: rowOf(el) + down }); }),
+      primary: elementRef(els.indexOf(selectedElement) >= 0 ? selectedElement : els[els.length - 1])
+    });
+  }
+
+  // Same as choosing Edit in the element's context menu
   function openElementEditor(element) {
     var info = collectElementInfo(element);
-    if (!info.type || info.type === 'image') return;
+    if (!info.type) return;
     elementContextMenuState.element = element;
     elementContextMenuState.elementType = info.type;
     elementContextMenuState.elementIndex = info.index;
@@ -3723,11 +4763,19 @@ window.__frmMain = function(D) {
   // Capture phase: runs before the canvas handler, which moves/deletes/deselects the selected element
   function onShortcutKeydown(e) {
     var mod = e.ctrlKey || e.metaKey;
+    var zoomAction = zoomActionFromKey(e);
+    if (zoomAction) {
+      consumeKey(e);
+      handleZoomAction(zoomAction);
+      return;
+    }
     var modal = topModal();
     var menu = openContextMenu();
 
     // Esc closes one layer per press. An open native <select> list swallows Esc itself.
     if (e.key === 'Escape') {
+      if (marquee) { endMarquee(false); consumeKey(e); return; }
+      if (cancelToolDrags()) { consumeKey(e); return; }
       if (sizeDrag || elResize || boxResize) return; // the resize handlers cancel the drag
       if (menu) { hideAllContextMenus(); consumeKey(e); return; }
       if (modal) {
@@ -3736,6 +4784,7 @@ window.__frmMain = function(D) {
         return;
       }
       if (tabOrderMode) { cancelTabOrder(); consumeKey(e); return; }
+      if (window.__frmArmed && !inlineEdit) { disarm(); consumeKey(e); return; }
       return; // the canvas handler deselects
     }
 
@@ -3781,12 +4830,40 @@ window.__frmMain = function(D) {
       return;
     }
     if (mod && !e.altKey && !e.shiftKey && key === 'd') {
-      duplicateSelectedElement();
+      duplicateSelected();
+      consumeKey(e);
+      return;
+    }
+    if (mod && !e.altKey && !e.shiftKey && (key === 'c' || key === 'x' || key === 'v')) {
+      // Not in the middle of a drag
+      var dragging = draggedElement || sizeDrag || elResize || boxResize || marquee || placing || toolDrag || toolboxDrag;
+      if (!dragging && !e.repeat) {
+        if (key !== 'c') { hideAllContextMenus(); disarm(); }
+        if (key === 'v') pasteElements();
+        else if (!copySelected(key === 'x')) return; // text selected on the page can still be copied
+      }
+      consumeKey(e);
+      return;
+    }
+    if (mod && !e.altKey && !e.shiftKey && key === 'a') {
+      selectAll();
+      consumeKey(e);
+      return;
+    }
+    if (!mod && !e.altKey && !e.shiftKey && !e.repeat && !menu && TOOL_KEYS[key]) {
+      // Not in the middle of a drag
+      if (!draggedElement && !sizeDrag && !elResize && !boxResize && !marquee && !placing && !toolDrag && !toolboxDrag) useToolKey(key);
       consumeKey(e);
       return;
     }
     if (!mod && !e.altKey && e.key === '?') {
       showModal('shortcutsModal');
+      consumeKey(e);
+      return;
+    }
+    if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length &&
+        !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
+      showNotice(selectedElements.length + selectedRows.length > 1 ? 'Several selected: select one element to edit' : 'Triggers and hidden fields can\'t be edited with this key');
       consumeKey(e);
       return;
     }
@@ -3820,8 +4897,15 @@ window.__frmMain = function(D) {
 
     window.addEventListener('message', function(ev) {
       var msg = ev.data;
-      if (msg && msg.command === 'frmSelectAfterRefresh' && typeof msg.key === 'string') {
-        pendingSelectionKey = msg.key;
+      if (msg && msg.command === 'frmSelectAfterRefresh' && Array.isArray(msg.keys)) {
+        pendingSelection = {
+          keys: msg.keys, primary: msg.primary, visual: [], triggers: [],
+          rows: (msg.hiddenFields || []).map(function(index) { return 'field:' + index; }), triggerLines: msg.triggerLines || []
+        };
+      }
+      if (msg && msg.command === 'frmNotice' && typeof msg.text === 'string') showNotice(msg.text, 5000);
+      if (msg && msg.command === 'frmZoom' && typeof msg.action === 'string') {
+        handleZoomAction(msg.action);
       }
     });
 
@@ -3838,34 +4922,38 @@ window.__frmMain = function(D) {
 
     if (/Mac|iPhone|iPad/.test(navigator.platform || '')) {
       document.querySelectorAll('[data-kbd-mod]').forEach(function(el) {
-        el.textContent = el.textContent.replace('Ctrl', '⌘');
+        el.textContent = el.textContent.replace(/Ctrl/g, '⌘');
+        if (el.title) el.title = el.title.replace(/Ctrl/g, '⌘');
       });
     }
   }
 
   // Initialize drag and drop and keyboard navigation after DOM is ready
   setupShortcuts(); // first, so its capture-phase Escape runs before the resize handlers end a drag
+  setupToolbox(); // before anything else that listens to the mouse, so nothing under an armed tool reacts
   setupWindowResize();
   setupElementResize();
   setupBoxResize();
   setupContextMenu();
   setupDragAndDrop();
+  setupMarquee(); // first, so its click handler can stop the one that deselects
   setupKeyboardNavigation();
   setupCodeSelection();
   fitTextSpans();
   
   // Restore selection if it existed before this update
   restoreSelection();
+  setupRowSelection();
   setupTriggerHover();
   window.__frmCarry = null;
 
   // Hooks for the bootstrap's in-place updates
   window.__frmHooks = {
     isBusy: function() {
-      return !!draggedElement || !!sizeDrag || !!elResize || tabOrderMode ||!!document.querySelector('.modal-overlay:not(.hidden)');
+      return !!draggedElement || !!sizeDrag || !!elResize || !!marquee || !!placing || !!toolDrag || !!toolboxDrag || !!inlineEdit || tabOrderMode || !!document.querySelector('.modal-overlay:not(.hidden)');
     },
     getSelection: function() {
-      return pendingSelectionKey ? { keys: [pendingSelectionKey], primary: pendingSelectionKey, visual: [], triggers: [] } : getSelection();
+      return pendingSelection ? Object.assign({}, pendingSelection, { otherwise: getSelection() }) : getSelection();
     }
   };
   tryCodeSelection(); // one that waited for this update

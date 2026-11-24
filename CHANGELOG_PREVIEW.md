@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-11-24
+
+### Added
+
+- Copy, cut and paste with Ctrl+C, Ctrl+X and Ctrl+V, within a form and between forms. The clipboard holds plain FRM lines, so it also works to and from the text editor. Pasting puts the top-left corner at the cell under the pointer, each line in its section, under new indexes, on the active tab; fields join `group(1)`. Cutting and pasting in the same form keeps the indexes. One Ctrl+Z undoes it.
+- Triggers and hidden fields can be selected in their lists, together with elements on the form, to copy, cut or delete them. Double-click shows them in the source (one click used to, for hidden fields). A pasted trigger follows its field when that is pasted with it.
+- A floating toolbox with Text, Field, Button, Checkbox, Radio, Preview and Image. Click a tool and then a cell, or drag the tool onto the form; with a field, preview or image, drag to set its size. Double-click a tool to add several; Esc or right-click stops. The toolbox can be moved, flipped between vertical and horizontal, and hidden to a toolbox icon; this is remembered for all forms.
+- T, F, B, C, R, P and I add an element at the cell under the pointer, also when the toolbox is hidden. Away from the form they select the tool.
+- Images can be added, and edited with F2, Enter or the right-click menu. The dialog lists the files in `custom/forms/images` and `system/forms/images` with thumbnails and fills in the size from the chosen file. Editing rewrites only what changed.
+- A new element is selected, and the "Added ..." message is gone.
+- In tab-order mode, a field-setting button (RADIO, CHECKBOX or NAME=value) or a row in Hidden Fields adds that field, including when the field is hidden. Clicking any stand-in for the same field toggles the same slot. Delete × are hidden and dragging is off until you confirm or cancel.
+- Several elements can be moved, duplicated, deleted or hidden at once, as one undo step. Shift+click works like Ctrl+click, dragging on empty space selects everything completely inside the box, and Ctrl+A selects all on the current tab. Arrow keys, dragging, Ctrl+D, Delete and the right-click menu then act on all selected elements of the current tab. A group keeps its layout and stops at the form's edge as a whole; its copies go below the group.
+- Preview zoom shortcuts: Ctrl+scroll, Ctrl+= and Ctrl+- change zoom in 5% steps (scroll keeps the point under the cursor); Ctrl+0 resets to 100%; Ctrl+1 or the titlebar Fit button scales the form to the panel. ⌘ on Mac. The keys work while a dialog is open and when the zoom slider is hidden. Zoom is remembered up to 1000% (it used to forget anything above 300%).
+
+### Fixed
+
+- Adding or duplicating a field on a form without `revision= 2` no longer treats the second value of `group(1)` as a field number.
+- A preview added on a form with tabs is put in the tab's `opt_preview` list, and previews in such lists are only shown on their tabs.
+- Adding an element after cancelling an edit no longer overwrites the element whose edit was cancelled.
+- A refresh no longer closes a text or header that is being typed.
+- Tab-order mode: locked fields can be picked, and clicking a field or button only numbers it (dropdowns don't open, radios don't toggle). Fields without an index, and buttons whose field isn't on the form, can't be picked; a notice says why. Button and field names match exactly, including case and `$`.
+- Buttons that set a variable to blank (`RADIO MOUNT=`) are read as such, and editing them keeps the value blank. An empty value for a radio or plain variable button now means blank. A `$` before a button's variable is kept.
+- A button line with nothing after its position or label no longer takes in the line below it.
+- Moves made in quick succession (holding an arrow key) are written one after the other, so none are lost.
+- A field without an index can no longer be moved or deleted from the preview; that could change another field.
+
 ## 2026-11-23
 
 ### Added

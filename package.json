@@ -56,10 +56,98 @@
       {
         "command": "vertexFrmPreview.convertPushbuttons",
         "title": "FRM: Convert all pushbuttons to buttons"
+      },
+      {
+        "command": "vertexFrmPreview.zoomIn",
+        "title": "FRM: Zoom In"
+      },
+      {
+        "command": "vertexFrmPreview.zoomOut",
+        "title": "FRM: Zoom Out"
+      },
+      {
+        "command": "vertexFrmPreview.zoomReset",
+        "title": "FRM: Reset Zoom"
+      },
+      {
+        "command": "vertexFrmPreview.zoomFit",
+        "title": "FRM: Fit Zoom to Window"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "vertexFrmPreview.zoomIn",
+        "key": "ctrl+=",
+        "mac": "cmd+=",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomIn",
+        "key": "ctrl+shift+=",
+        "mac": "cmd+shift+=",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomIn",
+        "key": "ctrl+numpad_add",
+        "mac": "cmd+numpad_add",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomOut",
+        "key": "ctrl+-",
+        "mac": "cmd+-",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomOut",
+        "key": "ctrl+numpad_subtract",
+        "mac": "cmd+numpad_subtract",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomReset",
+        "key": "ctrl+0",
+        "mac": "cmd+0",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomReset",
+        "key": "ctrl+numpad0",
+        "mac": "cmd+numpad0",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomFit",
+        "key": "ctrl+1",
+        "mac": "cmd+1",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
+      },
+      {
+        "command": "vertexFrmPreview.zoomFit",
+        "key": "ctrl+numpad1",
+        "mac": "cmd+numpad1",
+        "when": "activeWebviewPanelId == 'vertexFrmPreview'"
       }
     ],
     "menus": {
       "commandPalette": [
+        {
+          "command": "vertexFrmPreview.zoomIn",
+          "when": "false"
+        },
+        {
+          "command": "vertexFrmPreview.zoomOut",
+          "when": "false"
+        },
+        {
+          "command": "vertexFrmPreview.zoomReset",
+          "when": "false"
+        },
+        {
+          "command": "vertexFrmPreview.zoomFit",
+          "when": "false"
+        },
         {
           "command": "vertexFrmPreview.sortSections",
           "when": "resourceLangId == vertexfrm || resourceExtname == .frm"

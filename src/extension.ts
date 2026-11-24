@@ -1,12 +1,23 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { elementsInSelections, findElement, lineContinues } from './elementLookup';
+import {
+  ElementContent, ElementCopy, ElementMove, ElementRef, ImageEdit, NewElement, addElement, duplicateElements, editImage,
+  isCopy, isMove, keyOf, moveElements, validRefs
+} from './elementEdits';
+import { copyStatements, deleteStatements, pasteStatements, validTriggerRefs } from './formClipboard';
+import { parseButtonAssignment } from './buttonAssignment';
+import { elementsInSelections, findElement, findTriggerStatements } from './elementLookup';
+import {
+  Section, bannerLength, classifyStatement, collectContinuedStatement, formatIndexStatement, insertIntoSection, isBlankLine,
+  isCommentLine, isSeparatorLine, parseIndexList, statementKeyword, statementValue, wrapWidthFromFirstLine
+} from './frmSections';
 import { newButtonKeyword } from './frmStatements';
 import { convertButtons, registerLanguageFeatures, usesMixedButtons } from './languageFeatures';
 
 // The extension's install folder; the preview page's styles and script are in its media/ folder
 let extensionUri: vscode.Uri | undefined;
+let globalState: vscode.Memento | undefined;
 function mediaRoot(): vscode.Uri {
   return vscode.Uri.joinPath(extensionUri!, 'media');
 }
@@ -16,6 +27,7 @@ let log: vscode.LogOutputChannel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   extensionUri = context.extensionUri;
+  globalState = context.globalState;
   log = vscode.window.createOutputChannel('Vertex FRM', { log: true });
   context.subscriptions.push(log);
   // The extension starts once VS Code is up (onStartupFinished), so read the files every first
@@ -29,6 +41,20 @@ export function activate(context: vscode.ExtensionContext) {
   const openCmd = vscode.commands.registerCommand('vertexFrmPreview.open', () => openPreview(context));
   context.subscriptions.push(openCmd);
   context.subscriptions.push(vscode.commands.registerCommand('vertexFrmPreview.sortSections', sortSectionsCommand));
+  const sendPreviewZoom = (action: 'in' | 'out' | 'reset' | 'fit') => {
+    for (const panel of panelByDoc.values()) {
+      if (panel.active) {
+        panel.webview.postMessage({ command: 'frmZoom', action });
+        return;
+      }
+    }
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('vertexFrmPreview.zoomIn', () => sendPreviewZoom('in')),
+    vscode.commands.registerCommand('vertexFrmPreview.zoomOut', () => sendPreviewZoom('out')),
+    vscode.commands.registerCommand('vertexFrmPreview.zoomReset', () => sendPreviewZoom('reset')),
+    vscode.commands.registerCommand('vertexFrmPreview.zoomFit', () => sendPreviewZoom('fit')),
+  );
   registerLanguageFeatures(context);
 
   // Auto-open / auto-reveal when a vertex-frm file is focused (each controlled by a setting)
@@ -126,7 +152,7 @@ const previewHistoryRuns = new Map<string, number>();
 // Messages from the preview that don't edit the file
 const NON_EDITING_COMMANDS = new Set([
   'gateCancel', 'frmReady', 'frmTiming', 'frmSoftUpdateFailed', 'setZoom', 'setActiveTab', 'setGridOn',
-  'resolveFieldValues', 'showInSource', 'undo', 'redo', 'cancelTabOrder', 'dismissMixedButtons'
+  'resolveFieldValues', 'listImages', 'resolveImage', 'setToolbox', 'showInSource', 'copyElements', 'undo', 'redo', 'cancelTabOrder', 'dismissMixedButtons'
 ]);
 
 function followsCursor(): boolean {
@@ -192,48 +218,20 @@ interface TimingMessage {
   drawn?: number;
 }
 
-interface ElementRefMessage { elementType: string; elementIndex: number; }
+/** `line` instead of an index for triggers. */
+interface ElementRefMessage { elementType: string; elementIndex: number; line?: number; }
 
-interface PositionMessage { type: string; index: number; newRow: number; newCol: number; alreadyDrawn?: boolean; }
+interface ElementsMessage { elements: ElementRef[]; triggers?: unknown; }
 
-/** What the add/edit dialogs send; which of the optional values are present depends on the element type. */
-interface ElementContentMessage {
-  elementType: string;
-  row: number;
-  col: number;
-  // text
-  content?: string;
-  boxRows?: number | null;
-  boxCols?: number | null;
-  // field
-  name?: string;
-  nameFormat?: { angle?: boolean; quoted?: boolean };
-  type?: string;
-  len?: number;
-  ignore?: number | string | null;
-  values?: string[];
-  // pushbutton (also uses name)
-  label?: string;
-  kind?: string;
-  program?: string;
-  value?: string;
-  // preview
-  rows?: number;
-  cols?: number;
-  mode?: string;
-  path?: string;
-  field?: string;
-  portType?: string;
-  portStyle?: string;
-}
+interface PasteElementsMessage { cell?: { row: number; col: number } | null; rows: number; cols: number; tabId?: number | null; }
 
-interface AddElementMessage extends ElementContentMessage { activeTabId?: number | null; }
+interface MoveElementsMessage { moves: ElementMove[]; alreadyDrawn?: boolean; }
 
-interface EditElementMessage extends ElementContentMessage { elementIndex: number; }
+interface DuplicateElementsMessage { elements: ElementCopy[]; primary?: ElementRef; }
+
+interface EditElementMessage extends ElementContent { elementIndex: number; }
 
 interface MoveElementMessage extends ElementRefMessage { targetTabIds: 'all' | number[]; }
-
-interface DuplicateElementMessage extends ElementRefMessage { row: number; }
 
 interface HeaderMessage { title?: string; }
 
@@ -466,19 +464,19 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         edit.replace(doc.uri, full, msg.text);
         vscode.workspace.applyEdit(edit);
       } else if (msg?.command === 'setZoom' && typeof msg?.zoom === 'number') {
-        const clamped = Math.max(0.5, Math.min(3, Number(msg.zoom)));
+        const clamped = Math.max(0.5, Math.min(10, Number(msg.zoom)));
         zoomByDoc.set(key, clamped);
       } else if (msg?.command === 'setActiveTab' && typeof msg?.id === 'number') {
         activeTabByDoc.set(key, Number(msg.id));
       } else if (msg?.command === 'setGridOn') {
         const on = Boolean(msg?.on);
         gridOnByDoc.set(key, on);
-      } else if (msg?.command === 'updatePosition') {
-        handlePositionUpdate(doc, msg);
+      } else if (msg?.command === 'moveElements') {
+        handleMoveElements(doc, createdPanel, msg);
       } else if (msg?.command === 'addElement') {
-        handleAddElement(doc, msg);
-      } else if (msg?.command === 'deleteElement') {
-        handleDeleteElement(doc, msg);
+        handleAddElement(doc, createdPanel, msg);
+      } else if (msg?.command === 'deleteElements') {
+        handleDeleteElements(doc, msg);
       } else if (msg?.command === 'editElement') {
         handleEditElement(doc, msg);
       } else if (msg?.command === 'updateHeader') {
@@ -486,18 +484,29 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
       } else if (msg?.command === 'resolveFieldValues' && Array.isArray(msg?.names)) {
         const names = msg.names.filter((n: unknown): n is string => typeof n === 'string');
         createdPanel.webview.postMessage({ command: 'fieldValuesResolved', requestId: msg.requestId, lines: describeFieldValues(names) });
+      } else if (msg?.command === 'listImages') {
+        createdPanel.webview.postMessage({ command: 'imagesListed', requestId: msg.requestId, images: listImages(createdPanel.webview) });
+      } else if (msg?.command === 'resolveImage' && typeof msg?.name === 'string') {
+        createdPanel.webview.postMessage({ command: 'imageResolved', requestId: msg.requestId, src: resolveImageSrc(createdPanel.webview, msg.name) ?? null });
+      } else if (msg?.command === 'setToolbox') {
+        const state = toolboxState(msg.state);
+        if (state) globalState?.update(TOOLBOX_KEY, state);
       } else if (msg?.command === 'setPortSize') {
         handleSetPortSize(doc, msg);
       } else if (msg?.command === 'resizeElement') {
-        handleResizeElement(doc, msg);
+        queueEdit(doc, () => handleResizeElement(doc, msg));
       } else if (msg?.command === 'setTextBox') {
         handleSetTextBox(doc, msg);
       } else if (msg?.command === 'moveElement') {
         handleMoveElement(doc, msg);
-      } else if (msg?.command === 'duplicateElement') {
-        handleDuplicateElement(doc, createdPanel, msg);
+      } else if (msg?.command === 'duplicateElements') {
+        handleDuplicateElements(doc, createdPanel, msg);
+      } else if (msg?.command === 'copyElements' || msg?.command === 'cutElements') {
+        handleCopyElements(doc, createdPanel, msg, msg.command === 'cutElements');
+      } else if (msg?.command === 'pasteElements') {
+        handlePasteElements(doc, createdPanel, msg);
       } else if (msg?.command === 'undo' || msg?.command === 'redo') {
-        runDocumentHistory(doc, createdPanel, msg.command);
+        queueEdit(doc, () => runDocumentHistory(doc, createdPanel, msg.command));
       } else if (msg?.command === 'showInSource') {
         handleShowInSource(doc, createdPanel, msg);
       } else if (msg?.command === 'addTrigger') {
@@ -518,364 +527,174 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
   }
 }
 
-function handlePositionUpdate(doc: vscode.TextDocument, msg: PositionMessage) {
-  try {
-    const key = doc.uri.toString();
-    const text = doc.getText();
-    const model = parseFrm(text);
-    
-    // Update the model based on the message
-    let updated = false;
-    if (msg.type === 'text' && typeof msg.index === 'number') {
-      const textItem = model.texts.find(t => t.index === msg.index);
-      if (textItem) {
-        textItem.row = msg.newRow;
-        textItem.col = msg.newCol;
-        updated = true;
-      }
-    } else if (msg.type === 'field' && typeof msg.index === 'number') {
-      const fieldItem = model.fields.find(f => f.index === msg.index);
-      if (fieldItem) {
-        fieldItem.row = msg.newRow;
-        fieldItem.col = msg.newCol;
-        updated = true;
-      }
-    } else if (msg.type === 'pushbutton' && typeof msg.index === 'number') {
-      const pushItem = model.pushbuttons.find(p => p.index === msg.index);
-      if (pushItem) {
-        pushItem.row = msg.newRow;
-        pushItem.col = msg.newCol;
-        updated = true;
-      }
-    } else if (msg.type === 'image' && typeof msg.index === 'number') {
-      const imageItem = model.images.find(i => i.index === msg.index);
-      if (imageItem) {
-        imageItem.row = msg.newRow;
-        imageItem.col = msg.newCol;
-        updated = true;
-      }
-    } else if (msg.type === 'preview' && typeof msg.index === 'number') {
-      const previewItem = model.previews.find(p => p.index === msg.index);
-      if (previewItem) {
-        previewItem.row = msg.newRow;
-        previewItem.col = msg.newCol;
-        updated = true;
-      }
-    }
-    
-    if (updated) {
-      // Regenerate FRM text and apply edit - only update the specific element that was moved
-      const newFrmText = serializeFrmModel(model, text, msg);
-      const edit = new vscode.WorkspaceEdit();
-      const full = new vscode.Range(0, 0, doc.lineCount, 0);
-      edit.replace(doc.uri, full, newFrmText);
+// Edits from the preview that are still running, per document
+const editQueueByDoc = new Map<string, Promise<void>>();
+
+/** Run an edit once the previous ones are done, so quick key presses each start from the latest text. */
+function queueEdit(doc: vscode.TextDocument, run: () => void | Thenable<unknown>): void {
+  const key = doc.uri.toString();
+  const queued: Promise<void> = (editQueueByDoc.get(key) ?? Promise.resolve())
+    .then(async () => { await run(); })
+    .catch(error => { vscode.window.showErrorMessage(`FRM preview: the edit failed: ${error}`); })
+    .then(() => { if (editQueueByDoc.get(key) === queued) editQueueByDoc.delete(key); });
+  editQueueByDoc.set(key, queued);
+}
+
+/** Replace the whole text in one undo step. */
+function replaceLines(doc: vscode.TextDocument, lines: string[]): Thenable<boolean> {
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), lines.join('\n'));
+  return vscode.workspace.applyEdit(edit);
+}
+
+const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+const refNames = (refs: ElementRef[]) => refs.map(r => `${r.type}(${r.index})`).join(', ');
+
+function handleMoveElements(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: MoveElementsMessage) {
+  const moves = validRefs(msg.moves, isMove);
+  if (!moves.length) return;
+  const key = doc.uri.toString();
+  // Refreshes wait until the file has caught up with what the preview shows
+  pendingPreviewEdits.set(key, (pendingPreviewEdits.get(key) ?? 0) + 1);
+  queueEdit(doc, async () => {
+    let moved = false;
+    try {
+      const text = doc.getText();
+      const { lines, failed } = moveElements(text.split(/\r?\n/), moves);
+      if (failed.length) vscode.window.showErrorMessage(`Could not move ${refNames(failed)}`);
       // The preview already drew the move itself (unless it came from the hidden-field list),
       // so mark the resulting text as shown and let the debounced refresh skip it.
-      const alreadyDrawn = msg.alreadyDrawn !== false;
-      const shownBefore = shownTextByDoc.get(key) === text;
-      pendingPreviewEdits.set(key, (pendingPreviewEdits.get(key) ?? 0) + 1);
-      const done = () => pendingPreviewEdits.set(key, Math.max(0, (pendingPreviewEdits.get(key) ?? 1) - 1));
-      vscode.workspace.applyEdit(edit).then(success => {
-        if (success && alreadyDrawn && shownBefore) {
-          shownTextByDoc.set(key, doc.getText());
-        }
-        done();
-      }, done);
+      const shown = msg.alreadyDrawn !== false && !failed.length && shownTextByDoc.get(key) === text;
+      moved = await replaceLines(doc, lines) && !failed.length;
+      if (moved && shown) shownTextByDoc.set(key, doc.getText());
+    } finally {
+      const left = (pendingPreviewEdits.get(key) ?? 1) - 1;
+      if (panelByDoc.get(key) === panel) {
+        pendingPreviewEdits.set(key, Math.max(0, left));
+        // The preview shows a move that isn't in the file
+        if (!moved) updateWebview(panel, doc);
+      }
     }
-  } catch (error) {
-    console.error('Error handling position update:', error);
-  }
+  });
 }
 
-function handleAddElement(doc: vscode.TextDocument, msg: AddElementMessage) {
-  try {
-    const text = doc.getText();
-    const lines = text.split(/\r?\n/);
-    
-    // Parse the model to find the next available index for this element type
-    const model = parseFrm(text);
-    const elementType = msg.elementType;
-    
-    let nextIndex = 1;
-    if (elementType === 'text') {
-      // Find the highest existing text index
-      const maxIndex = model.texts.reduce((max, t) => {
-        return t.index !== undefined && t.index > max ? t.index : max;
-      }, 0);
-      nextIndex = maxIndex + 1;
-    } else if (elementType === 'field') {
-      // Find the highest existing field index
-      const maxIndex = model.fields.reduce((max, f) => {
-        return f.index !== undefined && f.index > max ? f.index : max;
-      }, 0);
-      nextIndex = maxIndex + 1;
-    } else if (elementType === 'pushbutton') {
-      // Find the highest existing pushbutton index
-      const maxIndex = model.pushbuttons.reduce((max, p) => {
-        return p.index !== undefined && p.index > max ? p.index : max;
-      }, 0);
-      nextIndex = maxIndex + 1;
-    } else if (elementType === 'preview') {
-      // Find the highest existing preview index
-      const maxIndex = model.previews.reduce((max, p) => {
-        return p.index !== undefined && p.index > max ? p.index : max;
-      }, 0);
-      nextIndex = maxIndex + 1;
-    }
-    
-    let newLine = '';
-    
-    if (elementType === 'text') {
-      // Format: text(n)= row col "content" or text(n)= row col {content}
-      // Use quotes for simple text, braces for box text or VXID references
-      const content = msg.content || '';
-      // Add box directive if box dimensions are provided
-      const boxDirective = (msg.boxRows && msg.boxCols) ? `+" #[${msg.boxRows},${msg.boxCols}]*"` : '';
-      // Use curly braces when there's a box directive, quotes otherwise
-      if (boxDirective) {
-        newLine = `text(${nextIndex})= ${msg.row} ${msg.col} {"${content}"${boxDirective}}`;
-      } else {
-        newLine = `text(${nextIndex})= ${msg.row} ${msg.col} "${content}"`;
-      }
-    } else if (elementType === 'field') {
-      // Format: field(n)= NAME type row col len ignore ["value1" "value2" ...]
-      const name = msg.name || 'FIELD';
-      const type = msg.type || '1';
-      const len = msg.len || 10;
-      // Default ignore value: 7 for VXUI, 4 for only
-      const defaultIgnore = model.winstyle?.toLowerCase() === 'only' ? 4 : 7;
-      const ignore = msg.ignore !== undefined && msg.ignore !== null && msg.ignore !== '' ? msg.ignore : defaultIgnore;
-      const values = msg.values || [];
-      
-      let valuesStr = '';
-      if (values.length > 0) {
-        valuesStr = ' ' + values.map((v: string) => `"${v}"`).join(' ');
-      }
-      
-      // Format field name according to nameFormat (default to plain if not specified)
-      const nameFormat = msg.nameFormat || {};
-      let formattedName = name;
-      if (nameFormat.angle && nameFormat.quoted) {
-        formattedName = `"<${name}>"`;
-      } else if (nameFormat.angle) {
-        formattedName = `<${name}>`;
-      } else if (nameFormat.quoted) {
-        formattedName = `"${name}"`;
-      }
-      newLine = `field(${nextIndex})= ${formattedName} ${type} ${msg.row} ${msg.col} ${len} ${ignore}${valuesStr}`;
-    } else if (elementType === 'pushbutton') {
-      // Format depends on button kind:
-      // General: pushbutton(n)= row col "label" @program.prg(args) P
-      // Checkbox: pushbutton(n)= row col "label" CHECKBOX name=value
-      // Radio: pushbutton(n)= row col "label" RADIO name=value
-      const label = msg.label || '';
-      const kind = msg.kind || 'select';
-      
-      if (kind === 'checkbox') {
-        const name = msg.name || 'VAR';
-        const value = msg.value || '1;0';
-        newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" CHECKBOX ${name}=${value}`;
-      } else if (kind === 'radio') {
-        const name = msg.name || 'VAR';
-        const value = msg.value || '1;0';
-        newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" RADIO ${name}=${value}`;
-      } else {
-        // General button
-        if (msg.program) {
-          // Program call
-          let program = msg.program;
-          if (!program.startsWith('@')) {
-            program = '@' + program;
-          }
-          newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" ${program} P`;
-        } else if (msg.name) {
-          // Variable assignment (less common for general buttons, but supported)
-          const value = msg.value || '1';
-          newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}" ${msg.name}=${value}`;
-        } else {
-          // Basic button with no action
-          newLine = `${newButtonKeyword(lines)}(${nextIndex})= ${msg.row} ${msg.col} "${label}"`;
-        }
-      }
-    } else if (elementType === 'preview') {
-      // Format: preview(n)= row col rows cols mode "path" "field" port_type port_style
-      const rows = msg.rows || 10;
-      const cols = msg.cols || 30;
-      const mode = msg.mode || '0';
-      const path = msg.path || '$DIR_PICTS/file.vxp';
-      const field = msg.field || '';
-      const portType = msg.portType || 'PORT_2D';
-      const portStyleRaw = msg.portStyle ?? 'SIMPLE';
-      const portStyle = portStyleRaw === '' ? '""' : portStyleRaw;
-      newLine = `preview(${nextIndex})= ${msg.row} ${msg.col} ${rows} ${cols} ${mode} "${path}" "${field}" ${portType} ${portStyle}`;
-    }
-    
-    if (!newLine) {
+function handleDeleteElements(doc: vscode.TextDocument, msg: ElementsMessage) {
+  const refs = validRefs<ElementRef>(msg.elements);
+  const triggers = validTriggerRefs(msg.triggers);
+  if (!refs.length && !triggers.length) return;
+  queueEdit(doc, async () => {
+    const { lines, deleted, deletedTriggers } = deleteStatements(doc.getText().split(/\r?\n/), refs, triggers);
+    if (!deleted.length && !deletedTriggers) {
+      vscode.window.showErrorMessage(`Could not find ${[refNames(refs), triggers.length ? count(triggers.length, 'trigger') : ''].filter(Boolean).join(', ')}`);
       return;
     }
-    
-    // Insert the new line into its section (after the last element of the same type,
-    // or between the neighbouring sections if it is the first of its type)
-    const sectionByType: Record<string, Section> = {
-      text: Section.Text,
-      field: Section.Field,
-      pushbutton: Section.Button,
-      preview: Section.Preview,
-    };
-    insertIntoSection(lines, sectionByType[elementType], [newLine]);
-    
-    // Apply the edit
-    const newText = lines.join('\n');
-    
-    // Now update group and tab opt_* lists
-    const updatedLines = newText.split(/\r?\n/);
-    
-    // Add to group(1) if it exists (only for fields, handle multi-line groups ending with \)
-    if (elementType === 'field') {
-      addFieldToGroup1(updatedLines, nextIndex, model.revision);
-    }
-    
-    // If tabs exist and we have an active tab, add to appropriate opt_* list
-    if (msg.activeTabId !== undefined && msg.activeTabId !== null) {
-      const tabId = msg.activeTabId;
-      let optKey = '';
-      
-      if (elementType === 'text') {
-        optKey = 'opt_text';
-      } else if (elementType === 'field') {
-        optKey = 'opt_field';
-      } else if (elementType === 'pushbutton') {
-        optKey = `opt_${newButtonKeyword(lines)}`;
-      }
-      
-      if (optKey) {
-        // An existing list is used whichever way it spells opt_button
-        const optName = elementType === 'pushbutton' ? 'opt_(?:push)?button' : optKey;
-        const optRegex = new RegExp(`^\\s*${optName}\\s*\\(\\s*${tabId}\\s*\\)\\s*=`, 'i');
-        let foundOpt = false;
-        
-        for (let i = 0; i < updatedLines.length; i++) {
-          if (optRegex.test(updatedLines[i])) {
-            const collected = collectContinuedStatement(updatedLines, i);
-            const items = parseIndexList(statementValue(collected.text)).map(String);
-            items.push(String(nextIndex));
-            const sortedItems = items.sort((a, b) => {
-              const numA = parseInt(a) || 0;
-              const numB = parseInt(b) || 0;
-              return numA - numB;
-            });
-            const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(updatedLines[i]) : undefined;
-            replaceContinuedStatement(updatedLines, i, formatIndexStatement(statementKeyword(updatedLines[i]), sortedItems, wrapAt));
-            foundOpt = true;
-            break;
-          }
-        }
-        
-        // If opt_* line doesn't exist for this tab, create it
-        if (!foundOpt) {
-          insertIntoSection(updatedLines, Section.Opt, [`${optKey}(${tabId})= ${nextIndex}`]);
-        }
-      }
-    }
-    
-    const finalText = updatedLines.join('\n');
-    const edit = new vscode.WorkspaceEdit();
-    const full = new vscode.Range(0, 0, doc.lineCount, 0);
-    edit.replace(doc.uri, full, finalText);
-    vscode.workspace.applyEdit(edit);
-    
-    // Show info message
-    vscode.window.showInformationMessage(`Added ${elementType}(${nextIndex}) at (${msg.row}, ${msg.col})`);
-  } catch (error) {
-    console.error('Error adding element:', error);
-    vscode.window.showErrorMessage(`Failed to add element: ${error}`);
-  }
+    const names = [
+      deleted.length === 1 ? refNames(deleted) : deleted.length ? `${deleted.length} elements` : '',
+      deletedTriggers ? count(deletedTriggers, 'trigger') : ''
+    ].filter(Boolean).join(' and ');
+    if (await replaceLines(doc, lines)) vscode.window.showInformationMessage(`Deleted ${names}`);
+    else vscode.window.showErrorMessage(`Failed to delete ${names}`);
+  });
 }
 
-function handleDeleteElement(doc: vscode.TextDocument, msg: ElementRefMessage) {
-  try {
-    const elementType = msg.elementType; // 'text', 'field', 'pushbutton'
-    const elementIndex = msg.elementIndex;
+// What was last copied or cut in a preview, to recognise it when it is pasted
+let lastCopy: { uri: string; text: string; cut: boolean } | undefined;
 
-    const text = doc.getText();
-    const lines = text.split(/\r?\n/);
+const showNotice = (panel: vscode.WebviewPanel, text: string) => panel.webview.postMessage({ command: 'frmNotice', text });
 
-    // Find the element's statement
-    const statement = findElement(lines, elementType, elementIndex);
-
-    if (!statement) {
-      vscode.window.showErrorMessage(`Could not find ${elementType}(${elementIndex})`);
+/** Put the lines of elements and triggers on the clipboard; cut also removes them. */
+function handleCopyElements(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: ElementsMessage, cut: boolean) {
+  const refs = validRefs<ElementRef>(msg.elements);
+  const triggers = validTriggerRefs(msg.triggers);
+  queueEdit(doc, async () => {
+    const source = doc.getText().split(/\r?\n/);
+    const copied = copyStatements(source, refs, triggers);
+    if (!copied.count) {
+      showNotice(panel, `Nothing found to ${cut ? 'cut' : 'copy'}`);
       return;
     }
-
-    // Remove the whole statement, including `\` continuation lines
-    lines.splice(statement.startLine, statement.endLine - statement.startLine + 1);
-
-    // Remove from group(1) if it's a field
-    if (elementType === 'field') {
-      const groupRegex = /^\s*group\s*\(\s*1\s*\)\s*=\s*/i;
-      let groupStartIndex = -1;
-      for (let i = 0; i < lines.length; i++) {
-        if (groupRegex.test(lines[i])) {
-          groupStartIndex = i;
-          break;
-        }
-      }
-
-      if (groupStartIndex !== -1) {
-        const collected = collectContinuedStatement(lines, groupStartIndex);
-        // Format: group(1)= <type_expr> [<val1> <val2>] <field_indexes...>
-        // revision=2: first 3 values are preserved (type_expr, val1, val2)
-        // no revision or revision=1: first 2 values are preserved (type_expr, val1)
-        const allItems = statementValue(collected.text).replace(/\\/g, ' ').split(/[,;\s]+/).filter(Boolean);
-        const model = parseFrm(doc.getText());
-        const preserveCount = model.revision === 2 ? 3 : 2;
-        const preserved = allItems.slice(0, preserveCount);
-        const members = allItems.slice(preserveCount).map(Number).filter(n => !isNaN(n));
-        const newMembers = members.filter(m => m !== elementIndex);
-        const allValues = newMembers.length === 0 ? [...preserved] : [...preserved, ...newMembers.map(String)];
-        const wrapAt = collected.endIndex > groupStartIndex ? wrapWidthFromFirstLine(lines[groupStartIndex]) : undefined;
-        replaceContinuedStatement(lines, groupStartIndex, formatIndexStatement('group(1)', allValues, wrapAt));
-      }
+    await vscode.env.clipboard.writeText(copied.text);
+    if (cut && !await replaceLines(doc, deleteStatements(source, refs, triggers).lines)) {
+      vscode.window.showErrorMessage('Failed to cut');
+      cut = false;
     }
+    lastCopy = { uri: doc.uri.toString(), text: copied.text, cut };
+  });
+}
 
-    // Remove from tab opt_* lists
-    // Handle opt_button as synonym for opt_pushbutton
-    const optTypeName = elementType === 'pushbutton' ? '(?:pushbutton|button)' : elementType;
-    const optPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*(\\d+)\\s*\\)\\s*=`, 'i');
-    for (let i = 0; i < lines.length; i++) {
-      if (!optPattern.test(lines[i])) continue;
-      const collected = collectContinuedStatement(lines, i);
-      const list = parseIndexList(statementValue(collected.text));
-      const newList = list.filter(idx => idx !== elementIndex);
-      if (newList.length === list.length) continue;
-      if (newList.length === 0) {
-        lines.splice(i, collected.endIndex - i + 1);
-        i--;
-      } else {
-        const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
-        const newLines = formatIndexStatement(statementKeyword(lines[i]), newList.map(String), wrapAt);
-        lines.splice(i, collected.endIndex - i + 1, ...newLines);
-        i += newLines.length - 1;
-      }
-    }
+/** Cells an element covers, as if it were alone on a form of automatic size. */
+function statementSize(statement: string[]): { rows: number; cols: number } {
+  const text = statement.join('\n');
+  const model = parseFrm(text);
+  const at = [...model.texts, ...model.fields, ...model.pushbuttons, ...model.images, ...model.previews][0];
+  return at ? { rows: Math.max(1, model.rows - at.row + 1), cols: Math.max(1, model.cols - at.col + 1) } : { rows: 1, cols: 1 };
+}
 
-    const newText = lines.join('\n');
-
-    // Apply the edit
-    const edit = new vscode.WorkspaceEdit();
-    edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), newText);
-
-    vscode.workspace.applyEdit(edit).then(success => {
-      if (success) {
-        vscode.window.showInformationMessage(`Deleted ${elementType}(${elementIndex})`);
-      } else {
-        vscode.window.showErrorMessage(`Failed to delete ${elementType}(${elementIndex})`);
-      }
+/** Add the elements and triggers on the clipboard. The preview is told up front to select them once it re-renders. */
+function handlePasteElements(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: PasteElementsMessage) {
+  const int = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 1;
+  if (!int(msg.rows) || !int(msg.cols)) return;
+  queueEdit(doc, async () => {
+    const text = await vscode.env.clipboard.readText();
+    const own = lastCopy && lastCopy.uri === doc.uri.toString() && lastCopy.text === text.replace(/\r\n/g, '\n') ? lastCopy : undefined;
+    const pasted = pasteStatements(doc.getText().split(/\r?\n/), text, {
+      cell: msg.cell && int(msg.cell.row) && int(msg.cell.col) ? msg.cell : null,
+      rows: msg.rows, cols: msg.cols,
+      tabId: typeof msg.tabId === 'number' && Number.isInteger(msg.tabId) ? msg.tabId : null,
+      sameForm: !!own, restoreIndexes: !!own?.cut, sizeOf: statementSize
     });
-  } catch (error) {
-    vscode.window.showErrorMessage(`Error deleting element: ${error}`);
-  }
+    if (!pasted) {
+      showNotice(panel, 'No form elements on the clipboard');
+      return;
+    }
+    const { keys, hiddenFields, triggerLines } = pasted;
+    const done = keys.length + hiddenFields.length + triggerLines.length;
+    const targets = (list: string[]) => [...new Set(list)].join(', ');
+    const notes = [
+      pasted.skipped ? `${count(pasted.skipped, 'other line')} skipped` : '',
+      pasted.tooBig ? 'too big for the form' : '',
+      pasted.duplicateTriggers ? `${count(pasted.duplicateTriggers, 'trigger')} already there` : '',
+      pasted.missingTargets.length ? `${count(pasted.missingTargets.length, 'trigger')} skipped: no field ${targets(pasted.missingTargets)}` : '',
+      pasted.keptTargets.length ? `check trigger for field ${targets(pasted.keptTargets)}: it was copied from another form` : ''
+    ].filter(Boolean);
+    if (notes.length) showNotice(panel, [`${done} pasted`, ...notes].join(', '));
+    if (!done) return;
+    // Sent before the edit so it arrives ahead of the refresh the edit triggers
+    panel.webview.postMessage({
+      command: 'frmSelectAfterRefresh', keys, primary: keys[keys.length - 1] ?? null, hiddenFields, triggerLines
+    });
+    if (!await replaceLines(doc, pasted.lines)) vscode.window.showErrorMessage('Failed to paste');
+  });
+}
+
+/** Copy elements to the given rows. The preview is told up front to select the copies once it re-renders. */
+function handleDuplicateElements(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: DuplicateElementsMessage) {
+  const items = validRefs(msg.elements, isCopy);
+  if (!items.length) return;
+  queueEdit(doc, async () => {
+    const { lines, copies, failed } = duplicateElements(doc.getText().split(/\r?\n/), items);
+    if (failed.length) vscode.window.showWarningMessage(`Could not duplicate ${refNames(failed)}`);
+    if (!copies.size) return;
+    const keys = [...copies.values()];
+    const primary = (msg.primary && validRefs([msg.primary]).length ? copies.get(keyOf(msg.primary)) : undefined) ?? keys[keys.length - 1];
+    // Sent before the edit so it arrives ahead of the refresh the edit triggers
+    panel.webview.postMessage({ command: 'frmSelectAfterRefresh', keys, primary });
+    if (!await replaceLines(doc, lines)) vscode.window.showErrorMessage('Failed to duplicate');
+  });
+}
+
+/** Add an element. The preview is told up front to select it once it re-renders. */
+function handleAddElement(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: NewElement) {
+  queueEdit(doc, async () => {
+    const text = doc.getText();
+    const added = addElement(text.split(/\r?\n/), msg, parseFrm(text).winstyle);
+    if (!added) {
+      vscode.window.showErrorMessage(`Failed to add ${msg.elementType}`);
+      return;
+    }
+    panel.webview.postMessage({ command: 'frmSelectAfterRefresh', keys: [added.key], primary: added.key });
+    if (!await replaceLines(doc, added.lines)) vscode.window.showErrorMessage(`Failed to add ${msg.elementType}`);
+  });
 }
 
 function handleUpdateHeader(doc: vscode.TextDocument, msg: HeaderMessage) {
@@ -1003,7 +822,7 @@ function handleSetPortSize(doc: vscode.TextDocument, msg: PortSizeMessage) {
 
 // Stretching from the preview. Fields: msg.col + msg.len. Images/previews: msg.row, msg.col, msg.rows, msg.cols.
 // Only those numbers are rewritten; the rest of the line keeps its formatting.
-function handleResizeElement(doc: vscode.TextDocument, msg: ResizeElementMessage) {
+function handleResizeElement(doc: vscode.TextDocument, msg: ResizeElementMessage): Thenable<void> | undefined {
   try {
     const int = (v: unknown, min: number) => typeof v === 'number' && Number.isInteger(v) && v >= min;
     const type = msg?.type;
@@ -1042,10 +861,9 @@ function handleResizeElement(doc: vscode.TextDocument, msg: ResizeElementMessage
       if (newLine === line) return;
       const edit = new vscode.WorkspaceEdit();
       edit.replace(doc.uri, new vscode.Range(i, 0, i, line.length), newLine);
-      vscode.workspace.applyEdit(edit).then(success => {
+      return vscode.workspace.applyEdit(edit).then(success => {
         if (!success) vscode.window.showErrorMessage(`Failed to resize ${type}(${msg.index})`);
       });
-      return;
     }
   } catch (error) {
     vscode.window.showErrorMessage(`Error resizing element: ${error}`);
@@ -1109,7 +927,27 @@ function handleSetTextBox(doc: vscode.TextDocument, msg: TextBoxMessage) {
   }
 }
 
+function handleEditImage(doc: vscode.TextDocument, msg: EditElementMessage) {
+  const index = msg.elementIndex;
+  const edit: ImageEdit = { index, rows: msg.rows, cols: msg.cols, mode: msg.mode, file: msg.file };
+  queueEdit(doc, async () => {
+    const lines = doc.getText().split(/\r?\n/);
+    const edited = editImage(lines, edit);
+    if (!edited) {
+      vscode.window.showErrorMessage(`Could not edit image(${index})`);
+      return;
+    }
+    if (edited.join('\n') === lines.join('\n')) return;
+    if (await replaceLines(doc, edited)) vscode.window.showInformationMessage(`Updated image(${index})`);
+    else vscode.window.showErrorMessage(`Failed to update image(${index})`);
+  });
+}
+
 function handleEditElement(doc: vscode.TextDocument, msg: EditElementMessage) {
+  if (msg.elementType === 'image') {
+    handleEditImage(doc, msg);
+    return;
+  }
   try {
     const text = doc.getText();
     const lines = text.split(/\r?\n/);
@@ -1168,7 +1006,7 @@ function handleEditElement(doc: vscode.TextDocument, msg: EditElementMessage) {
         newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" CHECKBOX ${name}=${value}`;
       } else if (kind === 'radio') {
         const name = msg.name || 'VAR';
-        const value = msg.value || '1';
+        const value = msg.value ?? '1';
         newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" RADIO ${name}=${value}`;
       } else {
         // General button
@@ -1181,7 +1019,7 @@ function handleEditElement(doc: vscode.TextDocument, msg: EditElementMessage) {
           newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${program} P`;
         } else if (msg.name) {
           // Variable assignment (less common for general buttons, but supported)
-          const value = msg.value || '1';
+          const value = msg.value ?? '1';
           newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${msg.name}=${value}`;
         } else {
           // Basic button with no action
@@ -1308,114 +1146,6 @@ function handleMoveElement(doc: vscode.TextDocument, msg: MoveElementMessage) {
   }
 }
 
-/** Add a field index to group(1), keeping the leading non-index values (type_expr, and val1 val2 for revision 2). */
-function addFieldToGroup1(lines: string[], fieldIndex: number, revision: number | undefined): void {
-  const groupRegex = /^\s*group\s*\(\s*1\s*\)\s*=\s*/i;
-  const i = lines.findIndex(l => groupRegex.test(l));
-  if (i < 0) return;
-  const collected = collectContinuedStatement(lines, i);
-  const items = statementValue(collected.text).replace(/\\/g, ' ').trim().split(/\s+/).filter(Boolean);
-  const preserveCount = revision === 2 ? 3 : 1;
-  const preserved = items.slice(0, preserveCount);
-  const fieldIndexes = items.slice(preserveCount).map(s => parseInt(s)).filter(n => !isNaN(n));
-  if (fieldIndexes.includes(fieldIndex)) return;
-  fieldIndexes.push(fieldIndex);
-  fieldIndexes.sort((a, b) => a - b);
-  const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
-  replaceContinuedStatement(lines, i, formatIndexStatement('group(1)', [...preserved, ...fieldIndexes.map(String)], wrapAt));
-}
-
-const DUPLICATE_KEYWORD: Record<string, string> = {
-  text: 'text',
-  field: 'field',
-  pushbutton: '(?:push)?button',
-  image: 'image',
-  preview: 'preview',
-};
-
-const DUPLICATE_SECTION: Record<string, Section> = {
-  text: Section.Text,
-  field: Section.Field,
-  pushbutton: Section.Button,
-  image: Section.Image,
-  preview: Section.Preview,
-};
-
-/**
- * Copy an element's statement verbatim under the next free index, placed at `msg.row`
- * (same column), and make it visible on the same tabs. The preview is told up front to
- * select the copy once it re-renders.
- */
-function handleDuplicateElement(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: DuplicateElementMessage): void {
-  const elementType = String(msg?.elementType ?? '');
-  const sourceIndex = Number(msg?.elementIndex);
-  const row = Number(msg?.row);
-  const keyword = DUPLICATE_KEYWORD[elementType];
-  if (!keyword || !Number.isInteger(sourceIndex) || !Number.isInteger(row) || row < 1) {
-    return;
-  }
-  try {
-    const text = doc.getText();
-    const lines = text.split(/\r?\n/);
-    const model = parseFrm(text);
-
-    const head = `^(\\s*${keyword}\\s*\\(\\s*)${sourceIndex}(\\s*\\)\\s*=\\s*)`;
-    const start = lines.findIndex(l => new RegExp(head, 'i').test(l));
-    if (start < 0) {
-      vscode.window.showWarningMessage(`Could not find ${elementType}(${sourceIndex}) in source`);
-      return;
-    }
-    const statement = lines.slice(start, collectContinuedStatement(lines, start).endIndex + 1);
-
-    const existing: Array<{ index?: number }> = ({
-      text: model.texts,
-      field: model.fields,
-      pushbutton: model.pushbuttons,
-      image: model.images,
-      preview: model.previews,
-    } as Record<string, Array<{ index?: number }>>)[elementType] ?? [];
-    const newIndex = existing.reduce((max, e) => (e.index ?? 0) > max ? (e.index ?? 0) : max, 0) + 1;
-
-    // The row is the first number after '=', except for fields: field(n)= NAME type row col ...
-    const rowPattern = new RegExp(head + (elementType === 'field' ? '(\\S+\\s+\\S+\\s+)' : '()') + '\\d+', 'i');
-    if (!rowPattern.test(statement[0])) {
-      vscode.window.showWarningMessage(`Could not read the position of ${elementType}(${sourceIndex})`);
-      return;
-    }
-    statement[0] = statement[0].replace(rowPattern, (_m, pre, eq, between) => `${pre}${newIndex}${eq}${between}${row}`);
-    insertIntoSection(lines, DUPLICATE_SECTION[elementType], statement);
-
-    if (elementType === 'field') {
-      addFieldToGroup1(lines, newIndex, model.revision);
-    }
-
-    // Visible on the same tabs as the original
-    const optTypeName = elementType === 'pushbutton' ? '(?:pushbutton|button)' : elementType;
-    const optPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*\\d+\\s*\\)\\s*=`, 'i');
-    for (let i = 0; i < lines.length; i++) {
-      if (!optPattern.test(lines[i])) continue;
-      const collected = collectContinuedStatement(lines, i);
-      const list = parseIndexList(statementValue(collected.text));
-      if (!list.includes(sourceIndex) || list.includes(newIndex)) continue;
-      list.push(newIndex);
-      list.sort((a, b) => a - b);
-      const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
-      const newLines = formatIndexStatement(statementKeyword(lines[i]), list.map(String), wrapAt);
-      lines.splice(i, collected.endIndex - i + 1, ...newLines);
-      i += newLines.length - 1;
-    }
-
-    const edit = new vscode.WorkspaceEdit();
-    edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), lines.join('\n'));
-    // Sent before the edit so it arrives ahead of the refresh the edit triggers
-    panel.webview.postMessage({ command: 'frmSelectAfterRefresh', key: `${elementType}:${newIndex}` });
-    vscode.workspace.applyEdit(edit);
-  } catch (error) {
-    vscode.window.showErrorMessage(`Failed to duplicate element: ${error}`);
-    return;
-  }
-}
-
 /**
  * Undo/redo from the preview: run VS Code's own undo/redo on the .frm document, so the preview
  * and the text editor share one history, then hand focus back to the preview.
@@ -1445,10 +1175,12 @@ function handleShowInSource(doc: vscode.TextDocument, panel: vscode.WebviewPanel
     const elementIndex = msg.elementIndex;
 
     // Find the line that contains this element
-    const elementLineIndex = findElement(lines, elementType, elementIndex)?.startLine ?? -1;
+    const elementLineIndex = elementType === 'trigger'
+      ? findTriggerStatements(lines).find(t => t.line === msg.line)?.line ?? -1
+      : findElement(lines, elementType, elementIndex)?.startLine ?? -1;
 
     if (elementLineIndex === -1) {
-      vscode.window.showWarningMessage(`Could not find ${elementType}(${elementIndex}) in source`);
+      vscode.window.showWarningMessage(`Could not find ${elementType === 'trigger' ? 'the trigger' : `${elementType}(${elementIndex})`} in source`);
       return;
     }
 
@@ -1682,145 +1414,6 @@ function handleOpenTriggerProgram(msg: { program?: string }) {
   }
 }
 
-function serializeFrmModel(model: FrmModel, originalText: string, changedElement?: { type: string; index: number }): string {
-  // Split original text into lines for processing
-  const lines = originalText.split(/\r?\n/);
-  const newLines: string[] = [...lines]; // Copy original lines
-  
-  // Only update lines that contain elements that were moved
-  // Helper function to update just the position numbers in a line
-  const updatePositionInLine = (line: string, newRow: number, newCol: number): string => {
-    // Match the pattern: element_type(optional_index)= old_row old_col rest_of_line
-    // and replace just the row and col numbers
-    return line.replace(/^(\s*(?:text|field|pushbutton|button|image|preview)\s*(?:\(\s*\d+\s*\))?\s*=\s*)(\d+)\s+(\d+)(.*)$/i, 
-      (match, prefix, oldRow, oldCol, suffix) => {
-        return `${prefix}${newRow} ${newCol}${suffix}`;
-      });
-  };
-  
-  // Process each line to find and update only moved elements
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-    const line = lines[lineIndex];
-    
-    // Check if this line defines a text element
-    const textMatch = line.match(/^\s*(text\s*(?:\(\s*(\d+)\s*\))?)\s*=/i);
-    if (textMatch) {
-      const indexStr = textMatch[2];
-      const index = indexStr ? Number(indexStr) : undefined;
-      // Only update if this is the element that was changed (or if no changedElement specified, update all that differ)
-      if (!changedElement || (changedElement.type === 'text' && changedElement.index === index)) {
-        const textItem = model.texts.find(t => t.index === index);
-        if (textItem) {
-          // Extract current position from line to see if it changed
-          const posMatch = line.match(/^\s*text\s*(?:\(\s*\d+\s*\))?\s*=\s*(\d+)\s+(\d+)/i);
-          if (posMatch) {
-            const currentRow = Number(posMatch[1]);
-            const currentCol = Number(posMatch[2]);
-            if (textItem.row !== currentRow || textItem.col !== currentCol) {
-              newLines[lineIndex] = updatePositionInLine(line, textItem.row, textItem.col);
-            }
-          }
-        }
-      }
-    }
-    
-    // Check if this line defines a field element
-    const fieldMatch = line.match(/^\s*(field\s*(?:\(\s*(\d+)\s*\))?)\s*=/i);
-    if (fieldMatch) {
-      const indexStr = fieldMatch[2];
-      const index = indexStr ? Number(indexStr) : undefined;
-      // Only update if this is the element that was changed (or if no changedElement specified, update all that differ)
-      if (!changedElement || (changedElement.type === 'field' && changedElement.index === index)) {
-        const fieldItem = model.fields.find(f => f.index === index);
-        if (fieldItem) {
-          // Extract current position from line to see if it changed
-          // Match field name in any format: plain, quoted, or angle-bracketed
-          const posMatch = line.match(/^\s*field\s*(?:\(\s*\d+\s*\))?\s*=\s*(?:"[^"]+"|<[^>]+>|[\w$]+)\s+[\d+]+\s+(\d+)\s+(\d+)/i);
-          if (posMatch) {
-            const currentRow = Number(posMatch[1]);
-            const currentCol = Number(posMatch[2]);
-            if (fieldItem.row !== currentRow || fieldItem.col !== currentCol) {
-              // For fields, we need to update the 4th and 5th numbers (row and col)
-              newLines[lineIndex] = line.replace(/^(\s*field\s*(?:\(\s*\d+\s*\))?\s*=\s*(?:"[^"]+"|<[^>]+>|[\w$]+)\s+[\d+]+\s+)(\d+)\s+(\d+)(.*)$/i, 
-                (match, prefix, oldRow, oldCol, suffix) => {
-                  return `${prefix}${fieldItem.row} ${fieldItem.col}${suffix}`;
-                });
-            }
-          }
-        }
-      }
-    }
-    
-    // Check if this line defines a pushbutton element
-    const pushMatch = line.match(/^\s*((?:pushbutton|button)\s*(?:\(\s*(\d+)\s*\))?)\s*=/i);
-    if (pushMatch) {
-      const indexStr = pushMatch[2];
-      const index = indexStr ? Number(indexStr) : undefined;
-      // Only update if this is the element that was changed (or if no changedElement specified, update all that differ)
-      if (!changedElement || (changedElement.type === 'pushbutton' && changedElement.index === index)) {
-        const pushItem = model.pushbuttons.find(p => p.index === index);
-        if (pushItem) {
-          // Extract current position from line to see if it changed
-          const posMatch = line.match(/^\s*(?:pushbutton|button)\s*(?:\(\s*\d+\s*\))?\s*=\s*(\d+)\s+(\d+)/i);
-          if (posMatch) {
-            const currentRow = Number(posMatch[1]);
-            const currentCol = Number(posMatch[2]);
-            if (pushItem.row !== currentRow || pushItem.col !== currentCol) {
-              newLines[lineIndex] = updatePositionInLine(line, pushItem.row, pushItem.col);
-            }
-          }
-        }
-      }
-    }
-    
-    // Check if this line defines an image element
-    const imageMatch = line.match(/^\s*(image\s*(?:\(\s*(\d+)\s*\))?)\s*=/i);
-    if (imageMatch) {
-      const indexStr = imageMatch[2];
-      const index = indexStr ? Number(indexStr) : undefined;
-      // Only update if this is the element that was changed (or if no changedElement specified, update all that differ)
-      if (!changedElement || (changedElement.type === 'image' && changedElement.index === index)) {
-        const imageItem = model.images.find(i => i.index === index);
-        if (imageItem) {
-          // Extract current position from line to see if it changed
-          const posMatch = line.match(/^\s*image\s*(?:\(\s*\d+\s*\))?\s*=\s*(\d+)\s+(\d+)/i);
-          if (posMatch) {
-            const currentRow = Number(posMatch[1]);
-            const currentCol = Number(posMatch[2]);
-            if (imageItem.row !== currentRow || imageItem.col !== currentCol) {
-              newLines[lineIndex] = updatePositionInLine(line, imageItem.row, imageItem.col);
-            }
-          }
-        }
-      }
-    }
-    
-    // Check if this line defines a preview element
-    const previewMatch = line.match(/^\s*(preview\s*(?:\(\s*(\d+)\s*\))?)\s*=/i);
-    if (previewMatch) {
-      const indexStr = previewMatch[2];
-      const index = indexStr ? Number(indexStr) : undefined;
-      // Only update if this is the element that was changed (or if no changedElement specified, update all that differ)
-      if (!changedElement || (changedElement.type === 'preview' && changedElement.index === index)) {
-        const previewItem = model.previews.find(p => p.index === index);
-        if (previewItem) {
-          // Extract current position from line to see if it changed
-          const posMatch = line.match(/^\s*preview\s*(?:\(\s*\d+\s*\))?\s*=\s*(\d+)\s+(\d+)/i);
-          if (posMatch) {
-            const currentRow = Number(posMatch[1]);
-            const currentCol = Number(posMatch[2]);
-            if (previewItem.row !== currentRow || previewItem.col !== currentCol) {
-              newLines[lineIndex] = updatePositionInLine(line, previewItem.row, previewItem.col);
-            }
-          }
-        }
-      }
-    }
-  }
-  
-  return newLines.join('\n');
-}
-
 function updateWebview(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
   const renderStart = Date.now();
   const text = doc.getText();
@@ -2019,239 +1612,6 @@ function extractProgramFromTail(tail: string): string | undefined {
 /** Flatten `\`-continued lines in source for regex-based parsing. */
 function joinContinuedLines(src: string): string {
   return src.replace(/\\\s*\r?\n[ \t]*/g, ' ');
-}
-
-/** Join a statement starting at startIndex across `\` continuations. */
-function collectContinuedStatement(lines: string[], startIndex: number): { text: string; endIndex: number } {
-  let i = startIndex;
-  const parts: string[] = [];
-  while (i < lines.length) {
-    let content = lines[i];
-    const cont = lineContinues(content);
-    if (cont) {
-      content = content.trimEnd().slice(0, -1);
-    }
-    parts.push(i === startIndex ? content : content.trim());
-    if (!cont) break;
-    i++;
-  }
-  return { text: parts.join(' '), endIndex: i };
-}
-
-/** Text after the first `=` in a joined statement. */
-function statementValue(joinedText: string): string {
-  const eq = joinedText.indexOf('=');
-  return eq >= 0 ? joinedText.slice(eq + 1) : joinedText;
-}
-
-/** Keyword part of a statement line, e.g. `opt_text(1)` or `group(1)`. */
-function statementKeyword(line: string): string {
-  const m = line.match(/^\s*([^=]+?)\s*=/);
-  return m ? m[1].trim() : line.trim();
-}
-
-/** Parse a list of numeric indexes, ignoring leftover `\` tokens. */
-function parseIndexList(raw: string): number[] {
-  return raw
-    .replace(/\\/g, ' ')
-    .replace(/[,;]+/g, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map(Number)
-    .filter(n => Number.isFinite(n));
-}
-
-/** Items-per-line from the first line of a wrapped statement. */
-function wrapWidthFromFirstLine(firstLine: string): number {
-  const afterEq = firstLine.includes('=') ? firstLine.slice(firstLine.indexOf('=') + 1) : firstLine;
-  const content = afterEq.replace(/\\\s*$/, '').trim();
-  const count = content ? content.split(/\s+/).filter(Boolean).length : 0;
-  return count > 0 ? count : 10;
-}
-
-/**
- * Rebuild a `keyword= items` statement. If wrapAt is set, wrap with trailing `\`
- * and 16-space indent on continuation lines (same style as existing group rewriter).
- */
-function formatIndexStatement(keywordWithArgs: string, items: Array<string | number>, wrapAt?: number): string[] {
-  const toks = items.map(String);
-  if (toks.length === 0) {
-    return [`${keywordWithArgs}=`];
-  }
-  const shouldWrap = wrapAt != null && wrapAt > 0;
-  if (!shouldWrap) {
-    return [`${keywordWithArgs}= ${toks.join(' ')}`];
-  }
-  const out: string[] = [];
-  let current: string[] = [];
-  for (let idx = 0; idx < toks.length; idx++) {
-    current.push(toks[idx]);
-    if (current.length >= wrapAt && idx < toks.length - 1) {
-      const body = current.join(' ');
-      out.push(out.length === 0 ? `${keywordWithArgs}= ${body}\\` : `                ${body}\\`);
-      current = [];
-    }
-  }
-  if (current.length > 0) {
-    const body = current.join(' ');
-    out.push(out.length === 0 ? `${keywordWithArgs}= ${body}` : `                ${body}`);
-  }
-  return out;
-}
-
-function replaceContinuedStatement(lines: string[], startIndex: number, newLines: string[]): void {
-  const { endIndex } = collectContinuedStatement(lines, startIndex);
-  lines.splice(startIndex, endIndex - startIndex + 1, ...newLines);
-}
-
-// ---------------------------------------------------------------------------
-// File section order
-// ---------------------------------------------------------------------------
-
-/** Sections of an FRM file, in the order they should appear. */
-const enum Section {
-  Charset = 0,
-  Header = 1,
-  Text = 2,
-  Field = 3,
-  Group = 4,
-  Button = 5,
-  Image = 6,
-  Preview = 7,
-  Opt = 8,
-  TabOrder = 9,
-  Trigger = 10,
-}
-
-const HEADER_KEYWORDS = new Set(['vxdbase_winstyle', 'port_size', 'revision', 'status_bar', 'header', 'page_header']);
-const OPT_KIND_ORDER = ['text', 'field', 'pushbutton', 'image', 'preview'];
-
-interface StatementClass {
-  section: Section;
-  /** `(n)` index of the statement, if any. */
-  index?: number;
-  /** Secondary sort key inside the section (used for opt_* kinds). */
-  kind?: number;
-}
-
-function isBlankLine(line: string): boolean {
-  return /^\s*$/.test(line);
-}
-
-function isCommentLine(line: string): boolean {
-  return /^\s*!/.test(line);
-}
-
-/** A lone `!` used to separate sections. */
-function isSeparatorLine(line: string): boolean {
-  return isBlankLine(line) || /^\s*!\s*$/.test(line);
-}
-
-/** Which section a statement line belongs to, or undefined for unrecognised statements. */
-function classifyStatement(line: string): StatementClass | undefined {
-  const m = line.match(/^\s*([A-Za-z_$][\w$]*)\s*(?:\(\s*(\d+)\s*\))?\s*=/);
-  if (!m) {
-    return undefined;
-  }
-  const keyword = m[1].toLowerCase();
-  const index = m[2] !== undefined ? parseInt(m[2], 10) : undefined;
-  if (keyword === 'charset') return { section: Section.Charset };
-  if (HEADER_KEYWORDS.has(keyword)) return { section: Section.Header };
-  switch (keyword) {
-    case 'text': return { section: Section.Text, index };
-    case 'field': return { section: Section.Field, index };
-    case 'group': return { section: Section.Group, index };
-    case 'button':
-    case 'pushbutton': return { section: Section.Button, index };
-    case 'image': return { section: Section.Image, index };
-    case 'preview': return { section: Section.Preview, index };
-    case 'tab_order': return { section: Section.TabOrder };
-    case 'trigger': return { section: Section.Trigger };
-  }
-  if (keyword.startsWith('opt_')) {
-    const kindName = keyword.slice(4) === 'button' ? 'pushbutton' : keyword.slice(4);
-    const kind = OPT_KIND_ORDER.indexOf(kindName);
-    return { section: Section.Opt, index, kind: kind >= 0 ? kind : OPT_KIND_ORDER.length };
-  }
-  return undefined;
-}
-
-/** Number of leading lines forming the top-of-file comment banner (comments and blanks before the first statement). */
-function bannerLength(lines: string[]): number {
-  let i = 0;
-  while (i < lines.length && (isBlankLine(lines[i]) || isCommentLine(lines[i]))) {
-    i++;
-  }
-  return i;
-}
-
-/**
- * Insert new statement lines where their section belongs:
- * after the last statement of the same section, otherwise between the
- * neighbouring sections, separated from them by an empty line.
- * Unrecognised statements count as part of the section of the statement above them.
- */
-function insertIntoSection(lines: string[], section: Section, newLines: string[]): void {
-  let lastSameEnd = -1;
-  let lastLowerEnd = -1;
-  let firstHigherStart = -1;
-  let current: Section = Section.Header;
-
-  for (let i = bannerLength(lines); i < lines.length; i++) {
-    if (isBlankLine(lines[i]) || isCommentLine(lines[i])) {
-      continue;
-    }
-    const end = collectContinuedStatement(lines, i).endIndex;
-    const cls = classifyStatement(lines[i]);
-    if (cls) {
-      current = cls.section;
-    }
-    if (current === section) {
-      lastSameEnd = end;
-    } else if (current < section) {
-      lastLowerEnd = end;
-    } else if (firstHigherStart < 0) {
-      firstHigherStart = i;
-    }
-    i = end;
-  }
-
-  if (lastSameEnd >= 0) {
-    lines.splice(lastSameEnd + 1, 0, ...newLines);
-    return;
-  }
-
-  if (lastLowerEnd >= 0) {
-    const at = lastLowerEnd + 1;
-    const block = ['', ...newLines];
-    if (at < lines.length && !isSeparatorLine(lines[at])) {
-      block.push('');
-    }
-    lines.splice(at, 0, ...block);
-    return;
-  }
-
-  if (firstHigherStart >= 0) {
-    // Go above comments attached to the next statement, unless they are the top banner.
-    let at = firstHigherStart;
-    while (at > 0 && isCommentLine(lines[at - 1]) && !isSeparatorLine(lines[at - 1])) {
-      at--;
-    }
-    if (at <= bannerLength(lines) && lines.slice(0, at).every(l => isBlankLine(l) || isCommentLine(l))) {
-      at = firstHigherStart;
-    }
-    lines.splice(at, 0, ...newLines, '');
-    return;
-  }
-
-  // No statements at all: append at the end of the file (before a final newline).
-  let at = lines.length;
-  if (at > 0 && lines[at - 1] === '') {
-    at--;
-  }
-  const block = at > 0 && !isBlankLine(lines[at - 1]) ? ['', ...newLines] : [...newLines];
-  lines.splice(at, 0, ...block);
 }
 
 interface SectionUnit {
@@ -2454,7 +1814,7 @@ function parseFrm(src: string): FrmModel {
 
   // pushbutton(n)= ... OR button(n)= ... (treat 'button' as synonym for 'pushbutton')
   // Now handles both regular buttons (row col {label}) and bottom bar buttons (100 rowpos 0 {label})
-  const pbRegex = /^\s*(?:pushbutton|button)\s*(?:\(\s*(\d+)\s*\))?\s*=\s*(\d+)\s+(\d+)\s+(\d+)?\s*(?:(?:"([^"]*)"|\{([^}]*)\}))?\s*([^\n]*)/gim;
+  const pbRegex = /^\s*(?:pushbutton|button)\s*(?:\(\s*(\d+)\s*\))?\s*=\s*(\d+)[ \t]+(\d+)(?:[ \t]+(\d+))?[ \t]*(?:(?:"([^"]*)"|\{([^}]*)\}))?[ \t]*([^\n]*)/gim;
   let pbm: RegExpExecArray | null;
   while ((pbm = pbRegex.exec(text))) {
     const idx = pbm[1] != null ? Number(pbm[1]) : undefined;
@@ -2490,32 +1850,13 @@ function parseFrm(src: string): FrmModel {
     let action: 'program' | 'variable' | undefined;
     let program: string | undefined;
     const cleanedTail = tail.trim();
-    if (/\bRADIO\b/i.test(tail)) {
-      kind = 'radio';
-      const m = tail.match(/\bRADIO\b\s*([A-Z0-9_]+)\s*=\s*([^\s]+)/i);
-      if (m) { name = m[1]; value = m[2].replace(/,/g, ';'); }
-      action = 'variable';
-    } else if (/\bCHECKBOX\b/i.test(tail)) {
-      kind = 'checkbox';
-      const m = tail.match(/\bCHECKBOX\b\s*([A-Z0-9_]+)\s*=\s*([^\s]+)/i);
-      if (m) { name = m[1]; value = m[2].replace(/,/g, ';'); }
+    const assignment = parseButtonAssignment(cleanedTail);
+    if (assignment) {
+      ({ kind, name, value } = assignment);
       action = 'variable';
     } else {
-      if (cleanedTail) {
-        const assignMatch = cleanedTail.match(/([A-Z0-9_]+)\s*=\s*([^\s]+)/i);
-        if (assignMatch) {
-          name = assignMatch[1];
-          value = assignMatch[2].replace(/,/g, ';');
-          action = 'variable';
-        }
-        if (!action) {
-          const programMatch = extractProgramFromTail(cleanedTail);
-          if (programMatch) {
-            program = programMatch;
-            action = 'program';
-          }
-        }
-      }
+      program = extractProgramFromTail(cleanedTail);
+      if (program) action = 'program';
     }
     pushbuttons.push({ index: idx, row, col, label, kind, name, value, action, program, isBottomBar, bottomBarRow });
   }
@@ -2779,6 +2120,87 @@ function resolveImageSrc(webview: vscode.Webview, fileName: string): string | un
   } catch {
     return undefined;
   }
+}
+
+const IMAGE_FILE = /\.(bmp|jpe?g|tiff?|gif|png)$/i;
+
+/** The image files forms can use, by name. A file in both folders is listed once, as custom: that is the one used. */
+function listImages(webview: vscode.Webview): { name: string; custom: boolean; src: string }[] {
+  const found = new Map<string, { name: string; custom: boolean; src: string }>();
+  for (const [dir, custom] of [[customImg, true], [systemImg, false]] as const) {
+    if (!dir) continue;
+    try {
+      for (const entry of fs.readdirSync(dir.fsPath, { withFileTypes: true })) {
+        const id = entry.name.toLowerCase();
+        if (entry.isDirectory() || !IMAGE_FILE.test(entry.name) || found.has(id)) continue;
+        found.set(id, { name: entry.name, custom, src: webview.asWebviewUri(vscode.Uri.joinPath(dir, entry.name)).toString() });
+      }
+    } catch { /* the folder doesn't exist */ }
+  }
+  return [...found.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+// ---------------------------------------------------------------------------
+// The preview's toolbox
+// ---------------------------------------------------------------------------
+
+const TOOLBOX_KEY = 'vertexFrmPreview.toolbox';
+
+/** How the toolbox is shown, in every preview. x and y are the distances from the panel edges named by fromRight and fromBottom. */
+interface ToolboxState {
+  hidden: boolean;
+  horizontal: boolean;
+  fromRight: boolean;
+  fromBottom: boolean;
+  x: number;
+  y: number;
+  /** When it was last changed, so a page can tell whether it knows better. */
+  at: number;
+}
+
+function toolboxState(value: unknown): ToolboxState | undefined {
+  const v = value as Partial<ToolboxState> | undefined;
+  if (!v || ![v.x, v.y, v.at].every(n => typeof n === 'number' && Number.isFinite(n))) return undefined;
+  return {
+    hidden: !!v.hidden, horizontal: !!v.horizontal, fromRight: !!v.fromRight, fromBottom: !!v.fromBottom,
+    x: Number(v.x), y: Number(v.y), at: Number(v.at)
+  };
+}
+
+function savedToolbox(): ToolboxState {
+  return toolboxState(globalState?.get(TOOLBOX_KEY)) ??
+    { hidden: false, horizontal: false, fromRight: true, fromBottom: false, x: 24, y: 56, at: 0 };
+}
+
+const TOOLS: { tool: string; label: string; key: string; hint: string; icon: string }[] = [
+  { tool: 'text', label: 'Text', key: 'T', hint: 'click a cell', icon: '<path d="M3 4V3h10v1M8 3v10M6 13h4"/>' },
+  { tool: 'field', label: 'Field', key: 'F', hint: 'click a cell or drag its width', icon: '<rect x="1.5" y="4.5" width="13" height="7"/><path d="M4 6.5v3"/>' },
+  { tool: 'button', label: 'Button', key: 'B', hint: 'click a cell', icon: '<rect x="1.5" y="4" width="13" height="8" rx="2.5"/><path d="M5 8h6"/>' },
+  { tool: 'checkbox', label: 'Checkbox', key: 'C', hint: 'click a cell', icon: '<rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M5 8l2.2 2.4L11 5.6"/>' },
+  { tool: 'radio', label: 'Radio button', key: 'R', hint: 'click a cell', icon: '<circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2" fill="currentColor"/>' },
+  { tool: 'preview', label: 'Preview', key: 'P', hint: 'click a cell or drag its size', icon: '<rect x="1.5" y="2.5" width="13" height="11"/><path d="M1.5 5.5h13M8 7.5l3 1.5v2L8 12.2 5 11V9zM5 9l3 1.3L11 9M8 10.3v1.9"/>' },
+  { tool: 'image', label: 'Image', key: 'I', hint: 'click a cell or drag its size', icon: '<rect x="1.5" y="2.5" width="13" height="11"/><circle cx="5.2" cy="6" r="1.2"/><path d="M2 12l3.8-3.6 2.4 2.2L11 7.4l3.2 3.6"/>' },
+];
+
+function toolboxIcon(content: string): string {
+  return `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${content}</svg>`;
+}
+
+function renderToolbox(): string {
+  const tools = TOOLS.map(t => {
+    const title = `${t.label} (${t.key}): drag onto the form, or click and then ${t.hint}. Double-click to add several.`;
+    return `<button type="button" class="toolbox-tool" id="tool-${t.tool}" data-tool="${t.tool}" title="${title}" aria-label="${title}" aria-pressed="false">${toolboxIcon(t.icon)}<span class="toolbox-key" aria-hidden="true">${t.key}</span></button>`;
+  }).join('');
+  return `
+    <div id="toolbox" class="toolbox hidden" role="toolbar" aria-label="Toolbox">
+      <div class="toolbox-header" title="Drag to move the toolbox">
+        <span class="toolbox-grip" aria-hidden="true"></span>
+        <button type="button" class="toolbox-ctrl" id="toolboxFlip" title="Flip between vertical and horizontal" aria-label="Flip between vertical and horizontal">${toolboxIcon('<path d="M2.5 9.5v-5a2 2 0 0 1 2-2h5M7.5.8L9.5 2.5 7.5 4.2M13.5 6.5v5a2 2 0 0 1-2 2h-5M8.5 15.2l-2-1.7 2-1.7"/>')}</button>
+        <button type="button" class="toolbox-ctrl" id="toolboxHide" title="Hide toolbox" aria-label="Hide toolbox">${toolboxIcon('<path d="M3.5 8h9"/>')}</button>
+      </div>
+      <div class="toolbox-tools">${tools}</div>
+    </div>
+    <button type="button" id="toolboxShow" class="toolbox-show hidden" title="Show toolbox" aria-label="Show toolbox">${toolboxIcon('<path d="M1.5 5.5h13v8h-13zM5.5 5.5V4a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 10.5 4v1.5M1.5 9h4.2M10.3 9h4.2M5.7 8h1.6v2H5.7zM8.7 8h1.6v2H8.7zM7.3 9h1.4"/>')}</button>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3251,6 +2673,7 @@ interface PreviewData {
   portRows: number;
   portCols: number;
   boxOffset: number;
+  toolbox: ToolboxState;
 }
 
 interface PreviewOptions {
@@ -3363,7 +2786,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     const dataIdx = pb.index != null ? ` data-push-idx="${pb.index}" data-pb-idx="${pb.index}"` : ' data-unindexed="1"';
     const dataKind = ` data-pb-kind="${pb.kind}"`;
     const dataName = pb.name ? ` data-pb-name="${escapeAttr(pb.name)}"` : '';
-    const dataValue = pb.value ? ` data-pb-value="${escapeAttr(pb.value)}"` : '';
+    const dataValue = pb.value != null ? ` data-pb-value="${escapeAttr(pb.value)}"` : '';
     const dataProgram = pb.program ? ` data-pb-program="${escapeAttr(pb.program)}"` : '';
     const dataAction = pb.action ? ` data-pb-action="${pb.action}"` : '';
     const attrs = `${dataIdx}${dataKind}${dataName}${dataValue}${dataProgram}${dataAction}`;
@@ -3374,11 +2797,11 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     })();
     if (pb.kind === 'radio') {
       const nm = pb.name ? ` name="${escapeAttr(pb.name)}"` : '';
-      const valueAttr = pb.value ? ` value="${escapeAttr(pb.value)}"` : '';
+      const valueAttr = pb.value != null ? ` value="${escapeAttr(pb.value)}"` : '';
       return `<div class="push radio draggable"${attrs} draggable="true" data-type="pushbutton" data-row="${pb.row}" data-col="${pb.col}" style="grid-row:${pb.row}; grid-column:${pb.col} / span ${span};">\n        <div class="insertion-point" title="Insertion Point"></div>\n        <div class="delete-button" title="Delete">×</div>\n        <input type="radio"${nm}${valueAttr} />\n        <span class="label">${escapeHtml(pb.label)}</span>\n      </div>`;
     } else if (pb.kind === 'checkbox') {
       const nm = pb.name ? ` name="${escapeAttr(pb.name)}"` : '';
-      const valueAttr = pb.value ? ` value="${escapeAttr(pb.value)}"` : '';
+      const valueAttr = pb.value != null ? ` value="${escapeAttr(pb.value)}"` : '';
       return `<div class="push checkbox draggable"${attrs} draggable="true" data-type="pushbutton" data-row="${pb.row}" data-col="${pb.col}" style="grid-row:${pb.row}; grid-column:${pb.col} / span ${span};">\n        <div class="insertion-point" title="Insertion Point"></div>\n        <div class="delete-button" title="Delete">×</div>\n        <input type="checkbox"${nm}${valueAttr} />\n        <span class="label">${escapeHtml(pb.label)}</span>\n      </div>`;
     }
     // select button
@@ -3390,7 +2813,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     const dataIdx = pb.index != null ? ` data-push-idx="${pb.index}" data-pb-idx="${pb.index}"` : ' data-unindexed="1"';
     const dataKind = ` data-pb-kind="${pb.kind}"`;
     const dataName = pb.name ? ` data-pb-name="${escapeAttr(pb.name)}"` : '';
-    const dataValue = pb.value ? ` data-pb-value="${escapeAttr(pb.value)}"` : '';
+    const dataValue = pb.value != null ? ` data-pb-value="${escapeAttr(pb.value)}"` : '';
     const dataProgram = pb.program ? ` data-pb-program="${escapeAttr(pb.program)}"` : '';
     const dataAction = pb.action ? ` data-pb-action="${pb.action}"` : '';
     const attrs = `${dataIdx}${dataKind}${dataName}${dataValue}${dataProgram}${dataAction}`;
@@ -3398,14 +2821,14 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     
     if (pb.kind === 'radio') {
       const nm = pb.name ? ` name="${escapeAttr(pb.name)}"` : '';
-      const valueAttr = pb.value ? ` value="${escapeAttr(pb.value)}"` : '';
+      const valueAttr = pb.value != null ? ` value="${escapeAttr(pb.value)}"` : '';
       return `<div class="bottom-bar-button radio"${attrs}${dataBottomBarRow} data-type="pushbutton" data-row="${pb.row}" data-col="${pb.col}">
         <input type="radio"${nm}${valueAttr} />
         <span class="label">${escapeHtml(pb.label)}</span>
       </div>`;
     } else if (pb.kind === 'checkbox') {
       const nm = pb.name ? ` name="${escapeAttr(pb.name)}"` : '';
-      const valueAttr = pb.value ? ` value="${escapeAttr(pb.value)}"` : '';
+      const valueAttr = pb.value != null ? ` value="${escapeAttr(pb.value)}"` : '';
       return `<div class="bottom-bar-button checkbox"${attrs}${dataBottomBarRow} data-type="pushbutton" data-row="${pb.row}" data-col="${pb.col}">
         <input type="checkbox"${nm}${valueAttr} />
         <span class="label">${escapeHtml(pb.label)}</span>
@@ -3428,7 +2851,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
       }
     }
     return `
-    <div class="trigger-item" data-trigger-idx="${idx}" data-trigger-line="${t.line}" data-trigger-target="${escapeAttr(t.target)}" data-trigger-program="${escapeAttr(t.program)}">
+    <div class="trigger-item" data-trigger-idx="${idx}" data-trigger-line="${t.line}" data-trigger-target="${escapeAttr(t.target)}" data-trigger-program="${escapeAttr(t.program)}" title="Double-click to show in source, right-click to open the program">
       <div class="trigger-target">→ ${targetDisplay}</div>
       <div class="trigger-program">${escapeHtml(t.program)} ${escapeHtml(t.flag)}</div>
       <div class="trigger-actions">
@@ -3444,7 +2867,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     // const typeExpr = (f.typeExpr ?? '').trim() || String(f.type);
     // const valueSummary = f.values.length > 0 ? ` | values ${f.values.length}` : '';
     return `
-    <div class="trigger-item hidden-field-item" draggable="true" data-type="field" data-field-idx="${fieldIdx}"${f.index == null ? ' data-no-index="1"' : ''} data-field-name="${escapeAttr(f.name)}" data-row="${f.row}" data-col="${f.col}" data-span="${Math.max(1, f.len + (f.values.length > 0 ? 2 : 0))}" onclick="showHiddenFieldInSource(${fieldIdx})" title="Drag onto the preview to unhide, or click to show in source">
+    <div class="trigger-item hidden-field-item" draggable="true" data-type="field" data-field-idx="${fieldIdx}"${f.index == null ? ' data-no-index="1"' : ''} data-field-name="${escapeAttr(f.name)}" data-row="${f.row}" data-col="${f.col}" data-span="${Math.max(1, f.len + (f.values.length > 0 ? 2 : 0))}" title="Drag onto the preview to unhide; double-click to show in source">
       <div class="trigger-target">Field ${fieldIdx} - ${escapeHtml(f.name)}</div>
       <div class="trigger-actions">
         <button class="trigger-action-btn delete" onclick="deleteHiddenField(event, ${fieldIdx})" title="Delete">×</button>
@@ -3459,7 +2882,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     const dataIdx = img.index != null ? ` data-image-idx="${img.index}"` : '';
     const srcAttr = img.resolvedSrc ? ` src="${img.resolvedSrc}"` : '';
     const alt = escapeHtml(img.file || 'image');
-    return `<div class="image draggable"${dataIdx} draggable="true" data-type="image" data-row="${img.row}" data-col="${img.col}" style="grid-row:${img.row} / span ${spanR}; grid-column:${img.col} / span ${spanC};">
+    return `<div class="image draggable"${dataIdx} draggable="true" data-type="image" data-row="${img.row}" data-col="${img.col}" data-image-rows="${img.rows}" data-image-cols="${img.cols}" data-image-mode="${escapeAttr(img.modeExpr ?? "0")}" data-image-file="${escapeAttr(img.file)}" style="grid-row:${img.row} / span ${spanR}; grid-column:${img.col} / span ${spanC};">
       <div class="insertion-point" title="Insertion Point"></div>
       <div class="delete-button" title="Delete">×</div>
       <img${srcAttr} alt="${alt}" />
@@ -3505,8 +2928,9 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
             <button class="ctrl" data-zoom="1">1x</button>
             <button class="ctrl" data-zoom="1.5">1.5x</button>
             <button class="ctrl" data-zoom="2">2x</button>
-            <input id="zoomRange" type="range" min="0.5" max="10" step="0.1" value="1" />
+            <input id="zoomRange" type="range" min="0.5" max="10" step="0.05" value="1" />
             <span class="zoomLabel" id="zoomLabel">100%</span>
+            <button id="zoomFit" class="ctrl" style="width:auto; padding:0 8px;" data-kbd-mod title="Fit to window (Ctrl+1)">Fit</button>
             ` : ''}
             <label class="ctrl" style="gap:6px; width:auto;">
               <input id="gridToggle" type="checkbox" /> Grid
@@ -3579,24 +3003,27 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
       </div>
     </div>
 
+    ${renderToolbox()}
+
     <!-- Context Menu -->
     <div id="contextMenu" class="context-menu hidden">
-      <div class="context-menu-item" data-action="add-text">Add Text</div>
-      <div class="context-menu-item" data-action="add-field">Add Field</div>
-      <div class="context-menu-item" data-action="add-button-select">Add Button</div>
-      <div class="context-menu-item" data-action="add-button-checkbox">Add Checkbox</div>
-      <div class="context-menu-item" data-action="add-button-radio">Add Radio Button</div>
-      <div class="context-menu-item" data-action="add-preview">Add Preview</div>
+      <div class="context-menu-item" data-action="add-text">Add Text<span class="context-menu-shortcut">T</span></div>
+      <div class="context-menu-item" data-action="add-field">Add Field<span class="context-menu-shortcut">F</span></div>
+      <div class="context-menu-item" data-action="add-button-select">Add Button<span class="context-menu-shortcut">B</span></div>
+      <div class="context-menu-item" data-action="add-button-checkbox">Add Checkbox<span class="context-menu-shortcut">C</span></div>
+      <div class="context-menu-item" data-action="add-button-radio">Add Radio Button<span class="context-menu-shortcut">R</span></div>
+      <div class="context-menu-item" data-action="add-preview">Add Preview<span class="context-menu-shortcut">P</span></div>
+      <div class="context-menu-item" data-action="add-image">Add Image<span class="context-menu-shortcut">I</span></div>
     </div>
 
     <!-- Element Context Menu -->
     <div id="elementContextMenu" class="context-menu hidden">
       <div class="context-menu-item" data-action="edit-element">Edit<span class="context-menu-shortcut">F2</span></div>
       <div class="context-menu-item hidden" data-action="toggle-box" id="toggleBoxMenuItem">Add Box</div>
-      <div class="context-menu-item" data-action="duplicate-element">Duplicate<span class="context-menu-shortcut" data-kbd-mod>Ctrl+D</span></div>
+      <div class="context-menu-item" data-action="duplicate-element"><span class="label">Duplicate</span><span class="context-menu-shortcut" data-kbd-mod>Ctrl+D</span></div>
       <div class="context-menu-item" data-action="move-element" id="moveElementMenuItem">Set Tab Visibility</div>
       <div class="context-menu-item" data-action="show-in-source">Show in Source</div>
-      <div class="context-menu-item" data-action="delete-element">Delete<span class="context-menu-shortcut">Del</span></div>
+      <div class="context-menu-item" data-action="delete-element"><span class="label">Delete</span><span class="context-menu-shortcut">Del</span></div>
     </div>
 
     <!-- Window Resize Handle Context Menu -->
@@ -3898,7 +3325,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
           <div class="modal-field hidden" id="buttonValueField">
             <label>Value</label>
             <input type="text" id="buttonValue" placeholder="e.g., 1;0 for toggle" />
-            <small>For checkbox/radio: value when checked;unchecked (e.g., 1;0)</small>
+            <small>For checkbox: value when checked;unchecked (e.g., 1;0). For the others, leave empty to set the variable to blank</small>
           </div>
           <div class="modal-buttons">
             <button class="modal-button" data-action="cancel">Cancel</button>
@@ -3975,26 +3402,79 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
       </div>
     </div>
 
+    <div id="marquee" class="marquee hidden"></div>
     <div id="selectionNotice" class="selection-notice hidden" role="status"></div>
+
+    <!-- Modal for Image Input -->
+    <div id="imageModal" class="modal-overlay hidden">
+      <div class="modal">
+        <h3 id="imageModalTitle">Add Image</h3>
+        <div class="modal-form">
+          <div class="modal-field">
+            <label for="imageFile">File</label>
+            <input type="text" id="imageFile" placeholder="Search, or type a name such as logo.png" autocomplete="off" spellcheck="false" />
+            <div id="imageList" class="image-list" role="listbox" aria-label="Images"></div>
+            <small id="imageHint" class="fv-hint"></small>
+          </div>
+          <div style="display: flex; gap: 12px;">
+            <div class="modal-field" style="flex: 1;">
+              <label for="imageRows">Rows (Height)</label>
+              <input type="number" id="imageRows" value="10" min="1" />
+            </div>
+            <div class="modal-field" style="flex: 1;">
+              <label for="imageCols">Columns (Width)</label>
+              <input type="number" id="imageCols" value="20" min="1" />
+            </div>
+          </div>
+          <div class="modal-field">
+            <label>Type</label>
+            <div id="imageModes" class="image-modes">
+              <label><input type="checkbox" value="1" /> No horizontal stretch</label>
+              <label><input type="checkbox" value="2" /> No vertical stretch</label>
+              <label><input type="checkbox" value="64" /> Transparent by alpha channel</label>
+              <label><input type="checkbox" value="128" /> Transparent by top left corner's colour</label>
+            </div>
+            <small id="imageModeNote"></small>
+          </div>
+          <div class="modal-buttons">
+            <button class="modal-button" data-action="cancel">Cancel</button>
+            <button class="modal-button primary" data-action="confirm-image">Confirm</button>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- Keyboard Shortcuts -->
     <div id="shortcutsModal" class="modal-overlay hidden">
       <div class="modal shortcuts-modal">
         <h3>Keyboard Shortcuts</h3>
         <div class="shortcuts-grid">
-          <h4>Selected element</h4>
-          <span><kbd data-kbd-mod>Ctrl</kbd>+click</span><span>Add to or remove from the selection</span>
+          <h4>Selecting</h4>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+click / <kbd>Shift</kbd>+click</span><span>Add to or remove from the selection (also triggers and hidden fields)</span>
+          <span>Drag on empty space</span><span>Select everything inside the box (with <kbd data-kbd-mod>Ctrl</kbd> or <kbd>Shift</kbd>: add)</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>A</kbd></span><span>Select all on this tab</span>
+          <h4>Selected elements</h4>
           <span><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span><span>Move one cell</span>
-          <span><kbd>Shift</kbd>+<kbd>Arrow</kbd></span><span>Stretch (fields, images, previews)</span>
-          <span><kbd>F2</kbd> / <kbd>Enter</kbd></span><span>Edit</span>
-          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>D</kbd></span><span>Duplicate one row below</span>
+          <span><kbd>Shift</kbd>+<kbd>Arrow</kbd></span><span>Stretch (one field, image or preview)</span>
+          <span><kbd>F2</kbd> / <kbd>Enter</kbd></span><span>Edit (one element)</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>D</kbd></span><span>Duplicate one row below (several: below the group)</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>C</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>X</kbd></span><span>Copy / cut, also selected triggers and hidden fields</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>V</kbd></span><span>Paste at the cell under the pointer, in any form (away from the form: at the original place)</span>
           <span><kbd>Del</kbd> / <kbd>Backspace</kbd></span><span>Delete</span>
           <span><kbd>Esc</kbd></span><span>Deselect</span>
+          <h4>Adding</h4>
+          <span><kbd>T</kbd> <kbd>F</kbd> <kbd>B</kbd> <kbd>C</kbd> <kbd>R</kbd> <kbd>P</kbd> <kbd>I</kbd></span><span>Add text, field, button, checkbox, radio button, preview or image at the cell under the pointer</span>
+          <span>Click a tool, then a cell</span><span>Add it there (drag to size fields, previews and images; double-click the tool to add several; <kbd>Esc</kbd> or right-click stops)</span>
           <h4>Form</h4>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Z</kbd></span><span>Undo (shared with the .frm source)</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Y</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></span><span>Redo</span>
-          <span><kbd>Enter</kbd> / <kbd>Esc</kbd></span><span>Confirm / cancel tab order (in tab-order mode)</span>
+          <span><kbd>Enter</kbd> / <kbd>Esc</kbd></span><span>Confirm / cancel tab order (click fields, field-setting buttons or Hidden Fields rows)</span>
           <span><kbd>?</kbd></span><span>Show this list</span>
+          <h4>Zoom</h4>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+scroll</span><span>Zoom in / out (5%; keeps the point under the cursor)</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>=</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>−</kbd></span><span>Zoom in / out (5%)</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>0</kbd></span><span>Reset to 100%</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>1</kbd></span><span>Fit the form to the panel</span>
           <h4>Dialogs</h4>
           <span><kbd>Esc</kbd></span><span>Cancel, discarding changes</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Enter</kbd></span><span>Confirm</span>
@@ -4027,7 +3507,8 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     cols: model.cols,
     portRows: Number(model.portRows ?? 0),
     portCols: Number(model.portCols ?? 0),
-    boxOffset: BOX_LABEL_OFFSET
+    boxOffset: BOX_LABEL_OFFSET,
+    toolbox: savedToolbox()
   };
   return { body, data };
 }
