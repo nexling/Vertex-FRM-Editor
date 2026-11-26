@@ -1,5 +1,6 @@
 // Copies, cuts and pastes form elements and triggers as plain FRM lines. No VS Code dependency.
 
+import { insertBackground } from './backgrounds';
 import {
   ElementRef, SECTION_OF, addFieldToGroup1, addToTab, deleteElements, keyOf, matchPosition, revisionOf
 } from './elementEdits';
@@ -29,7 +30,7 @@ export interface PasteOptions {
 
 export interface PasteResult {
   lines: string[];
-  /** Keys of the pasted elements on the form. */
+  /** Keys of the pasted elements on the form and of backgrounds. */
   keys: string[];
   /** Indexes of the pasted hidden fields. */
   hiddenFields: number[];
@@ -109,7 +110,13 @@ export function pasteStatements(source: string[], text: string, options: PasteOp
   let used = 0;
 
   const items: Array<{ type: string; index: number; row: number; col: number; hidden: boolean; m: RegExpMatchArray; statement: string[] }> = [];
+  const backgrounds: Array<{ type: string; index: number; statement: string[] }> = [];
   for (const s of findElementStatements(pasted)) {
+    if (s.type === 'bgimage') {
+      backgrounds.push({ type: s.type, index: s.index, statement: statementLines(pasted, s) });
+      used += s.endLine - s.startLine + 1;
+      continue;
+    }
     const m = matchPosition(pasted[s.startLine], s.type);
     if (!m || (s.type === 'pushbutton' && BOTTOM_BAR.test(pasted[s.startLine]))) continue;
     const row = Number(m[2]), col = Number(m[4]);
@@ -118,7 +125,7 @@ export function pasteStatements(source: string[], text: string, options: PasteOp
   }
   const triggers = findTriggerStatements(pasted);
   for (const t of triggers) used += t.endLine - t.startLine + 1;
-  if (!items.length && !triggers.length) return undefined;
+  if (!items.length && !backgrounds.length && !triggers.length) return undefined;
 
   const lines = [...source];
   const result: PasteResult = {
@@ -155,21 +162,23 @@ export function pasteStatements(source: string[], text: string, options: PasteOp
 
   // Indexes
   const taken = new Set(existing.map(keyOf));
-  const indexes = new Map<(typeof items)[number], number>();
+  const indexes = new Map<ElementRef, number>();
   if (options.restoreIndexes) {
-    for (const item of items) {
+    for (const item of [...items, ...backgrounds]) {
       if (taken.has(keyOf(item))) continue;
       indexes.set(item, item.index);
       taken.add(keyOf(item));
     }
   }
   const nextIndex: Record<string, number> = {};
+  const nextFree = (item: ElementRef) =>
+    indexes.get(item) ?? (nextIndex[item.type] = (nextIndex[item.type] ?? 1) + 1) - 1;
   for (const s of [...existing, ...indexes.keys()]) nextIndex[s.type] = Math.max(nextIndex[s.type] ?? 1, s.index + 1);
 
   const fieldIndexes = new Map<number, number>();
   const revision = revisionOf(source);
   for (const item of items) {
-    const index = indexes.get(item) ?? (nextIndex[item.type] = (nextIndex[item.type] ?? 1) + 1) - 1;
+    const index = nextFree(item);
     const { m, statement } = item;
     const at = item.hidden ? `${m[2]}${m[3]}${m[4]}` : `${item.row + dRow}${m[3]}${item.col + dCol}`;
     const start = m[1].replace(/^(\s*)(\w+)(\s*\(\s*)\d+/, (_all, indent: string, keyword: string, open: string) =>
@@ -183,6 +192,14 @@ export function pasteStatements(source: string[], text: string, options: PasteOp
     if (options.tabId !== undefined && options.tabId !== null) addToTab(lines, item.type, index, options.tabId);
     if (item.hidden) result.hiddenFields.push(index);
     else result.keys.push(keyOf({ type: item.type, index }));
+  }
+
+  // Backgrounds have no position and, named in no list, are shown on every tab
+  for (const item of backgrounds) {
+    const index = nextFree(item);
+    item.statement[0] = item.statement[0].replace(/\(\s*\d+/, `(${index}`);
+    insertBackground(lines, item.statement);
+    result.keys.push(keyOf({ type: item.type, index }));
   }
 
   // Triggers come last in a file, so nothing is inserted above the ones already added

@@ -327,6 +327,33 @@ image(index)= rowupperleftcorner columnupperleftcorner maxrowsize maxcolumnsize 
 `
     },
     {
+        label: "bgimage",
+        detail: `adds a background image or colour behind the form. Searches images from directory: forms/images/ if no $DIR path is given.
+Several are drawn in index order, the highest on top. If a form has none, Vertex reads def_bg_*.vxf in the forms folder.
+Width and height: pixels, -1 = fit to the area, 0 = the image's own size
+Transparency: 0 = opaque, 255 = fully transparent
+Modes:
+- +64  = use alpha channel for transparency
+- +128 = use top left corner for transparency
+Placements:
+- FRAME    = inside of the frame
+- NOTFRAME = outside the frame (main database only)
+- DIALOG   = full dialog (main database only)
+
+Alignments: TOPLEFT, TOPMID, TOPRIGHT, MIDLEFT, MIDMID, MIDRIGHT, BOTTOMLEFT, BOTTOMMID, BOTTOMRIGHT, TILED
+Instead of a file, "RGB(red,green,blue)" fills with a colour.
+Supported file formats: BMP, JPG, TIF, GIF, PNG`,
+        documentation: `Example:\n
+\`\`\`vertexfrm
+bgimage(1)= -1 -1 0 0 FRAME TOPLEFT "RGB(255,255,0)"
+\`\`\`
+Example2:\n
+\`\`\`vertexfrm
+bgimage(index)= width height transparency mode placement alignment "image-filename"
+\`\`\`
+`
+    },
+    {
         label: "field",
         detail: `adds a field to the form.
 Styles:

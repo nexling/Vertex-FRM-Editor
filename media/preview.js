@@ -53,7 +53,7 @@
     var type = n.getAttribute('data-type');
     if (!type) return null;
     var idx = n.getAttribute('data-text-idx') || n.getAttribute('data-field-idx') || n.getAttribute('data-push-idx') ||
-      n.getAttribute('data-image-idx') || n.getAttribute('data-preview-idx');
+      n.getAttribute('data-image-idx') || n.getAttribute('data-preview-idx') || n.getAttribute('data-bgimage-idx');
     if (idx === null) return null;
     return type + ':' + idx + (n.classList.contains('hidden-field-item') ? ':hidden' : '');
   }
@@ -469,15 +469,26 @@ window.__frmMain = function(D) {
   var tabFields = D.tabFields;
   var tabPushButtons = D.tabPushButtons;
   var tabImages = D.tabImages;
+  var tabBackgrounds = D.tabBackgrounds;
   var tabPreviews = D.tabPreviews;
   // A preview on no tab's list is shown on all of them
   function previewOnTabs(idx) {
     return tabs.some(function(t) { return (tabPreviews[t.id] || []).map(Number).indexOf(idx) >= 0; });
   }
+  // Tabs whose list names a background
+  function backgroundTabs(idx) {
+    return tabs.filter(function(t) { return (tabBackgrounds[t.id] || []).map(Number).indexOf(idx) >= 0; }).map(function(t) { return t.id; });
+  }
   var initialActiveTab = D.initialActiveTab;
   var currentActiveTab = null; // Track the currently active tab
   function applyTab(tabId){
     try {
+      // A background on no tab's list is shown on all of them
+      document.querySelectorAll('.bg-image').forEach(function(el) {
+        var idx = JSON.parse(el.getAttribute('data-bg')).index;
+        var on = backgroundTabs(idx);
+        el.classList.toggle('hidden', on.length > 0 && on.indexOf(Number(tabId)) < 0);
+      });
       var textSet = new Set((tabTexts[tabId] || []).map(Number));
       var fieldSet = new Set((tabFields[tabId] || []).map(Number));
       var pushButtonSet = new Set((tabPushButtons[tabId] || []).map(Number));
@@ -624,7 +635,8 @@ window.__frmMain = function(D) {
     var hasTabs = D.tabs.length > 0;
     var moveItem = document.getElementById('moveElementMenuItem');
     if (moveItem) {
-      if (hasTabs) {
+      // A background's tabs are set in its dialog
+      if (hasTabs && elementType !== 'bgimage') {
         moveItem.classList.remove('hidden');
       } else {
         moveItem.classList.add('hidden');
@@ -754,6 +766,8 @@ window.__frmMain = function(D) {
       elementIndex = parseInt(element.getAttribute('data-field-idx'));
     } else if (elementType === 'pushbutton') {
       elementIndex = parseInt(element.getAttribute('data-pb-idx'));
+    } else if (elementType === 'bgimage') {
+      elementIndex = parseInt(element.getAttribute('data-bgimage-idx'));
     } else if (elementType === 'image') {
       elementIndex = parseInt(element.getAttribute('data-image-idx'));
     } else if (elementType === 'preview') {
@@ -1060,6 +1074,8 @@ window.__frmMain = function(D) {
               document.getElementById('previewModal').setAttribute('data-edit-index', elementIndex);
               showModal('previewModal');
               document.getElementById('previewPath').focus();
+            } else if (elementType === 'bgimage') {
+              openBackgroundModal(elementContextMenuState.element);
             } else if (elementType === 'image' && isFinite(elementIndex)) {
               openImageModal({ index: elementIndex, data: elementData }, null);
             }
@@ -1078,6 +1094,9 @@ window.__frmMain = function(D) {
             break;
           case 'duplicate-element':
             if (elementContextMenuState.group) {
+              duplicateSelected();
+            } else if (elementType === 'bgimage') {
+              setSelection([], null, null, null, [elementContextMenuState.element]);
               duplicateSelected();
             } else if (elementContextMenuState.element) {
               selectElement(elementContextMenuState.element);
@@ -1108,6 +1127,7 @@ window.__frmMain = function(D) {
     setupButtonModal();
     setupPreviewModal();
     setupImageModal();
+    setupBackgroundModal();
     setupMoveModal();
     setupTriggerModal();
 
@@ -2214,6 +2234,13 @@ window.__frmMain = function(D) {
       e.preventDefault();
       e.stopPropagation();
       
+      if (this.classList.contains('bg-item')) {
+        if (tabOrderMode) return;
+        var info = collectElementInfo(this);
+        if (!isFinite(info.index)) { showNotice('A background without an index can\'t be edited here'); return; }
+        showElementContextMenu(e.clientX, e.clientY, this, info.type, info.index, info.data);
+        return;
+      }
       var programName = this.getAttribute('data-trigger-program');
       if (programName && vscodeApi && vscodeApi.postMessage) {
         vscodeApi.postMessage({
@@ -2268,6 +2295,7 @@ window.__frmMain = function(D) {
   function openImageModal(editing, size) {
     var modal = document.getElementById('imageModal');
     if (!modal) return;
+    picker = 'image';
     imageEditing = editing;
     imageSizeTouched = !!(editing || size);
     var data = editing ? editing.data : { file: '', rows: size ? size.rows : 10, cols: size ? size.cols : 20, mode: '1+2' };
@@ -2283,6 +2311,10 @@ window.__frmMain = function(D) {
     imageFiles = null;
     renderImageList();
     showModal('imageModal');
+    requestImages();
+  }
+
+  function requestImages() {
     if (vscodeApi) {
       window.__frmImageListRequest = (window.__frmImageListRequest || 0) + 1;
       vscodeApi.postMessage({ command: 'listImages', requestId: window.__frmImageListRequest });
@@ -2290,8 +2322,10 @@ window.__frmMain = function(D) {
     checkImageName();
   }
 
+  // Both dialogs with a file list; the ids of their parts start with picker
+  var picker = 'image';
   function renderImageList() {
-    var box = document.getElementById('imageList');
+    var box = document.getElementById(picker + 'List');
     if (!box) return;
     box.textContent = '';
     function note(text) {
@@ -2301,7 +2335,7 @@ window.__frmMain = function(D) {
       box.appendChild(n);
     }
     if (!imageFiles) { note('Loading…'); return; }
-    var typed = document.getElementById('imageFile').value.trim().toLowerCase();
+    var typed = document.getElementById(picker + 'File').value.trim().toLowerCase();
     var exact = imageFiles.some(function(f) { return f.name.toLowerCase() === typed; });
     // A chosen file shows the whole list again, so another one can be picked
     var shown = imageFiles.filter(function(f) { return exact || f.name.toLowerCase().indexOf(typed) >= 0; });
@@ -2345,26 +2379,27 @@ window.__frmMain = function(D) {
 
   // Is the typed file there, and how large is it
   function checkImageName() {
-    var name = document.getElementById('imageFile').value.trim();
-    var hint = document.getElementById('imageHint');
+    var name = document.getElementById(picker + 'File').value.trim();
+    var hint = document.getElementById(picker + 'Hint');
     var id = window.__frmImageRequest = (window.__frmImageRequest || 0) + 1;
-    hint.textContent = /^\$/.test(name) ? 'Files in a $DIR path are not shown in the preview' : '';
-    if (!name || /^\$/.test(name) || !vscodeApi) return;
+    hint.textContent = '';
+    if (!name || !vscodeApi) return;
     vscodeApi.postMessage({ command: 'resolveImage', name: name, requestId: id });
   }
 
   function onImageMessage(msg) {
-    var modal = document.getElementById('imageModal');
+    var modal = document.getElementById(picker + 'Modal');
     if (!modal || modal.classList.contains('hidden')) return;
     if (msg.command === 'imagesListed' && msg.requestId === window.__frmImageListRequest) {
       imageFiles = msg.images || [];
       renderImageList();
     } else if (msg.command === 'imageResolved' && msg.requestId === window.__frmImageRequest) {
       if (!msg.src) {
-        document.getElementById('imageHint').textContent = 'Not found in custom/forms/images or system/forms/images';
+        var missing = document.getElementById(picker + 'File').value.trim();
+        document.getElementById(picker + 'Hint').textContent = /[\\/]/.test(missing) ? 'Not found' : 'Not found in custom/forms/images or system/forms/images';
         return;
       }
-      if (imageSizeTouched) return;
+      if (picker !== 'image' || imageSizeTouched) return;
       var img = new Image();
       img.onload = onCurrentPage(function() {
         if (imageSizeTouched || msg.requestId !== window.__frmImageRequest || !img.naturalWidth || !img.naturalHeight) return;
@@ -2376,17 +2411,15 @@ window.__frmMain = function(D) {
     }
   }
 
-  function setupImageModal() {
-    var modal = document.getElementById('imageModal');
-    if (!modal) return;
-    var file = document.getElementById('imageFile');
-    var box = document.getElementById('imageList');
+  function setupImagePicker(ids) {
+    var file = document.getElementById(ids + 'File');
+    var box = document.getElementById(ids + 'List');
     var timer;
     function changed() {
       renderImageList();
       clearTimeout(timer);
       window.__frmImageRequest = (window.__frmImageRequest || 0) + 1; // answers for the previous name no longer count
-      document.getElementById('imageHint').textContent = '';
+      document.getElementById(ids + 'Hint').textContent = '';
       timer = setTimeout(checkImageName, 200);
     }
     function pick(item) {
@@ -2397,7 +2430,7 @@ window.__frmMain = function(D) {
     file.addEventListener('input', changed);
     file.addEventListener('keydown', function(e) {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
-      var items = list('#imageList .image-list-item');
+      var items = list('#' + ids + 'List .image-list-item');
       var at = items.findIndex(function(i) { return i.classList.contains('kbd-active'); });
       if (e.key === 'Enter' && at >= 0) {
         e.preventDefault();
@@ -2415,6 +2448,13 @@ window.__frmMain = function(D) {
       var item = e.target.closest('.image-list-item');
       if (item) pick(item);
     });
+  }
+
+  function setupImageModal() {
+    var modal = document.getElementById('imageModal');
+    if (!modal) return;
+    var file = document.getElementById('imageFile');
+    setupImagePicker('image');
     ['imageRows', 'imageCols'].forEach(function(id) {
       document.getElementById(id).addEventListener('input', function() { imageSizeTouched = true; });
     });
@@ -2456,6 +2496,248 @@ window.__frmMain = function(D) {
       hideModal('imageModal');
       if (vscodeApi && Object.keys(data).length > 3) vscodeApi.postMessage(data);
     });
+  }
+
+  // ---- Background dialog --------------------------------------------------------------------------
+  var bgEditing = null; // the edited background's values; null when adding
+  var BG_NEW = { width: -1, height: -1, transparency: 0, mode: 64, placement: 'FRAME', alignment: 'TOPLEFT', file: '', color: null };
+
+  function bgKind() {
+    var on = document.querySelector('#bgKinds input:checked');
+    return on ? on.value : null;
+  }
+
+  function hex(color) {
+    return '#' + color.map(function(c) { return (c < 16 ? '0' : '') + c.toString(16); }).join('');
+  }
+
+  // What the chosen kind and the readable values need
+  function showBgControls() {
+    var kind = bgKind();
+    var kept = [];
+    document.getElementById('bgKinds').classList.toggle('hidden', kind === null);
+    if (kind === null) kept.push('file');
+    list('#bgModal .bg-picture').forEach(function(el) { el.classList.toggle('hidden', kind === 'color'); });
+    list('#bgModal [data-bg-part]:not(.bg-picture)').forEach(function(el) { el.classList.remove('hidden'); });
+    list('#bgModal .bg-color').forEach(function(el) { el.classList.toggle('hidden', kind !== 'color'); });
+    if (kind === null) document.getElementById('bgFile').parentElement.classList.add('hidden');
+    list('#bgModal [data-bg-part]').forEach(function(el) {
+      var part = el.getAttribute('data-bg-part');
+      if (!bgEditing || bgEditing[part] !== null) return;
+      if (!el.classList.contains('hidden')) kept.push(part);
+      el.classList.add('hidden');
+    });
+    document.getElementById('bgKept').textContent = kept.length ? 'Kept as written: ' + kept.join(', ') : '';
+    ['Width', 'Height'].forEach(function(side) {
+      document.getElementById('bg' + side + 'Px').classList.toggle('hidden', document.getElementById('bg' + side).value !== 'px');
+    });
+    var t = Number(document.getElementById('bgTransparency').value);
+    document.getElementById('bgTransparencyLabel').textContent = t + ' (' + Math.round((255 - t) / 2.55) + '% visible)';
+  }
+
+  // row: the edited background's row; null when adding
+  function openBackgroundModal(row) {
+    var modal = document.getElementById('bgModal');
+    if (!modal) return;
+    picker = 'bg';
+    bgEditing = row ? JSON.parse(row.getAttribute('data-bg')) : null;
+    var v = bgEditing || BG_NEW;
+    document.getElementById('bgModalTitle').textContent = bgEditing ? 'Edit Background' : 'Add Background';
+    var kind = v.file === null ? null : v.color ? 'color' : 'picture';
+    list('#bgKinds input').forEach(function(r) { r.checked = r.value === kind; });
+    document.getElementById('bgFile').value = v.color ? '' : v.file || '';
+    document.getElementById('bgHint').textContent = '';
+    document.getElementById('bgColor').value = hex(v.color || [240, 240, 240]);
+    ['width', 'height'].forEach(function(part) {
+      var id = part === 'width' ? 'bgWidth' : 'bgHeight';
+      var px = v[part] > 0;
+      document.getElementById(id).value = px ? 'px' : v[part] === 0 ? '0' : '-1';
+      document.getElementById(id + 'Px').value = px ? v[part] : 200;
+    });
+    document.getElementById('bgTransparency').value = v.transparency || 0;
+    list('#bgModes input').forEach(function(b) { b.checked = !!(v.mode & Number(b.value)); });
+    document.getElementById('bgPlacement').value = v.placement || 'FRAME';
+    list('#bgAlignment input').forEach(function(r) { r.checked = r.value === (v.alignment || 'TOPLEFT'); });
+    var on = bgEditing ? backgroundTabs(bgEditing.index) : [];
+    list('#bgTabs .bg-tab').forEach(function(b) { b.checked = on.indexOf(Number(b.value)) >= 0; });
+    var all = document.getElementById('bgAllTabs');
+    if (all) all.checked = !on.length;
+    imageFiles = null;
+    renderImageList();
+    showBgControls();
+    showModal('bgModal');
+    requestImages();
+  }
+
+  function setupBackgroundModal() {
+    var modal = document.getElementById('bgModal');
+    if (!modal) return;
+    setupImagePicker('bg');
+    document.getElementById('addBackgroundBtn').addEventListener('click', function(e) {
+      e.stopPropagation();
+      if (!tabOrderMode) openBackgroundModal(null);
+    });
+    list('#bgKinds input, #bgWidth, #bgHeight').forEach(function(el) { el.addEventListener('change', showBgControls); });
+    document.getElementById('bgTransparency').addEventListener('input', showBgControls);
+    var all = document.getElementById('bgAllTabs');
+    var boxes = list('#bgTabs .bg-tab');
+    if (all) {
+      all.addEventListener('change', function() {
+        if (all.checked) boxes.forEach(function(b) { b.checked = false; });
+        else if (boxes.length) boxes.forEach(function(b) { b.checked = Number(b.value) === Number(currentActiveTab); });
+      });
+      boxes.forEach(function(b) {
+        b.addEventListener('change', function() { all.checked = !boxes.some(function(x) { return x.checked; }); });
+      });
+    }
+
+    modal.querySelector('[data-action="cancel"]').addEventListener('click', function() { hideModal('bgModal'); });
+    modal.querySelector('[data-action="confirm-background"]').addEventListener('click', function() {
+      var kind = bgKind();
+      var old = bgEditing;
+      var values = {};
+      if (kind === 'color') {
+        values.file = 'RGB(' + document.getElementById('bgColor').value.slice(1).match(/../g).map(function(h) { return parseInt(h, 16); }).join(',') + ')';
+        if (old && old.color && hex(old.color) === document.getElementById('bgColor').value) values.file = old.file;
+      } else if (kind === 'picture') {
+        values.file = document.getElementById('bgFile').value.replace(/["{}]/g, '').trim();
+        if (!values.file) {
+          document.getElementById('bgHint').textContent = 'Choose or enter a file name';
+          document.getElementById('bgFile').focus();
+          return;
+        }
+      }
+      var bad = false;
+      ['width', 'height'].forEach(function(part) {
+        var id = part === 'width' ? 'bgWidth' : 'bgHeight';
+        var how = document.getElementById(id).value;
+        values[part] = how === 'px' ? parseInt(document.getElementById(id + 'Px').value, 10) : Number(how);
+        if (kind !== 'color' && !(old && old[part] === null) && !(values[part] >= -1 && (how !== 'px' || values[part] >= 1))) bad = true;
+      });
+      if (bad) return;
+      values.transparency = Number(document.getElementById('bgTransparency').value);
+      // A value outside the slider's range stays unless the slider is moved
+      if (old && old.transparency !== null && values.transparency === Math.max(0, Math.min(255, old.transparency))) values.transparency = old.transparency;
+      values.mode = old && old.mode !== null ? old.mode : 0;
+      list('#bgModes input').forEach(function(b) { values.mode = b.checked ? values.mode | Number(b.value) : values.mode & ~Number(b.value); });
+      values.placement = document.getElementById('bgPlacement').value;
+      var align = document.querySelector('#bgAlignment input:checked');
+      values.alignment = align ? align.value : 'TOPLEFT';
+      if (kind === 'color') {
+        // A colour shows transparency and placement only; its other values stay
+        ['width', 'height', 'mode', 'alignment'].forEach(function(part) { values[part] = old ? old[part] : part === 'mode' ? 0 : BG_NEW[part]; });
+      }
+      var on = boxes.filter(function(b) { return b.checked; }).map(function(b) { return Number(b.value); });
+      var msg = { command: old ? 'editElement' : 'addElement', elementType: 'bgimage' };
+      if (old) {
+        // Only what changed, so the rest of the line stays as written
+        Object.keys(values).forEach(function(part) { if (old[part] === null || values[part] === old[part]) delete values[part]; });
+        msg.elementIndex = old.index;
+      }
+      msg.background = values;
+      var before = old ? backgroundTabs(old.index) : [];
+      if (on.join() !== before.join()) msg.tabIds = on.length ? on : 'all';
+      hideModal('bgModal');
+      if (vscodeApi && (Object.keys(values).length || msg.tabIds)) vscodeApi.postMessage(msg);
+    });
+  }
+
+  // ---- Drawing backgrounds ------------------------------------------------------------------------
+  // Pictures by address: { w, h, keyed }, keyed = the picture with its top left pixel's colour removed
+  var bgPictures = window.__frmBgPictures = window.__frmBgPictures || {};
+
+  function bgPicture(src) {
+    var known = bgPictures[src];
+    if (known) return known;
+    known = bgPictures[src] = { w: 0, h: 0, keyed: null };
+    var img = new Image();
+    if (!/^data:/.test(src)) img.crossOrigin = 'anonymous'; // so its pixels may be read
+    img.onload = function() {
+      known.w = img.naturalWidth;
+      known.h = img.naturalHeight;
+      known.img = img;
+      if (window.__frmLayoutBackgrounds) window.__frmLayoutBackgrounds();
+    };
+    img.onerror = function() {
+      if (!img.crossOrigin) return;
+      img = new Image();
+      img.onload = function() {
+        known.w = img.naturalWidth;
+        known.h = img.naturalHeight;
+        if (window.__frmLayoutBackgrounds) window.__frmLayoutBackgrounds();
+      };
+      img.src = src;
+    };
+    img.src = src;
+    return known;
+  }
+
+  function keyedSrc(pic, src) {
+    if (pic.keyed) return pic.keyed;
+    if (!pic.img) return src;
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = pic.w;
+      canvas.height = pic.h;
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(pic.img, 0, 0);
+      var pixels = ctx.getImageData(0, 0, pic.w, pic.h);
+      var p = pixels.data;
+      var r = p[0], g = p[1], b = p[2];
+      for (var i = 0; i < p.length; i += 4) if (p[i] === r && p[i + 1] === g && p[i + 2] === b) p[i + 3] = 0;
+      ctx.putImageData(pixels, 0, 0);
+      pic.keyed = canvas.toDataURL();
+    } catch { pic.keyed = src; }
+    return pic.keyed;
+  }
+
+  function layoutBackgrounds() {
+    var content = document.querySelector('.content');
+    var frame = document.querySelector('#gridFrame > .grid');
+    var area = document.querySelector('.form-area');
+    if (!content || !frame || !area) return;
+    var images = list('.bg-image');
+    if (!images.length) return;
+    var c = content.getBoundingClientRect(), g = frame.getBoundingClientRect();
+    var pad = parseFloat(getComputedStyle(content).paddingLeft) || 0;
+    var bar = document.querySelector('.bottom-bar');
+    var f = { left: g.left - c.left, top: g.top - c.top, width: g.width, height: g.height };
+    var bottom = bar ? bar.getBoundingClientRect().bottom - c.top : f.top + f.height;
+    var d = { left: 0, top: 0, width: f.left + f.width + pad, height: bottom + pad };
+    images.forEach(function(el) {
+      var v = JSON.parse(el.getAttribute('data-bg'));
+      var s = el.style;
+      var pic = v.color || !v.resolvedSrc ? null : bgPicture(v.resolvedSrc);
+      var ready = v.width !== null && v.height !== null && v.transparency !== null && v.placement && v.alignment && (v.color || (pic && pic.w));
+      s.display = ready ? '' : 'none';
+      if (!ready) return;
+      var a = v.placement === 'FRAME' ? f : d;
+      ['left', 'top', 'width', 'height'].forEach(function(k) { s[k] = a[k] + 'px'; });
+      // The dialog with the frame cut out of it
+      var r = f.left + f.width, b = f.top + f.height;
+      s.clipPath = v.placement === 'NOTFRAME' ? 'path(evenodd, "M0 0H' + d.width + 'V' + d.height + 'H0ZM' + f.left + ' ' + f.top + 'H' + r + 'V' + b + 'H' + f.left + 'Z")' : '';
+      s.opacity = String(1 - Math.max(0, Math.min(255, v.transparency)) / 255);
+      var src = pic && v.mode & 128 ? keyedSrc(pic, v.resolvedSrc) : v.resolvedSrc;
+      var color = v.color ? 'rgb(' + v.color.join(',') + ')' : '';
+      var drawn = v.color ? 'linear-gradient(' + color + ',' + color + ')' : 'url("' + src + '")';
+      if (s.backgroundImage !== drawn) s.backgroundImage = drawn;
+      function length(value, full, own) {
+        return (value < 0 || (value === 0 && v.color) ? full : (value || own) * currentZoom) + 'px';
+      }
+      s.backgroundSize = length(v.width, a.width, pic ? pic.w : 0) + ' ' + length(v.height, a.height, pic ? pic.h : 0);
+      var tiled = v.alignment === 'TILED';
+      s.backgroundRepeat = tiled ? 'repeat' : 'no-repeat';
+      var m = /^(TOP|MID|BOTTOM)(LEFT|MID|RIGHT)$/.exec(v.alignment);
+      s.backgroundPosition = tiled ? 'left top' : (m[2] === 'MID' ? 'center' : m[2].toLowerCase()) + ' ' + (m[1] === 'MID' ? 'center' : m[1].toLowerCase());
+    });
+  }
+
+  function setupBackgrounds() {
+    window.__frmLayoutBackgrounds = layoutBackgrounds;
+    if (window.__frmBgObserver) window.__frmBgObserver.disconnect();
+    window.__frmBgObserver = new ResizeObserver(layoutBackgrounds);
+    list('.content, #gridFrame > .grid, .bottom-bar').forEach(function(el) { window.__frmBgObserver.observe(el); });
+    layoutBackgrounds();
   }
 
   // ---- Adding elements ----------------------------------------------------------------------------
@@ -3173,7 +3455,7 @@ window.__frmMain = function(D) {
 
   // Keys that only work on elements leave selected rows alone
   function noticeRows() {
-    if (selectedRows.length) showNotice('Selected triggers and hidden fields not changed');
+    if (selectedRows.length) showNotice('Selected triggers, hidden fields and backgrounds not changed');
   }
 
   function deleteElements(els, rows, command) {
@@ -3253,7 +3535,11 @@ window.__frmMain = function(D) {
       });
       row.addEventListener('dblclick', function(e) {
         if (tabOrderMode || e.ctrlKey || e.metaKey || e.shiftKey || e.target.closest('.trigger-actions')) return;
-        if (!isTriggerRow(row)) showHiddenFieldInSource(elementIndexOf(row));
+        if (row.classList.contains('bg-item')) {
+          if (!isLocked(row) && vscodeApi && vscodeApi.postMessage) {
+            vscodeApi.postMessage({ command: 'showInSource', elementType: 'bgimage', elementIndex: elementIndexOf(row) });
+          }
+        } else if (!isTriggerRow(row)) showHiddenFieldInSource(elementIndexOf(row));
         else if (vscodeApi && vscodeApi.postMessage) {
           vscodeApi.postMessage({ command: 'showInSource', elementType: 'trigger', line: Number(row.getAttribute('data-trigger-line')) });
         }
@@ -3270,12 +3556,13 @@ window.__frmMain = function(D) {
   // The form element for a key; visual = its row in the Hidden Fields panel or its bottom-bar button instead
   function findByKey(key, visual) {
     var parts = key.split(':');
-    var cls = { text: 'text', field: 'field', pushbutton: 'push', image: 'image', preview: 'preview' }[parts[0]];
+    var cls = { text: 'text', field: 'field', pushbutton: 'push', image: 'image', preview: 'preview', bgimage: 'bgimage' }[parts[0]];
     if (!cls) return null;
     var attr = 'data-' + cls + '-idx';
     var idx = parts[1] === 'no-idx' ? ':not([' + attr + '])' : '[' + attr + '="' + parts[1] + '"]';
     if (!visual) return document.querySelector('.grid > .' + cls + '.draggable' + idx);
     if (parts[0] === 'field') return document.querySelector('.hidden-field-item' + idx);
+    if (parts[0] === 'bgimage') return document.querySelector('.bg-item' + idx);
     if (parts[0] === 'pushbutton') return document.querySelector('.bottom-bar-button' + idx);
     return null;
   }
@@ -4700,7 +4987,7 @@ window.__frmMain = function(D) {
   function elementIndexOf(el) {
     var attr = {
       text: 'data-text-idx', field: 'data-field-idx', pushbutton: 'data-push-idx',
-      image: 'data-image-idx', preview: 'data-preview-idx'
+      image: 'data-image-idx', preview: 'data-preview-idx', bgimage: 'data-bgimage-idx'
     }[el.getAttribute('data-type')];
     var n = attr ? parseInt(el.getAttribute(attr), 10) : NaN;
     return isFinite(n) ? n : null;
@@ -4723,12 +5010,15 @@ window.__frmMain = function(D) {
   // A group: below itself, or as far down as fits.
   function duplicateSelected() {
     if (tabOrderMode || !vscodeApi || !vscodeApi.postMessage || groupKeysBlocked()) return;
-    noticeRows();
+    var backgrounds = actionRows().filter(function(row) { return row.classList.contains('bg-item'); });
+    if (backgrounds.length < selectedRows.length) showNotice('Selected triggers and hidden fields not changed');
     var els = actionTargets();
-    if (!els.length) return;
+    if (!els.length && !backgrounds.length) return;
     var rowOf = function(el) { return parseInt(el.getAttribute('data-row'), 10); };
     var down;
-    if (els.length === 1) {
+    if (!els.length) {
+      down = 0;
+    } else if (els.length === 1) {
       down = rowOf(els[0]) + rowSpanOfElement(els[0]) <= gridRows ? 1 : 0;
     } else {
       var top = Math.min.apply(null, els.map(rowOf));
@@ -4738,8 +5028,9 @@ window.__frmMain = function(D) {
     noticeOtherTabs(els.length + ' duplicated');
     vscodeApi.postMessage({
       command: 'duplicateElements',
-      elements: els.map(function(el) { return Object.assign(elementRef(el), { row: rowOf(el) + down }); }),
-      primary: elementRef(els.indexOf(selectedElement) >= 0 ? selectedElement : els[els.length - 1])
+      elements: els.map(function(el) { return Object.assign(elementRef(el), { row: rowOf(el) + down }); })
+        .concat(backgrounds.map(function(row) { return Object.assign(elementRef(row), { row: 1 }); })),
+      primary: els.length ? elementRef(els.indexOf(selectedElement) >= 0 ? selectedElement : els[els.length - 1]) : undefined
     });
   }
 
@@ -4861,6 +5152,13 @@ window.__frmMain = function(D) {
       consumeKey(e);
       return;
     }
+    if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length === 1 && !selectedElements.length &&
+        selectedRows[0].classList.contains('bg-item') && !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON')) {
+      if (isLocked(selectedRows[0])) showNotice('A background without an index can\'t be edited here');
+      else openBackgroundModal(selectedRows[0]);
+      consumeKey(e);
+      return;
+    }
     if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length &&
         !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
       showNotice(selectedElements.length + selectedRows.length > 1 ? 'Several selected: select one element to edit' : 'Triggers and hidden fields can\'t be edited with this key');
@@ -4898,9 +5196,10 @@ window.__frmMain = function(D) {
     window.addEventListener('message', function(ev) {
       var msg = ev.data;
       if (msg && msg.command === 'frmSelectAfterRefresh' && Array.isArray(msg.keys)) {
+        var isRow = function(key) { return /^bgimage:/.test(key); };
         pendingSelection = {
-          keys: msg.keys, primary: msg.primary, visual: [], triggers: [],
-          rows: (msg.hiddenFields || []).map(function(index) { return 'field:' + index; }), triggerLines: msg.triggerLines || []
+          keys: msg.keys.filter(function(key) { return !isRow(key); }), primary: isRow(msg.primary || '') ? null : msg.primary, visual: [], triggers: [],
+          rows: (msg.hiddenFields || []).map(function(index) { return 'field:' + index; }).concat(msg.keys.filter(isRow)), triggerLines: msg.triggerLines || []
         };
       }
       if (msg && msg.command === 'frmNotice' && typeof msg.text === 'string') showNotice(msg.text, 5000);
@@ -4935,6 +5234,7 @@ window.__frmMain = function(D) {
   setupElementResize();
   setupBoxResize();
   setupContextMenu();
+  setupBackgrounds();
   setupDragAndDrop();
   setupMarquee(); // first, so its click handler can stop the one that deselects
   setupKeyboardNavigation();

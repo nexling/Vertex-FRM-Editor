@@ -32,7 +32,7 @@ export interface ElementSelection {
   primaryTrigger: number | null;
 }
 
-const DEFINITION = /^\s*(text|field|pushbutton|button|image|preview)\s*\(\s*(\d+)\s*\)\s*=/i;
+const DEFINITION = /^\s*(text|field|pushbutton|button|image|bgimage|preview)\s*\(\s*(\d+)\s*\)\s*=/i;
 const TRIGGER = /^\s*trigger\s*=\s*(\$?\w+)/i;
 
 /** True if a logical FRM statement continues onto the next line. */

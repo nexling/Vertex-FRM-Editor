@@ -11,8 +11,8 @@ const CONVERT_COMMAND = 'vertexFrmPreview.convertPushbuttons';
 const CONVERT_TITLE = 'Convert all pushbuttons to buttons';
 const DIAGNOSTICS_DELAY_MS = 250;
 
-export function registerLanguageFeatures(context: vscode.ExtensionContext): void {
-  registerDiagnostics(context);
+export function registerLanguageFeatures(context: vscode.ExtensionContext, imageExists: (file: string) => boolean | undefined): void {
+  registerDiagnostics(context, imageExists);
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(SELECTOR, {
       provideCompletionItems(doc, position) {
@@ -133,7 +133,7 @@ async function replaceLines(doc: vscode.TextDocument, before: string[], after: s
   return true;
 }
 
-function registerDiagnostics(context: vscode.ExtensionContext): void {
+function registerDiagnostics(context: vscode.ExtensionContext, imageExists: (file: string) => boolean | undefined): void {
   const collection = vscode.languages.createDiagnosticCollection(LANGUAGE);
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   const severities = {
@@ -154,7 +154,7 @@ function registerDiagnostics(context: vscode.ExtensionContext): void {
       collection.delete(doc.uri);
       return;
     }
-    collection.set(doc.uri, findProblems(splitLines(doc.getText())).map(p => {
+    collection.set(doc.uri, findProblems(splitLines(doc.getText()), imageExists).map(p => {
       const first = doc.lineAt(p.startLine);
       const range = new vscode.Range(
         p.startLine, first.firstNonWhitespaceCharacterIndex, p.endLine, doc.lineAt(p.endLine).text.trimEnd().length);

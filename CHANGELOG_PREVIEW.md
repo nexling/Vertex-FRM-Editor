@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-25
+
+### Added
+
+- Backgrounds (`bgimage`): pictures and `RGB(...)` colours are drawn behind the form with their size, transparency, placement, alignment and tabs (`opt_bgimage`).
+- A Backgrounds panel to add, edit, duplicate, copy, cut, paste and delete them. Double-click shows the line in the source.
+- Completion, hover and problem checks for `bgimage`.
+- `$DIR_...` and full paths are found, for images as well as backgrounds.
+
+### Changed
+
+- A `bgimage` in no `opt_bgimage` list is no longer reported: it is shown on every tab.
+
 ## 2026-11-24
 
 ### Added

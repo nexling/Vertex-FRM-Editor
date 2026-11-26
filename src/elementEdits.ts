@@ -1,5 +1,6 @@
 // Adds, moves, deletes and duplicates form elements in the lines of an FRM file. No VS Code dependency.
 
+import { insertBackground } from './backgrounds';
 import { findElement, findElementStatements } from './elementLookup';
 import {
   Section, collectContinuedStatement, formatIndexStatement, insertIntoSection, parseIndexList,
@@ -20,6 +21,7 @@ export const SECTION_OF: Record<string, Section> = {
   field: Section.Field,
   pushbutton: Section.Button,
   image: Section.Image,
+  bgimage: Section.Image, // see insertBackground
   preview: Section.Preview,
 };
 
@@ -53,6 +55,7 @@ export function revisionOf(lines: string[]): number | undefined {
 
 /** The text up to the row number of an element's statement (1), the row (2), the space (3) and the column (4). */
 export function matchPosition(line: string, type: string): RegExpMatchArray | null {
+  if (type === 'bgimage') return null; // starts with its size
   // field(n)= NAME type row col ...; NAME is plain, quoted or in angle brackets. The others start with row col.
   return line.match(type === 'field'
     ? /^(\s*field\s*\(\s*\d+\s*\)\s*=\s*(?:"[^"]+"|<[^>]+>|[\w$]+)\s+[\d+]+\s+)(\d+)(\s+)(\d+)/i
@@ -77,14 +80,15 @@ export function moveElements(source: string[], moves: ElementMove[]): { lines: s
 }
 
 /** Change the index list of every opt_* statement of an element type. Lists that become empty are removed. */
-function updateOptLists(lines: string[], type: string, change: (list: number[]) => number[] | undefined): void {
+export function updateOptLists(lines: string[], type: string, change: (list: number[], tabId: number) => number[] | undefined): void {
   // opt_button is a synonym for opt_pushbutton
   const typeName = type === 'pushbutton' ? '(?:pushbutton|button)' : type;
-  const pattern = new RegExp(`^\\s*opt_${typeName}\\s*\\(\\s*\\d+\\s*\\)\\s*=`, 'i');
+  const pattern = new RegExp(`^\\s*opt_${typeName}\\s*\\(\\s*(\\d+)\\s*\\)\\s*=`, 'i');
   for (let i = 0; i < lines.length; i++) {
-    if (!pattern.test(lines[i])) continue;
+    const m = lines[i].match(pattern);
+    if (!m) continue;
     const collected = collectContinuedStatement(lines, i);
-    const list = change(parseIndexList(statementValue(collected.text)));
+    const list = change(parseIndexList(statementValue(collected.text)), Number(m[1]));
     if (!list) continue;
     const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
     const newLines = list.length ? formatIndexStatement(statementKeyword(lines[i]), list, wrapAt) : [];
@@ -159,14 +163,15 @@ export function duplicateElements(source: string[], items: ElementCopy[]): { lin
     if (!item) continue;
     const statement = source.slice(s.startLine, s.endLine + 1);
     // The row is the first number after '=', except for fields: field(n)= NAME type row col ...
-    const m = statement[0].match(s.type === 'field'
+    const m = statement[0].match(s.type === 'bgimage' ? /^(\s*\w+\s*\(\s*)\d+(\s*\)\s*=\s*)/ : s.type === 'field'
       ? /^(\s*\w+\s*\(\s*)\d+(\s*\)\s*=\s*(?:"[^"]+"|\S+)\s+\S+\s+)\d+/
       : /^(\s*\w+\s*\(\s*)\d+(\s*\)\s*=\s*)\d+/);
     if (!m) continue;
     wanted.delete(keyOf(s)); // the first definition only, if an index is used twice
     const index = nextIndex[s.type]++;
-    statement[0] = m[1] + index + m[2] + item.row + statement[0].slice(m[0].length);
-    insertIntoSection(lines, SECTION_OF[s.type], statement);
+    statement[0] = m[1] + index + m[2] + (s.type === 'bgimage' ? '' : item.row) + statement[0].slice(m[0].length);
+    if (s.type === 'bgimage') insertBackground(lines, statement);
+    else insertIntoSection(lines, SECTION_OF[s.type], statement);
     if (s.type === 'field') addFieldToGroup1(lines, index, revision);
     updateOptLists(lines, s.type, list =>
       list.includes(s.index) && !list.includes(index) ? [...list, index].sort((a, b) => a - b) : undefined);
@@ -265,7 +270,7 @@ function elementLine(lines: string[], index: number, msg: ElementContent, winsty
 /** Add an element under the next free index, in its section, in group(1) (fields) and on the active tab. */
 export function addElement(source: string[], msg: NewElement, winstyle?: string): { lines: string[]; key: string } | undefined {
   const type = msg.elementType;
-  if (!Object.keys(SECTION_OF).includes(type) || !isInt(msg.row, 1) || !isInt(msg.col, 1)) return undefined;
+  if (!Object.keys(SECTION_OF).includes(type) || type === 'bgimage' || !isInt(msg.row, 1) || !isInt(msg.col, 1)) return undefined;
   const lines = [...source];
   const index = findElementStatements(source).reduce((next, s) => s.type === type ? Math.max(next, s.index + 1) : next, 1);
   const line = elementLine(lines, index, msg, winstyle);

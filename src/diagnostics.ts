@@ -1,4 +1,5 @@
 // Checks an FRM file for problems. No VS Code dependency.
+import { backgroundProblems } from './backgrounds';
 import {
   buttonSpellings, firstLineValue, groupFixedValues, ItemKind, itemPosition, itemsOf, optListKind,
   parseStatements, referenceTokens, Statement,
@@ -29,7 +30,8 @@ function describe(s: Statement): string {
   return `${s.keyword[0].toUpperCase()}${s.keyword.slice(1)}(${s.index})`;
 }
 
-export function findProblems(lines: string[]): Problem[] {
+/** imageExists: whether an image file can be found; undefined when that isn't known. */
+export function findProblems(lines: string[], imageExists?: (file: string) => boolean | undefined): Problem[] {
   const problems: Problem[] = [];
   const report = (s: Statement, severity: Problem['severity'], message: string, code?: string) =>
     problems.push({ startLine: s.startLine, endLine: s.endLine, severity, message, code });
@@ -41,6 +43,10 @@ export function findProblems(lines: string[]): Problem[] {
   for (const s of statements) {
     const check = HEADER_CHECKS[s.keyword];
     if (check && !check.value.test(firstLineValue(lines, s))) report(s, 'error', check.message);
+  }
+
+  for (const s of itemsOf(statements, 'bgimage')) {
+    for (const p of backgroundProblems(lines, s, imageExists)) report(s, p.severity, p.message);
   }
 
   for (const kind of KINDS) {
@@ -76,7 +82,8 @@ export function findProblems(lines: string[]): Problem[] {
 
     // Items on no tab, once the form has any tab list of that kind
     const onTabs = new Set(statements.filter(s => optListKind(s.keyword) === kind).flatMap(s => references(s, kind)));
-    if (onTabs.size) {
+    // Backgrounds are normally on every tab
+    if (onTabs.size && kind !== 'bgimage') {
       for (const s of indexed) {
         if (onTabs.has(s.index!)) continue;
         const pos = itemPosition(lines, s);

@@ -13,6 +13,7 @@ import {
   isCommentLine, isSeparatorLine, parseIndexList, statementKeyword, statementValue, wrapWidthFromFirstLine
 } from './frmSections';
 import { newButtonKeyword } from './frmStatements';
+import { ALIGNMENTS, Background, BackgroundEdit, addBackground, editBackground, findBackgrounds, imageCandidates, isTif, parseColor, validTabs } from './backgrounds';
 import { convertButtons, registerLanguageFeatures, usesMixedButtons } from './languageFeatures';
 
 // The extension's install folder; the preview page's styles and script are in its media/ folder
@@ -55,7 +56,11 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('vertexFrmPreview.zoomReset', () => sendPreviewZoom('reset')),
     vscode.commands.registerCommand('vertexFrmPreview.zoomFit', () => sendPreviewZoom('fit')),
   );
-  registerLanguageFeatures(context);
+  registerLanguageFeatures(context, file => {
+    const bases = imageBases();
+    // Without a Vertex folder around it, nothing is known about the form's images
+    return bases.some(b => fs.existsSync(b)) ? !!findImage(file, bases) : undefined;
+  });
 
   // Auto-open / auto-reveal when a vertex-frm file is focused (each controlled by a setting)
   const onFocusEditor = (ed: vscode.TextEditor | undefined) => {
@@ -229,7 +234,10 @@ interface MoveElementsMessage { moves: ElementMove[]; alreadyDrawn?: boolean; }
 
 interface DuplicateElementsMessage { elements: ElementCopy[]; primary?: ElementRef; }
 
-interface EditElementMessage extends ElementContent { elementIndex: number; }
+/** What the preview sends for a bgimage; tabIds is 'all' or the tabs it is on. */
+interface BackgroundMessage { background?: BackgroundEdit; tabIds?: unknown; }
+
+interface EditElementMessage extends ElementContent, BackgroundMessage { elementIndex: number; }
 
 interface MoveElementMessage extends ElementRefMessage { targetTabIds: 'all' | number[]; }
 
@@ -378,7 +386,8 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
       customRoot = vscode.workspace.workspaceFolders?.find(wf => wf.name.toLowerCase().startsWith('custom'));
       customImg = customRoot ? vscode.Uri.file(path.join(customRoot.uri.fsPath, 'forms', 'images')) : vscode.Uri.file(path.join(repoRoot.uri.fsPath, 'custom', 'forms', 'images'));
       systemImg = vscode.Uri.file(path.join(repoRoot.uri.fsPath, 'system', 'forms', 'images'));
-      roots.push(customImg, systemImg);
+      // $DIR paths reach other folders than forms/images
+      roots.push(...imageBases().map(b => vscode.Uri.file(b)));
     }
     const openStart = Date.now();
     panel = vscode.window.createWebviewPanel(
@@ -684,10 +693,12 @@ function handleDuplicateElements(doc: vscode.TextDocument, panel: vscode.Webview
 }
 
 /** Add an element. The preview is told up front to select it once it re-renders. */
-function handleAddElement(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: NewElement) {
+function handleAddElement(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: NewElement & BackgroundMessage) {
   queueEdit(doc, async () => {
     const text = doc.getText();
-    const added = addElement(text.split(/\r?\n/), msg, parseFrm(text).winstyle);
+    const added = msg.elementType === 'bgimage'
+      ? addBackground(text.split(/\r?\n/), msg.background ?? {}, validTabs(msg.tabIds))
+      : addElement(text.split(/\r?\n/), msg, parseFrm(text).winstyle);
     if (!added) {
       vscode.window.showErrorMessage(`Failed to add ${msg.elementType}`);
       return;
@@ -927,6 +938,21 @@ function handleSetTextBox(doc: vscode.TextDocument, msg: TextBoxMessage) {
   }
 }
 
+function handleEditBackground(doc: vscode.TextDocument, msg: EditElementMessage) {
+  const index = msg.elementIndex;
+  queueEdit(doc, async () => {
+    const lines = doc.getText().split(/\r?\n/);
+    const edited = editBackground(lines, index, msg.background ?? {}, validTabs(msg.tabIds));
+    if (!edited) {
+      vscode.window.showErrorMessage(`Could not edit bgimage(${index})`);
+      return;
+    }
+    if (edited.join('\n') === lines.join('\n')) return;
+    if (await replaceLines(doc, edited)) vscode.window.showInformationMessage(`Updated bgimage(${index})`);
+    else vscode.window.showErrorMessage(`Failed to update bgimage(${index})`);
+  });
+}
+
 function handleEditImage(doc: vscode.TextDocument, msg: EditElementMessage) {
   const index = msg.elementIndex;
   const edit: ImageEdit = { index, rows: msg.rows, cols: msg.cols, mode: msg.mode, file: msg.file };
@@ -946,6 +972,10 @@ function handleEditImage(doc: vscode.TextDocument, msg: EditElementMessage) {
 function handleEditElement(doc: vscode.TextDocument, msg: EditElementMessage) {
   if (msg.elementType === 'image') {
     handleEditImage(doc, msg);
+    return;
+  }
+  if (msg.elementType === 'bgimage') {
+    handleEditBackground(doc, msg);
     return;
   }
   try {
@@ -1440,6 +1470,9 @@ function updateWebview(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
       img.resolvedSrc = resolveImageSrc(panel.webview, img.file);
     }
   }
+  for (const bg of model.backgrounds) {
+    if (bg.file && !parseColor(bg.file) && !isTif(bg.file)) bg.resolvedSrc = resolveImageSrc(panel.webview, bg.file);
+  }
   const initialZoom = zoomByDoc.get(doc.uri.toString()) ?? 1;
   const initialTab = activeTabByDoc.get(doc.uri.toString());
   const initialGridOn = gridOnByDoc.get(doc.uri.toString());
@@ -1583,6 +1616,7 @@ interface FrmModel {
   pushbuttons: FrmPushButton[];
   boxes: FrmBox[];
   images: FrmImage[];
+  backgrounds: Array<Background & { resolvedSrc?: string }>; // lowest index first
   previews: FrmPreview[];
   triggers: FrmTrigger[];
   tabOrder?: number[]; // field indexes in tab order sequence
@@ -1592,6 +1626,7 @@ interface FrmModel {
   tabFields?: Record<number, number[]>; // tab id -> field indexes
   tabPushButtons?: Record<number, number[]>; // tab id -> pushbutton indexes
   tabImages?: Record<number, number[]>; // tab id -> image indexes
+  tabBackgrounds?: Record<number, number[]>; // tab id -> bgimage indexes
   tabPreviews?: Record<number, number[]>; // tab id -> preview indexes
 }
 
@@ -2012,6 +2047,13 @@ function parseFrm(src: string): FrmModel {
     tabImages[id].push(...list);
   }
 
+  // opt_bgimage(n)= list of bgimage indexes
+  const tabBackgrounds: Record<number, number[]> = {};
+  for (const ob of continued.matchAll(/^\s*opt_bgimage\s*\(\s*(\d+)\s*\)\s*=\s*([^\n]*)/gim)) {
+    (tabBackgrounds[Number(ob[1])] ??= []).push(...parseIndexList(ob[2]));
+  }
+  const backgrounds = findBackgrounds(text.split(/\r?\n/)).sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+
   // opt_preview(n)= list of preview indexes
   const optPreviewRegex = /^\s*opt_preview\s*\(\s*(\d+)\s*\)\s*=\s*([^\n]*)/gim;
   let opr: RegExpExecArray | null;
@@ -2066,7 +2108,7 @@ function parseFrm(src: string): FrmModel {
     Object.keys(tabPreviews).forEach(k => { tabPreviews[Number(k)] = uniqueNums(tabPreviews[Number(k)]); });
   }
 
-  return { title, rows, cols, portRows: requestedRows, portCols: requestedCols, winstyle, revision, texts, fields, pushbuttons, boxes, images, previews, triggers, tabOrder, tabs: sortedTabs, tabTexts: sortedTabs ? tabTexts : undefined, tabFields: sortedTabs ? tabFields : undefined, tabPushButtons: sortedTabs ? tabPushButtons : undefined, tabImages: sortedTabs ? tabImages : undefined, tabPreviews: sortedTabs ? tabPreviews : undefined };
+  return { title, rows, cols, portRows: requestedRows, portCols: requestedCols, winstyle, revision, texts, fields, pushbuttons, boxes, images, backgrounds, previews, triggers, tabOrder, tabs: sortedTabs, tabBackgrounds: sortedTabs ? tabBackgrounds : undefined, tabTexts: sortedTabs ? tabTexts : undefined, tabFields: sortedTabs ? tabFields : undefined, tabPushButtons: sortedTabs ? tabPushButtons : undefined, tabImages: sortedTabs ? tabImages : undefined, tabPreviews: sortedTabs ? tabPreviews : undefined };
 }
 
 // Translation support: load system/programs64/userprompt1.xml and resolve VXID keys
@@ -2097,8 +2139,20 @@ function getRepoRootFolder(): vscode.WorkspaceFolder | undefined {
   return { uri: vscode.Uri.file(parts.join(path.sep)), name: wf0.name, index: wf0.index } as vscode.WorkspaceFolder;
 }
 
-// Resolve an image file name to a webview-safe URI string, searching
-// <root>/custom/forms/images and then <root>/system/forms/images
+/** The custom and system folders, which hold forms/images and the folders of $DIR paths. */
+function imageBases(): string[] {
+  const dirs = getFormsDirs();
+  return dirs ? [path.dirname(dirs.custom), path.dirname(dirs.system)] : [];
+}
+
+function findImage(fileName: string, bases: string[]): string | undefined {
+  return imageCandidates(fileName, bases).find(p => {
+    try { return fs.statSync(p).isFile(); } catch { return false; }
+  });
+}
+
+// Resolve an image file name to a webview-safe URI string: a file in custom/forms/images or
+// system/forms/images, a $DIR path in the custom or system folder, or a full path
 function resolveImageSrc(webview: vscode.Webview, fileName: string): string | undefined {
   try {
     if (!customImg || !systemImg) return undefined;
@@ -2107,19 +2161,25 @@ function resolveImageSrc(webview: vscode.Webview, fileName: string): string | un
     if (imagePathCache.has(cacheKey)) {
       found = imagePathCache.get(cacheKey);
     } else {
-      const candidates = [
-        path.join(customImg.fsPath, fileName),
-        path.join(systemImg.fsPath, fileName)
-      ];
-      found = candidates.find(p => fs.existsSync(p));
-      imagePathCache.set(cacheKey, found);
+      found = findImage(fileName, imageBases());
+      // Only the folders of plain names are watched, so only those can be remembered
+      if (!/[\\/]/.test(fileName)) imagePathCache.set(cacheKey, found);
     }
     if (!found) return undefined;
+    const file = path.resolve(found).toLowerCase();
+    if (!imageBases().some(b => file.startsWith(path.resolve(b).toLowerCase() + path.sep))) return imageDataUri(found);
     const uri = webview.asWebviewUri(vscode.Uri.file(found));
     return uri.toString();
   } catch {
     return undefined;
   }
+}
+
+/** A file outside the folders the page may read, as a data URI. */
+function imageDataUri(file: string): string | undefined {
+  const type = path.extname(file).slice(1).toLowerCase();
+  if (!IMAGE_FILE.test(file) || fs.statSync(file).size > 10 * 1024 * 1024) return undefined;
+  return `data:image/${type === 'jpg' ? 'jpeg' : type};base64,${fs.readFileSync(file).toString('base64')}`;
 }
 
 const IMAGE_FILE = /\.(bmp|jpe?g|tiff?|gif|png)$/i;
@@ -2387,7 +2447,7 @@ function recordUsedAssets(key: string, model: FrmModel): void {
       if (name !== undefined) fieldValues.add(name.toLowerCase());
     }
   }
-  const images = new Set((model.images || []).map(img => img.file.toLowerCase()));
+  const images = new Set([...model.images, ...model.backgrounds].map(img => (img.file ?? '').toLowerCase()));
   usedAssetsByDoc.set(key, { fieldValues, images });
 }
 
@@ -2667,6 +2727,7 @@ interface PreviewData {
   tabFields: Record<number, number[]>;
   tabPushButtons: Record<number, number[]>;
   tabImages: Record<number, number[]>;
+  tabBackgrounds: Record<number, number[]>;
   tabPreviews: Record<number, number[]>;
   rows: number;
   cols: number;
@@ -2907,6 +2968,28 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     </div>`;
   }).join('\n');
 
+  // Drawn by the page (layoutBackgrounds), which knows the areas' sizes
+  const bgData = (bg: FrmModel['backgrounds'][number]) => {
+    const color = parseColor(bg.file);
+    return { ...bg, resolvedSrc: bg.resolvedSrc, color: color && color.every(c => c <= 255) ? color : null };
+  };
+  const backgroundsHtml = model.backgrounds.map(bg =>
+    `<div class="bg-image" data-bg="${escapeAttr(JSON.stringify(bgData(bg)))}"></div>`).join('');
+  const backgroundRows = model.backgrounds.map(bg => {
+    const data = bgData(bg);
+    const thumb = data.color ? `<span class="bg-thumb" style="background:rgb(${data.color.join(',')})"></span>`
+      : bg.resolvedSrc ? `<img class="bg-thumb" src="${escapeAttr(bg.resolvedSrc)}" alt="" />` : '<span class="bg-thumb">?</span>';
+    const name = bg.file ?? 'expression';
+    return `
+    <div class="trigger-item bg-item" data-type="bgimage"${bg.index != null ? ` data-bgimage-idx="${bg.index}"` : ' data-no-index="1"'} data-bg="${escapeAttr(JSON.stringify(data))}" title="${escapeAttr(name)}&#10;Double-click to show in source, right-click for more">
+      ${thumb}
+      <div class="bg-text">
+        <div class="trigger-target">${bg.index != null ? `Background ${bg.index}` : 'Background without index'} - ${escapeHtml(bg.placement ?? '?')}</div>
+        <div class="trigger-program">${escapeHtml(name)}</div>
+      </div>
+    </div>`;
+  }).join('');
+
   const body = `
     ${unindexedMsg ? `<div class="unindexed-strip">
       <span class="msg">${escapeHtml(unindexedMsg.title)}<span class="detail">${escapeHtml(unindexedMsg.detail)}</span></span>
@@ -2944,7 +3027,8 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
           <button class="ctrl close" title="Close">✕</button>
         </div>
       </div>
-      <div class="content">
+      <div class="content${model.backgrounds.length ? ' has-backgrounds' : ''}">
+        <div class="bg-layer">${backgroundsHtml}</div>
         ${model.tabs && model.tabs.length ? `
         <div class="tabs" id="tabs">
           ${model.tabs.map((t,i) => `<div class="tab${i===0?' active':''}" data-tab-id="${t.id}" title="${escapeHtml(t.label)}">${escapeHtml(t.label.replace(/_/g, ' '))}</div>`).join('')}
@@ -2981,6 +3065,13 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
                 <button class="add-trigger-btn" onclick="addNewTrigger()">+ Add</button>
               </h4>
               ${triggersHtml || '<div class="sidebar-empty">No triggers.</div>'}
+            </div>
+            <div class="triggers-panel" id="backgroundsPanel">
+              <h4>
+                Backgrounds
+                <button class="add-trigger-btn" id="addBackgroundBtn">+ Add</button>
+              </h4>
+              ${backgroundRows || '<div class="sidebar-empty">No backgrounds.</div>'}
             </div>
             <div class="triggers-panel" id="hiddenFieldsPanel">
               <h4>Hidden Fields (${hiddenFields.length})</h4>
@@ -3444,13 +3535,88 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
       </div>
     </div>
 
+    <!-- Background Dialog -->
+    <div id="bgModal" class="modal-overlay hidden">
+      <div class="modal">
+        <h3 id="bgModalTitle">Add Background</h3>
+        <div class="modal-form">
+          <div class="modal-field" id="bgKinds">
+            <div class="bg-options">
+              <label><input type="radio" name="bgKind" value="picture" /> Picture</label>
+              <label><input type="radio" name="bgKind" value="color" /> Colour</label>
+            </div>
+          </div>
+          <div class="modal-field bg-picture">
+            <label for="bgFile">File</label>
+            <input type="text" id="bgFile" placeholder="Search, or type a name such as logo.png" autocomplete="off" spellcheck="false" />
+            <div id="bgList" class="image-list" role="listbox" aria-label="Images"></div>
+            <small id="bgHint" class="fv-hint"></small>
+          </div>
+          <div class="modal-field bg-color">
+            <label for="bgColor">Colour</label>
+            <input type="color" id="bgColor" />
+          </div>
+          ${['Width', 'Height'].map(side => `
+          <div class="modal-field bg-picture" data-bg-part="${side.toLowerCase()}">
+            <label for="bg${side}">${side}</label>
+            <div class="bg-size">
+              <select id="bg${side}">
+                <option value="-1">Stretch</option>
+                <option value="0">Original size</option>
+                <option value="px">Pixels</option>
+              </select>
+              <input type="number" id="bg${side}Px" min="1" value="200" aria-label="${side} in pixels" />
+            </div>
+          </div>`).join('')}
+          <div class="modal-field" data-bg-part="transparency">
+            <label for="bgTransparency">Transparency <span id="bgTransparencyLabel"></span></label>
+            <input type="range" id="bgTransparency" min="0" max="255" step="1" />
+          </div>
+          <div class="modal-field bg-picture" data-bg-part="mode">
+            <label>Mode</label>
+            <div id="bgModes" class="image-modes">
+              <label><input type="checkbox" value="64" /> Transparent by alpha channel</label>
+              <label><input type="checkbox" value="128" /> Transparent by top left corner's colour</label>
+            </div>
+          </div>
+          <div class="modal-field" data-bg-part="placement">
+            <label for="bgPlacement">Placement</label>
+            <select id="bgPlacement">
+              <option value="FRAME">Inside the frame (FRAME)</option>
+              <option value="NOTFRAME">Outside the frame (NOTFRAME)</option>
+              <option value="DIALOG">Whole dialog (DIALOG)</option>
+            </select>
+          </div>
+          <div class="modal-field bg-picture" data-bg-part="alignment">
+            <label>Alignment</label>
+            <div id="bgAlignment" class="bg-alignment">
+              ${ALIGNMENTS.map(a => `<label title="${a}"><input type="radio" name="bgAlign" value="${a}" aria-label="${a}" />${a === 'TILED' ? ' Tiled' : ''}</label>`).join('')}
+            </div>
+          </div>
+          ${model.tabs && model.tabs.length ? `
+          <div class="modal-field">
+            <label>Tabs</label>
+            <div id="bgTabs" class="image-modes">
+              <label><input type="checkbox" id="bgAllTabs" /> All tabs</label>
+              ${model.tabs.map(t => `<label><input type="checkbox" class="bg-tab" value="${t.id}" /> ${escapeHtml(t.label.replace(/_/g, ' '))}</label>`).join('')}
+            </div>
+          </div>` : ''}
+          <small id="bgKept" class="fv-hint"></small>
+          <div class="modal-buttons">
+            <button class="modal-button" data-action="cancel">Cancel</button>
+            <button class="modal-button primary" data-action="confirm-background">Confirm</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Keyboard Shortcuts -->
     <div id="shortcutsModal" class="modal-overlay hidden">
       <div class="modal shortcuts-modal">
         <h3>Keyboard Shortcuts</h3>
         <div class="shortcuts-grid">
           <h4>Selecting</h4>
-          <span><kbd data-kbd-mod>Ctrl</kbd>+click / <kbd>Shift</kbd>+click</span><span>Add to or remove from the selection (also triggers and hidden fields)</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+click / <kbd>Shift</kbd>+click</span><span>Add to or remove from the selection (also triggers, hidden fields and backgrounds)</span>
           <span>Drag on empty space</span><span>Select everything inside the box (with <kbd data-kbd-mod>Ctrl</kbd> or <kbd>Shift</kbd>: add)</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>A</kbd></span><span>Select all on this tab</span>
           <h4>Selected elements</h4>
@@ -3458,7 +3624,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
           <span><kbd>Shift</kbd>+<kbd>Arrow</kbd></span><span>Stretch (one field, image or preview)</span>
           <span><kbd>F2</kbd> / <kbd>Enter</kbd></span><span>Edit (one element)</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>D</kbd></span><span>Duplicate one row below (several: below the group)</span>
-          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>C</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>X</kbd></span><span>Copy / cut, also selected triggers and hidden fields</span>
+          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>C</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>X</kbd></span><span>Copy / cut, also selected triggers, hidden fields and backgrounds</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>V</kbd></span><span>Paste at the cell under the pointer, in any form (away from the form: at the original place)</span>
           <span><kbd>Del</kbd> / <kbd>Backspace</kbd></span><span>Delete</span>
           <span><kbd>Esc</kbd></span><span>Deselect</span>
@@ -3502,6 +3668,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     tabFields: model.tabFields ?? {},
     tabPushButtons: model.tabPushButtons ?? {},
     tabImages: model.tabImages ?? {},
+    tabBackgrounds: model.tabBackgrounds ?? {},
     tabPreviews: model.tabPreviews ?? {},
     rows: model.rows,
     cols: model.cols,
@@ -3537,7 +3704,7 @@ function renderPreviewPage(webview: vscode.Webview, media: vscode.Uri, parts: Pr
 <html>
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${webview.cspSource}; img-src ${webview.cspSource} https:; script-src 'unsafe-inline' ${webview.cspSource};" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${webview.cspSource}; img-src ${webview.cspSource} https: data:; script-src 'unsafe-inline' ${webview.cspSource};" />
   <script>window.__frmHtmlStart = performance.now();</script>
   <style>
 ${assets.css}

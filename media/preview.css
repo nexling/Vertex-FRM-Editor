@@ -734,4 +734,23 @@ body.tool-dragging.tool-no-drop * { cursor: not-allowed !important; }
 .image-modes { display: grid; gap: 3px; }
 .modal-field .image-modes label { font-weight: normal; display: flex; align-items: center; gap: 6px; }
 .modal-field .image-modes input { padding: 0; }
-#imageModal .modal { max-height: calc(100vh - 16px); overflow-y: auto; box-sizing: border-box; }
+#imageModal .modal, #bgModal .modal { max-height: calc(100vh - 16px); overflow-y: auto; box-sizing: border-box; }
+
+/* Backgrounds: one layer under everything in the window, above its own colour */
+.content { position: relative; isolation: isolate; }
+.bg-layer { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+.bg-image { position: absolute; background-repeat: no-repeat; }
+.has-backgrounds .bottom-bar { background: transparent; }
+.bg-item { display: flex; align-items: center; gap: 8px; }
+.bg-item.code-highlight { outline: 2px dashed var(--vscode-focusBorder, #0078d4); outline-offset: 1px; }
+.bg-thumb { flex: none; width: 28px; height: 24px; object-fit: contain; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(0,0,0,.25); box-sizing: border-box; }
+.bg-text { min-width: 0; }
+.bg-text > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-field .bg-options { display: flex; gap: 16px; }
+.modal-field .bg-options label, .modal-field .bg-alignment label { font-weight: normal; display: flex; align-items: center; gap: 4px; margin: 0; }
+.bg-size { display: flex; gap: 8px; }
+.bg-size > * { flex: 1; min-width: 0; }
+.bg-alignment { display: grid; grid-template-columns: repeat(3, 20px); gap: 2px; width: fit-content; padding: 4px; }
+.bg-alignment label:last-child { grid-column: 1 / -1; width: max-content; }
+#bgColor { padding: 1px; height: 28px; width: 60px; }
+#bgTransparency { padding: 0; }
