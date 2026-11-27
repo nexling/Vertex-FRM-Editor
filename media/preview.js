@@ -5043,14 +5043,19 @@ window.__frmMain = function(D) {
       consumeKey(e);
       return;
     }
-    if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length &&
-        !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
-      showNotice(selectedElements.length + selectedRows.length > 1 ? 'Several selected: select one element to edit' : 'Triggers are edited from their row');
+    var editKey = !mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') &&
+      !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'));
+    // Several selected: the panel edits what they share
+    if (editKey && selectedElements.length + selectedRows.length > 1 && focusPanelInput()) {
       consumeKey(e);
       return;
     }
-    if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedElement &&
-        !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
+    if (editKey && selectedRows.length) {
+      showNotice(selectedElements.length + selectedRows.length > 1 ? 'Triggers can\'t be edited together with other elements' : 'Triggers are edited from their row');
+      consumeKey(e);
+      return;
+    }
+    if (editKey && selectedElement) {
       if (!editKeysBlocked()) openElementEditor(selectedElement);
       consumeKey(e);
     }
@@ -5123,6 +5128,8 @@ window.__frmMain = function(D) {
   var SHOWN_TYPE = { pushbutton: 'button', listview: 'page_listview' };
   var NOUNS = { text: 'text', field: 'field', pushbutton: 'button', image: 'image', preview: 'preview', listview: 'table', bgimage: 'background' };
   var TEXT_KINDS = ['int', 'text', 'lines', 'image', 'range'];
+  // What sets one element apart: shown only while one element is selected
+  var SINGLE_ONLY = ['name', 'nameAngle', 'nameQuoted', 'label', 'content'];
 
   function propsPanel() { return document.getElementById('propsPanel'); }
 
@@ -5194,7 +5201,9 @@ window.__frmMain = function(D) {
       title: single ? (SHOWN_TYPE[ref.type] || ref.type) + '(' + ref.index + ')' : keys.length + ' elements',
       sub: single ? (ref.type === 'field' ? propValues[keys[0]].values.name : '') : countText(keys),
       fields: keys.filter(function(k) { return /^field:/.test(k); }),
-      rows: sharedDefs(keys).map(function(def) { return { def: def, keys: keys }; })
+      rows: sharedDefs(keys).filter(function(def) { return single || SINGLE_ONLY.indexOf(def.key) < 0; }).map(function(def) {
+        return { def: def, keys: keys };
+      })
     };
   }
 
@@ -5422,7 +5431,6 @@ window.__frmMain = function(D) {
     var panel = propsPanel();
     if (!panel || !propsState) return;
     var keys = propsTargets();
-    if (keys.length > 1) keys = []; // one element at a time for now
     var layout = propsLayout(keys);
     var side = panel.closest('.side-panels');
     panel.classList.toggle('hidden', !layout);
@@ -5666,15 +5674,18 @@ window.__frmMain = function(D) {
     } else if (selectedElements.length !== 1 || selectedElement !== element) {
       selectElement(element);
     }
+    if (!focusPanelInput(prop) && isLocked(element)) showNotice('An element without an index can\'t be edited here');
+  }
+
+  // Put the cursor in the panel: in the given property, or the first input. False when the panel is hidden.
+  function focusPanelInput(prop) {
     var panel = propsPanel();
-    if (!panel || panel.classList.contains('hidden')) {
-      if (isLocked(element)) showNotice('An element without an index can\'t be edited here');
-      return;
-    }
+    if (!panel || panel.classList.contains('hidden')) return false;
     var target = prop ? panel.querySelector('[data-prop="' + prop + '"]') : null;
     if (target) target.focus({ preventScroll: false });
     else focusFirstModalInput(panel);
-    if (target || panel.contains(document.activeElement)) document.activeElement.scrollIntoView({ block: 'nearest' });
+    if (panel.contains(document.activeElement)) document.activeElement.scrollIntoView({ block: 'nearest' });
+    return true;
   }
 
   // Initialize drag and drop and keyboard navigation after DOM is ready
