@@ -80,6 +80,8 @@
       return;
     }
     patchAttributes(node, next);
+    // The page script owns what is inside (the Properties panel): an input there keeps its focus and text
+    if (node.hasAttribute('data-keep-children')) return;
     patchChildren(node, next, null);
     // Form controls reset to what the markup says, as freshly created ones would be
     if (node.nodeName === 'INPUT') {
@@ -512,20 +514,29 @@ window.__frmMain = function(D) {
     if (over && thumb) thumb.style.width = Math.max(8, 100 * cols.clientWidth / cols.scrollWidth) + '%';
   }
 
-  // Clicking a column heading selects the table and shows the column's field(n) and text(n) in the editor
+  // Clicking a column heading selects the table and its column: the Properties panel shows the column's
+  // field(n) and heading text(n), and the editor shows their lines
   function setupListviewColumns() {
     document.querySelectorAll('.grid > .listview .lv-col').forEach(function(col) {
       col.addEventListener('click', function(e) {
         if (tabOrderMode || e.ctrlKey || e.metaKey || e.shiftKey) return;
         if (!e.target.closest('.lv-head, .lv-filter')) return;
         e.stopPropagation();
-        selectElement(col.closest('.listview')); // clears the previous column mark
-        col.classList.add('lv-col-active');
+        var table = col.closest('.listview');
         var field = parseInt(col.getAttribute('data-col-field'), 10);
+        propsState.column = isFinite(field) ? { key: elementKey(table), field: field } : null;
+        selectElement(table);
+        col.classList.add('lv-col-active');
         if (isFinite(field) && vscodeApi && vscodeApi.postMessage) {
           vscodeApi.postMessage({ command: 'showColumnInSource', fieldIndex: field });
         }
       });
+    });
+  }
+
+  function markColumn(table, field) {
+    table.querySelectorAll('.lv-col').forEach(function(c) {
+      c.classList.toggle('lv-col-active', c.getAttribute('data-col-field') === String(field));
     });
   }
 
@@ -1029,140 +1040,13 @@ window.__frmMain = function(D) {
         
         var elementType = elementContextMenuState.elementType;
         var elementIndex = elementContextMenuState.elementIndex;
-        var elementData = elementContextMenuState.elementData;
         
         switch(action) {
           case 'edit-element':
-            // Open appropriate modal with existing data
-            if (elementType === 'listview') {
-              // No dialog: the table's numbers are edited in the file
-              if (vscodeApi && vscodeApi.postMessage) {
-                vscodeApi.postMessage({ command: 'showInSource', elementType: 'listview', elementIndex: elementIndex });
-              }
-            } else if (elementType === 'text') {
-              startTextEdit(elementContextMenuState.element);
-            } else if (elementType === 'field') {
-              document.getElementById('fieldModalTitle').textContent = 'Edit Field';
-              document.getElementById('fieldName').value = elementData.name || '';
-              
-              // Set name format checkboxes
-              document.getElementById('fieldNameAngle').checked = elementData.nameFormat?.angle || false;
-              document.getElementById('fieldNameQuoted').checked = elementData.nameFormat?.quoted || false;
-              
-              // Parse type expression and set checkboxes
-              var typeExpr = (elementData.type || '1').toString();
-              var typeValues = typeExpr.split('+').map(function(v) { return v.trim(); });
-              
-              // Reset all checkboxes
-              document.getElementById('fieldType1').checked = false;
-              document.getElementById('fieldType4').checked = false;
-              document.getElementById('fieldType8').checked = false;
-              document.getElementById('fieldType16').checked = false;
-              document.getElementById('fieldType32').checked = false;
-              document.getElementById('fieldType64').checked = false;
-              document.getElementById('fieldType128').checked = false;
-              document.getElementById('fieldType256').checked = false;
-              document.getElementById('fieldType512').checked = false;
-              document.getElementById('fieldType1024').checked = false;
-              document.getElementById('fieldType2048').checked = false;
-              document.getElementById('fieldType4096').checked = false;
-              document.getElementById('fieldType8192').checked = false;
-              document.getElementById('fieldType16384').checked = false;
-              document.getElementById('fieldType32768').checked = false;
-              
-              // Set checkboxes based on type expression
-              typeValues.forEach(function(val) {
-                if (val === '1') document.getElementById('fieldType1').checked = true;
-                else if (val === '4') document.getElementById('fieldType4').checked = true;
-                else if (val === '8') document.getElementById('fieldType8').checked = true;
-                else if (val === '16') document.getElementById('fieldType16').checked = true;
-                else if (val === '32') document.getElementById('fieldType32').checked = true;
-                else if (val === '64') document.getElementById('fieldType64').checked = true;
-                else if (val === '128') document.getElementById('fieldType128').checked = true;
-                else if (val === '256') document.getElementById('fieldType256').checked = true;
-                else if (val === '512') document.getElementById('fieldType512').checked = true;
-                else if (val === '1024') document.getElementById('fieldType1024').checked = true;
-                else if (val === '2048') document.getElementById('fieldType2048').checked = true;
-                else if (val === '4096') document.getElementById('fieldType4096').checked = true;
-                else if (val === '8192') document.getElementById('fieldType8192').checked = true;
-                else if (val === '16384') document.getElementById('fieldType16384').checked = true;
-                else if (val === '32768') document.getElementById('fieldType32768').checked = true;
-              });
-              
-              document.getElementById('fieldType').value = typeExpr;
-              document.getElementById('fieldLen').value = elementData.len || 10;
-              
-              // Populate dropdown values if any
-              var valuesTextarea = document.getElementById('fieldValues');
-              if (valuesTextarea && elementData.values && elementData.values.length > 0) {
-                valuesTextarea.value = elementData.values.map(function(v) { return '"' + v + '"'; }).join(' ');
-              } else if (valuesTextarea) {
-                valuesTextarea.value = '';
-              }
-              updateFieldValuesHint();
-
-              document.getElementById('fieldModal').setAttribute('data-edit-mode', 'true');
-              document.getElementById('fieldModal').setAttribute('data-edit-index', elementIndex);
-              document.getElementById('fieldModal').setAttribute('data-nameformat', JSON.stringify(elementData.nameFormat || {}));
-              showModal('fieldModal');
-              document.getElementById('fieldName').focus();
-            } else if (elementType === 'pushbutton') {
-              clearButtonModal();
-              document.getElementById('buttonModalTitle').textContent = 'Edit Button';
-              document.getElementById('buttonLabel').value = elementData.label || '';
-              contextMenuState.buttonType = elementData.kind || 'select';
-              document.getElementById('buttonModal').setAttribute('data-edit-mode', 'true');
-              document.getElementById('buttonModal').setAttribute('data-edit-index', elementIndex);
-              var actionSelect = document.getElementById('buttonActionType');
-              if (actionSelect) {
-                actionSelect.value = elementData.action === 'variable' ? 'variable' : 'program';
-              }
-              if (elementData.program) {
-                document.getElementById('buttonProgram').value = elementData.program;
-              }
-              if (elementData.name) {
-                document.getElementById('buttonVariable').value = elementData.name;
-              }
-              if (elementData.value != null) {
-                document.getElementById('buttonValue').value = elementData.value;
-              } else if (elementData.kind === 'checkbox') {
-                document.getElementById('buttonValue').value = '1;0';
-              } else if (elementData.kind === 'radio') {
-                document.getElementById('buttonValue').value = '1';
-              }
-              setupButtonModal('Edit ' + (elementData.kind === 'checkbox' ? 'Checkbox' : elementData.kind === 'radio' ? 'Radio Button' : 'Button'));
-              if (contextMenuState.buttonType === 'select') {
-                updateButtonFieldVisibility();
-              }
-              showModal('buttonModal');
-              document.getElementById('buttonLabel').focus();
-            } else if (elementType === 'preview') {
-              document.getElementById('previewModalTitle').textContent = 'Edit Preview';
-              document.getElementById('previewPath').value = elementData.path || '$DIR_PICTS/file.vxp';
-              document.getElementById('previewField').value = elementData.field || '';
-              document.getElementById('previewRows').value = elementData.rows || 25;
-              document.getElementById('previewCols').value = elementData.cols || 72;
-              document.getElementById('previewMode').value = elementData.mode || '0';
-              document.getElementById('previewPortType').value = elementData.portType || 'PORT_2D';
-              document.getElementById('previewPortStyle').value = elementData.portStyle ?? 'SIMPLE';
-              document.getElementById('previewModal').setAttribute('data-edit-mode', 'true');
-              document.getElementById('previewModal').setAttribute('data-edit-index', elementIndex);
-              showModal('previewModal');
-              document.getElementById('previewPath').focus();
-            } else if (elementType === 'bgimage') {
-              openBackgroundModal(elementContextMenuState.element);
-            } else if (elementType === 'image' && isFinite(elementIndex)) {
-              openImageModal({ index: elementIndex, data: elementData }, null);
-            }
+            focusPropsPanel(elementContextMenuState.element);
             break;
           case 'move-element':
-            // Open move modal
-            document.getElementById('moveModalTitle').textContent = 'Set Tab Visibility for ' + elementType + '(' + elementIndex + ')';
-            document.getElementById('moveModal').setAttribute('data-element-type', elementType);
-            document.getElementById('moveModal').setAttribute('data-element-index', elementIndex);
-            // Populate current visibility state
-            populateTabVisibility(elementType, elementIndex);
-            showModal('moveModal');
+            focusPropsPanel(elementContextMenuState.element, 'tabs');
             break;
           case 'toggle-box':
             if (elementContextMenuState.element) toggleTextBox(elementContextMenuState.element);
@@ -1203,7 +1087,6 @@ window.__frmMain = function(D) {
     setupPreviewModal();
     setupImageModal();
     setupBackgroundModal();
-    setupMoveModal();
     setupTriggerModal();
 
     // Setup document-level context menu for outside-grid clicks
@@ -1242,105 +1125,6 @@ window.__frmMain = function(D) {
           showModal('triggerModal');
         }
       });
-    });
-  }
-
-  function setupMoveModal() {
-    var modal = document.getElementById('moveModal');
-    if (!modal) return;
-
-    // Handle ALL checkbox toggle
-    var allCheckbox = document.getElementById('moveTabAll');
-    if (allCheckbox) {
-      allCheckbox.addEventListener('change', function() {
-        var checkboxes = document.querySelectorAll('.move-tab-checkbox');
-        checkboxes.forEach(function(cb) {
-          cb.disabled = this.checked;
-          if (this.checked) {
-            cb.checked = false;
-          }
-        }.bind(this));
-      });
-    }
-
-    // When individual checkboxes are clicked, uncheck ALL
-    document.querySelectorAll('.move-tab-checkbox').forEach(function(cb) {
-      cb.addEventListener('change', function() {
-        if (this.checked && allCheckbox) {
-          allCheckbox.checked = false;
-        }
-      });
-    });
-
-    // Cancel button
-    modal.querySelector('[data-action="cancel"]').addEventListener('click', function() {
-      hideModal('moveModal');
-    });
-
-    // Confirm button
-    modal.querySelector('[data-action="confirm-move"]').addEventListener('click', function() {
-      var elementType = modal.getAttribute('data-element-type');
-      var elementIndex = parseInt(modal.getAttribute('data-element-index'));
-
-      if (!elementType || !elementIndex) {
-        return;
-      }
-
-      // Get selected tabs
-      var targetTabIds = [];
-      var allChecked = document.getElementById('moveTabAll').checked;
-      
-      if (allChecked) {
-        targetTabIds = 'all';
-      } else {
-        document.querySelectorAll('.move-tab-checkbox:checked').forEach(function(cb) {
-          targetTabIds.push(parseInt(cb.value));
-        });
-        
-        if (targetTabIds.length === 0) {
-          // Skip if no tabs selected
-          return;
-        }
-      }
-
-      // Send to VS Code
-      if (vscodeApi && vscodeApi.postMessage) {
-        vscodeApi.postMessage({
-          command: 'moveElement',
-          elementType: elementType,
-          elementIndex: elementIndex,
-          targetTabIds: targetTabIds
-        });
-      }
-
-      hideModal('moveModal');
-    });
-  }
-
-  function populateTabVisibility(elementType, elementIndex) {
-    // Determine which tabs currently show this element
-    var currentTabs = [];
-    
-    // Check each tab's opt_ list
-    var tabLists = elementType === 'text' ? D.tabTexts :
-                   elementType === 'field' ? D.tabFields :
-                   elementType === 'pushbutton' ? D.tabPushButtons :
-                   elementType === 'image' ? D.tabImages :
-                   elementType === 'preview' ? D.tabPreviews : {};
-    D.tabs.forEach(function(t) {
-      if ((tabLists[t.id] || []).indexOf(elementIndex) !== -1) currentTabs.push(t.id);
-    });
-    
-    // Check if element is visible on all tabs
-    var allTabs = D.tabs.map(function(t) { return t.id; });
-    var isOnAllTabs = allTabs.length > 0 && currentTabs.length === allTabs.length;
-    
-    // Update checkboxes
-    document.getElementById('moveTabAll').checked = isOnAllTabs;
-    document.querySelectorAll('.move-tab-checkbox').forEach(function(cb) {
-      var tabId = parseInt(cb.value);
-      cb.checked = !isOnAllTabs && currentTabs.indexOf(tabId) !== -1;
-      cb.disabled = isOnAllTabs;
     });
   }
 
@@ -1464,14 +1248,16 @@ window.__frmMain = function(D) {
     });
   }
 
+  // Double-click: a text is edited where it is drawn, other elements in the Properties panel
   function setupTextEdit() {
     document.addEventListener('dblclick', function(e) {
-      if (e.target.closest('.inline-edit, .el-resize, .box-resize')) return;
-      var el = e.target.closest('.grid > .text.draggable');
-      if (!el || !el.hasAttribute('data-text-idx')) return;
+      if (tabOrderMode || e.target.closest('.inline-edit, .el-resize, .box-resize, .lv-col')) return;
+      var el = e.target.closest('.grid > .draggable');
+      if (!el) return;
       e.preventDefault();
       e.stopPropagation();
-      startTextEdit(el);
+      if (el.classList.contains('text') && el.hasAttribute('data-text-idx')) startTextEdit(el);
+      else focusPropsPanel(el);
     });
   }
 
@@ -3671,6 +3457,13 @@ window.__frmMain = function(D) {
     document.body.classList.toggle('multi-selected', els.length > 1);
     window.__frmCodeSelection = null; // a selection made here replaces one still waiting from the code
     showTriggers();
+    // A table's column stays chosen while the table alone stays selected
+    var column = propsState && propsState.column;
+    if (column) {
+      if (els.length === 1 && !selectedRows.length && elementKey(els[0]) === column.key) markColumn(els[0], column.field);
+      else propsState.column = null;
+    }
+    updatePropsPanel();
   }
 
   function clearSelection() {
@@ -4042,7 +3835,7 @@ window.__frmMain = function(D) {
     // Deselect when clicking on empty area (not when using a dialog or menu)
     document.addEventListener('click', function(e) {
       // Switching form tabs keeps the selection
-      if (e.target.closest('.modal-overlay, .context-menu, .tabs, .toolbox, .toolbox-show')) return;
+      if (e.target.closest('.modal-overlay, .context-menu, .tabs, .toolbox, .toolbox-show, .props-panel')) return;
       if (!e.target.closest('.draggable, .trigger-item')) clearSelection();
     });
   }
@@ -4932,6 +4725,7 @@ window.__frmMain = function(D) {
   function isTypingTarget(t) {
     if (!t || !t.tagName) return false;
     if (t.classList && t.classList.contains('inline-edit')) return true; // in-place header/text editor
+    if (t.closest && t.closest('.props-panel')) return true; // keys in the Properties panel are its own
     if (t.closest && t.closest('.draggable')) return false; // mock controls drawn inside form elements
     if (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return true;
     return t.tagName === 'INPUT' && !/^(checkbox|radio|button|submit|reset|range)$/i.test(t.type);
@@ -4962,7 +4756,7 @@ window.__frmMain = function(D) {
 
   function restoreCanvasFocus() {
     var active = document.activeElement;
-    if (active && active.closest && active.closest('.modal-overlay')) active.blur();
+    if (active && active.closest && active.closest('.modal-overlay, .props-panel')) active.blur();
     if (selectedElement && document.contains(selectedElement)) {
       selectedElement.focus({ preventScroll: true });
     }
@@ -5133,14 +4927,7 @@ window.__frmMain = function(D) {
 
   // Same as choosing Edit in the element's context menu
   function openElementEditor(element) {
-    var info = collectElementInfo(element);
-    if (!info.type) return;
-    elementContextMenuState.element = element;
-    elementContextMenuState.elementType = info.type;
-    elementContextMenuState.elementIndex = info.index;
-    elementContextMenuState.elementData = info.data;
-    var item = document.querySelector('#elementContextMenu .context-menu-item[data-action="edit-element"]');
-    if (item) item.click();
+    focusPropsPanel(element);
   }
 
   function consumeKey(e) {
@@ -5250,15 +5037,15 @@ window.__frmMain = function(D) {
       return;
     }
     if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length === 1 && !selectedElements.length &&
-        selectedRows[0].classList.contains('bg-item') && !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON')) {
-      if (isLocked(selectedRows[0])) showNotice('A background without an index can\'t be edited here');
-      else openBackgroundModal(selectedRows[0]);
+        !isTriggerRow(selectedRows[0]) && !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON')) {
+      // A background or hidden field
+      focusPropsPanel(selectedRows[0]);
       consumeKey(e);
       return;
     }
     if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length &&
         !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
-      showNotice(selectedElements.length + selectedRows.length > 1 ? 'Several selected: select one element to edit' : 'Triggers and hidden fields can\'t be edited with this key');
+      showNotice(selectedElements.length + selectedRows.length > 1 ? 'Several selected: select one element to edit' : 'Triggers are edited from their row');
       consumeKey(e);
       return;
     }
@@ -5324,8 +5111,575 @@ window.__frmMain = function(D) {
     }
   }
 
+  // ---- Properties panel -------------------------------------------------------------------------------
+  // The selected elements' properties, written to the file while they are typed. The panel's children
+  // outlive page updates (data-keep-children), so an input keeps its focus and unsent text. Its listeners
+  // sit on the panel itself and are added again on every run of this script, like all the others.
+  var propsState = window.__frmPropsState = window.__frmPropsState ||
+    { sig: '', session: '', seq: 0, timer: null, flush: null, column: null, bgKind: {}, images: null, imagesAsked: false };
+  var propValues = D.props || {};
+  var propDefs = D.propDefs || {};
+  var PROPS_DELAY_MS = 250;
+  var SHOWN_TYPE = { pushbutton: 'button', listview: 'page_listview' };
+  var NOUNS = { text: 'text', field: 'field', pushbutton: 'button', image: 'image', preview: 'preview', listview: 'table', bgimage: 'background' };
+  var TEXT_KINDS = ['int', 'text', 'lines', 'image', 'range'];
+
+  function propsPanel() { return document.getElementById('propsPanel'); }
+
+  function refOfKey(key) {
+    var parts = key.split(':');
+    return { type: parts[0], index: Number(parts[1]) };
+  }
+
+  function uniq(list) {
+    return list.filter(function(v, i) { return list.indexOf(v) === i; });
+  }
+
+  // What the panel changes: the selected form elements and Hidden Fields / Backgrounds rows, by key
+  function propsTargets() {
+    var keys = [];
+    selectedElements.concat(selectedRows.filter(function(row) { return !isTriggerRow(row); })).forEach(function(el) {
+      if (isLocked(el)) return;
+      var key = elementKey(el);
+      if (propValues[key] && keys.indexOf(key) < 0) keys.push(key);
+    });
+    return keys;
+  }
+
+  // Everything about a property but its label, to tell whether two types share it
+  function defShape(def) {
+    return JSON.stringify([def.kind, def.min, def.max, def.optional, def.pattern, def.options, def.bits]);
+  }
+
+  // The properties every element has in the same form, in the first one's order, whose conditions hold for all
+  function sharedDefs(keys) {
+    var types = uniq(keys.map(function(k) { return refOfKey(k).type; }));
+    return (propDefs[types[0]] || []).filter(function(def) {
+      var shared = types.every(function(t) {
+        return (propDefs[t] || []).some(function(d) { return d.key === def.key && defShape(d) === defShape(def); });
+      });
+      return shared && keys.every(function(k) {
+        var values = propValues[k].values;
+        if (values[def.key] === undefined) return false; // a bottom-bar button's row, tabs on a form without tabs
+        return !def.when || def.when.values.indexOf(values[def.when.key]) >= 0;
+      });
+    });
+  }
+
+  function countText(keys) {
+    var byType = {};
+    keys.forEach(function(k) { var t = refOfKey(k).type; byType[t] = (byType[t] || 0) + 1; });
+    return Object.keys(byType).map(function(t) { return byType[t] + ' ' + NOUNS[t] + (byType[t] > 1 ? 's' : ''); }).join(', ');
+  }
+
+  // What the panel shows: a title and rows, each a property and the elements it changes
+  function propsLayout(keys) {
+    if (!keys.length) return null;
+    var column = propsState.column;
+    if (column && keys.length === 1 && keys[0] === column.key && propValues['field:' + column.field]) {
+      var fieldKey = 'field:' + column.field;
+      var textKey = 'text:' + column.field;
+      var heading = { key: 'content', label: 'Heading', kind: 'text' };
+      if (!propValues[textKey]) heading.hint = 'No text(' + column.field + ') to show as the heading';
+      return {
+        title: 'Column: field(' + column.field + ')', sub: propValues[fieldKey].values.name, fields: [fieldKey],
+        rows: [{ def: heading, keys: propValues[textKey] ? [textKey] : [] }].concat(sharedDefs([fieldKey]).map(function(def) {
+          return { def: def, keys: [fieldKey] };
+        }))
+      };
+    }
+    var ref = refOfKey(keys[0]);
+    var single = keys.length === 1;
+    return {
+      title: single ? (SHOWN_TYPE[ref.type] || ref.type) + '(' + ref.index + ')' : keys.length + ' elements',
+      sub: single ? (ref.type === 'field' ? propValues[keys[0]].values.name : '') : countText(keys),
+      fields: keys.filter(function(k) { return /^field:/.test(k); }),
+      rows: sharedDefs(keys).map(function(def) { return { def: def, keys: keys }; })
+    };
+  }
+
+  // A row's value: the same in all its elements, or mixed
+  function rowValue(row) {
+    var all = row.keys.map(function(k) { return propValues[k].values[row.def.key]; });
+    var same = all.every(function(v) { return v === all[0]; });
+    return { value: same && all.length ? all[0] : '', mixed: !same, all: all };
+  }
+
+  function flagBits(expr) {
+    return String(expr || '').split('+').reduce(function(all, n) { return all | (Number(n) || 0); }, 0);
+  }
+
+  function tabList(value) {
+    if (value === 'all') return tabs.map(function(t) { return t.id; });
+    return value ? value.split(' ').map(Number) : [];
+  }
+
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function(name) {
+      var v = attrs[name];
+      if (v === null || v === undefined || v === false) return;
+      if (name === 'text') node.textContent = v;
+      else node.setAttribute(name, v === true ? '' : v);
+    });
+    (children || []).forEach(function(c) { if (c) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return node;
+  }
+
+  function hexOf(file) {
+    var m = /^RGB\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i.exec(file || '');
+    if (!m) return '#ffffff';
+    return '#' + [m[1], m[2], m[3]].map(function(n) { return ('0' + Math.min(255, Number(n)).toString(16)).slice(-2); }).join('');
+  }
+
+  function rgbOf(hex) {
+    return 'RGB(' + [1, 3, 5].map(function(i) { return parseInt(hex.slice(i, i + 2), 16); }).join(',') + ')';
+  }
+
+  function isColour(file) { return /^RGB\s*\(/i.test(file || ''); }
+
+  // A background shows its picture controls, or its colour; Picture can be chosen before a file is typed
+  function bgKindOf(key, file) {
+    return propsState.bgKind[key] || (isColour(file) ? 'color' : 'picture');
+  }
+
+  // The control of one row; data-prop and data-keys say what it changes
+  function buildControl(row, n) {
+    var def = row.def;
+    var id = 'prop-' + n;
+    var common = { 'data-prop': def.key, 'data-keys': row.keys.join(' '), 'data-kind': def.kind, id: id };
+    if (!row.keys.length) common.disabled = true;
+    switch (def.kind) {
+      case 'check':
+        return el('label', { class: 'props-check' }, [el('input', Object.assign({ type: 'checkbox' }, common)), ' ' + def.label]);
+      case 'select':
+        return el('select', common, def.options.map(function(o) { return el('option', { value: o.value, text: o.label }); }));
+      case 'lines':
+        return el('textarea', Object.assign({ rows: 3, spellcheck: 'false' }, common));
+      case 'flags':
+        return el('div', { class: 'props-flags', 'data-group': def.key }, def.bits.map(function(b) {
+          return el('label', { class: 'props-check' }, [
+            el('input', Object.assign({}, common, { type: 'checkbox', id: null, 'data-bit': b.bit })), ' ' + b.label + ' (' + b.bit + ')'
+          ]);
+        }).concat([el('div', { class: 'props-flags-sum', 'data-flags-sum': def.key })]));
+      case 'tabs':
+        return el('div', { class: 'props-flags' }, [
+          el('label', { class: 'props-check' }, [el('input', Object.assign({}, common, { type: 'checkbox', id: null, 'data-tab': 'all' })), ' All tabs'])
+        ].concat(tabs.map(function(t) {
+          return el('label', { class: 'props-check' }, [
+            el('input', Object.assign({}, common, { type: 'checkbox', id: null, 'data-tab': t.id })), ' ' + t.label.replace(/_/g, ' ')
+          ]);
+        })));
+      case 'range':
+        return el('div', { class: 'props-range' }, [
+          el('input', Object.assign({ type: 'range', min: def.min, max: def.max, step: 1 }, common)),
+          el('span', { class: 'props-range-value', 'data-range-value': def.key })
+        ]);
+      case 'bgsize':
+        return el('div', { class: 'props-pair' }, [
+          el('select', Object.assign({}, common, { 'data-part': 'mode' }), [
+            el('option', { value: '-1', text: 'Stretch' }), el('option', { value: '0', text: 'Original size' }), el('option', { value: 'px', text: 'Pixels' })
+          ]),
+          el('input', Object.assign({ type: 'text', inputmode: 'numeric', 'aria-label': def.label + ' in pixels' }, common, { id: null, 'data-part': 'px' }))
+        ]);
+      case 'bgfile': {
+        var key = row.keys[0];
+        var colour = bgKindOf(key, rowValue(row).value) === 'color';
+        return el('div', { class: 'props-bgfile' }, [
+          el('div', { class: 'props-pair' }, ['picture', 'color'].map(function(kind) {
+            return el('label', { class: 'props-check' }, [
+              el('input', Object.assign({}, common, { type: 'radio', id: null, name: id + '-kind', 'data-part': 'kind', value: kind, checked: (kind === 'color') === colour })),
+              kind === 'color' ? ' Colour' : ' Picture'
+            ]);
+          })),
+          colour
+            ? el('input', Object.assign({ type: 'color' }, common, { 'data-part': 'color' }))
+            : el('input', Object.assign({ type: 'text', list: 'propsImages', spellcheck: 'false', placeholder: 'File name, such as logo.png' }, common, { 'data-part': 'file' }))
+        ]);
+      }
+      default: {
+        var attrs = Object.assign({ type: 'text', spellcheck: 'false', autocomplete: 'off' }, common);
+        if (def.kind === 'int') attrs.inputmode = 'numeric';
+        if (def.kind === 'image') attrs.list = 'propsImages';
+        if (def.suggest === 'fields') attrs.list = 'propsFields';
+        return el('input', attrs);
+      }
+    }
+  }
+
+  // The panel's markup for a layout; values are filled in by fillProps
+  function buildProps(panel, layout) {
+    panel.textContent = '';
+    panel.appendChild(el('div', { class: 'props-header' }, [
+      el('div', { class: 'props-title', text: layout.title }),
+      layout.sub ? el('div', { class: 'props-sub', text: layout.sub }) : null
+    ]));
+    var body = el('div', { class: 'props-body' });
+    var line = null;
+    layout.rows.forEach(function(row, n) {
+      var def = row.def;
+      var label = def.kind === 'check' ? null : el('label', { class: 'props-label', for: ['flags', 'tabs'].indexOf(def.kind) < 0 ? 'prop-' + n : null, text: def.label });
+      var field = el('div', { class: 'props-field', 'data-field': def.key }, [
+        label, buildControl(row, n), def.hint ? el('small', { class: 'props-hint', text: def.hint }) : null
+      ]);
+      if (def.key === 'group') field.appendChild(el('small', { class: 'props-warning hidden', 'data-group-warning': '', text: 'Not in any group' }));
+      if (def.pair && line) {
+        line.appendChild(field);
+      } else {
+        line = el('div', { class: 'props-line' }, [field]);
+        body.appendChild(line);
+      }
+    });
+    if (layout.fields.length) {
+      body.appendChild(el('div', { class: 'props-actions' }, [
+        el('button', { type: 'button', class: 'props-button', 'data-action': 'hide-fields', 'data-keys': layout.fields.join(' '),
+          text: layout.fields.length > 1 ? 'Hide ' + layout.fields.length + ' fields' : 'Hide field' })
+      ]));
+    }
+    body.appendChild(el('datalist', { id: 'propsFields' }, (D.fieldNames || []).map(function(name) { return el('option', { value: name }); })));
+    body.appendChild(el('datalist', { id: 'propsImages' }, (propsState.images || []).map(function(name) { return el('option', { value: name }); })));
+    panel.appendChild(body);
+  }
+
+  function rowsByProp(layout) {
+    var map = {};
+    layout.rows.forEach(function(row) { map[row.def.key + '|' + row.keys.join(' ')] = row; });
+    return map;
+  }
+
+  // Put the file's values in the controls. The input being typed in keeps what it has.
+  function fillProps(panel, layout) {
+    var rows = rowsByProp(layout);
+    var active = document.activeElement;
+    panel.querySelectorAll('[data-prop]').forEach(function(control) {
+      var row = rows[control.getAttribute('data-prop') + '|' + control.getAttribute('data-keys')];
+      if (!row) return;
+      var v = rowValue(row);
+      var kind = row.def.kind;
+      var typing = control === active && control.type !== 'checkbox' && control.type !== 'radio' && control.tagName !== 'SELECT';
+      if (typing) return;
+      control.classList.remove('invalid');
+      if (kind === 'flags') {
+        var bit = Number(control.getAttribute('data-bit'));
+        var on = v.all.filter(function(x) { return (flagBits(x) & bit) !== 0; }).length;
+        control.checked = on === v.all.length && on > 0;
+        control.indeterminate = on > 0 && on < v.all.length;
+      } else if (kind === 'tabs') {
+        var tab = control.getAttribute('data-tab');
+        var count = v.all.filter(function(x) { return tab === 'all' ? x === 'all' : tabList(x).indexOf(Number(tab)) >= 0; }).length;
+        control.checked = count === v.all.length && count > 0;
+        control.indeterminate = count > 0 && count < v.all.length;
+      } else if (kind === 'check') {
+        control.checked = !v.mixed && v.value === '1';
+        control.indeterminate = v.mixed;
+      } else if (kind === 'bgsize') {
+        var px = v.value !== '-1' && v.value !== '0';
+        if (control.getAttribute('data-part') === 'mode') control.value = v.mixed ? '' : px ? 'px' : v.value;
+        else { control.value = px && !v.mixed ? v.value : ''; control.disabled = !px || v.mixed; }
+      } else if (kind === 'bgfile') {
+        var part = control.getAttribute('data-part');
+        if (part === 'color') control.value = hexOf(v.value);
+        else if (part === 'file') control.value = isColour(v.value) ? '' : v.value;
+      } else if (kind === 'select') {
+        control.value = v.mixed ? '' : v.value;
+        if (v.mixed) control.selectedIndex = -1;
+      } else {
+        control.value = v.mixed ? '' : v.value;
+        control.placeholder = v.mixed ? 'mixed' : '';
+        if (kind === 'range') {
+          var label = panel.querySelector('[data-range-value="' + row.def.key + '"]');
+          if (label) label.textContent = v.mixed ? 'mixed' : v.value;
+        }
+      }
+    });
+    layout.rows.forEach(function(row) {
+      if (row.def.kind === 'flags') {
+        var sum = panel.querySelector('[data-flags-sum="' + row.def.key + '"]');
+        var v = rowValue(row);
+        if (sum) sum.textContent = v.mixed ? 'mixed' : '= ' + v.value + (/\+/.test(v.value) ? ' (' + flagBits(v.value) + ')' : '');
+      }
+      if (row.def.key === 'group') {
+        var warning = panel.querySelector('[data-group-warning]');
+        if (warning) warning.classList.toggle('hidden', !rowValue(row).all.some(function(g) { return g === ''; }));
+      }
+    });
+  }
+
+  // Which control has the focus, to find it again after the panel is rebuilt
+  function controlId(control) {
+    if (!control || !control.getAttribute || !control.hasAttribute('data-prop')) return null;
+    return ['data-prop', 'data-keys', 'data-bit', 'data-tab', 'data-part'].map(function(a) { return control.getAttribute(a); }).join('|');
+  }
+
+  function findControl(panel, id) {
+    var found = null;
+    panel.querySelectorAll('[data-prop]').forEach(function(c) { if (!found && controlId(c) === id) found = c; });
+    return found;
+  }
+
+  // Show the panel for the selection, or hide it. Runs after every selection change and page update.
+  function updatePropsPanel() {
+    var panel = propsPanel();
+    if (!panel || !propsState) return;
+    var keys = propsTargets();
+    if (keys.length > 1) keys = []; // one element at a time for now
+    var layout = propsLayout(keys);
+    var side = panel.closest('.side-panels');
+    panel.classList.toggle('hidden', !layout);
+    if (side) side.classList.toggle('props-open', !!layout);
+    if (!layout) {
+      flushProps();
+      propsState.sig = '';
+      panel.textContent = '';
+      return;
+    }
+    var sig = JSON.stringify([layout.title, layout.rows.map(function(r) { return [r.def.key, r.keys]; }), keys.map(function(k) {
+      return propValues[k].values.file !== undefined && refOfKey(k).type === 'bgimage' ? bgKindOf(k, propValues[k].values.file) : '';
+    })]);
+    if (sig !== propsState.sig) {
+      flushProps();
+      var focused = panel.contains(document.activeElement) ? controlId(document.activeElement) : null;
+      buildProps(panel, layout);
+      propsState.sig = sig;
+      fillProps(panel, layout);
+      var again = focused && findControl(panel, focused);
+      if (again) again.focus({ preventScroll: true });
+    } else {
+      fillProps(panel, layout);
+    }
+    if (layout.rows.some(function(r) { return r.def.kind === 'image' || r.def.kind === 'bgfile'; })) askImages();
+  }
+
+  function askImages() {
+    if (propsState.images || propsState.imagesAsked || !vscodeApi || !vscodeApi.postMessage) return;
+    propsState.imagesAsked = true;
+    vscodeApi.postMessage({ command: 'listImages', requestId: 'props-images' });
+  }
+
+  function onPropsMessage(ev) {
+    var msg = ev.data;
+    if (!msg || msg.command !== 'imagesListed' || msg.requestId !== 'props-images') return;
+    propsState.images = (msg.images || []).map(function(img) { return img.name; });
+    var list = document.getElementById('propsImages');
+    if (list) {
+      list.textContent = '';
+      propsState.images.forEach(function(name) { list.appendChild(el('option', { value: name })); });
+    }
+  }
+
+  function sendPropEdits(edits, session) {
+    if (!edits.length || !vscodeApi || !vscodeApi.postMessage) return;
+    vscodeApi.postMessage({ command: 'setProps', session: session || '', edits: edits });
+  }
+
+  function valueEdits(keys, prop, value) {
+    return keys.map(function(k) { return Object.assign(refOfKey(k), { key: prop, value: value }); });
+  }
+
+  function flushProps() {
+    clearTimeout(propsState.timer);
+    var flush = propsState.flush;
+    propsState.flush = null;
+    if (flush) flush();
+  }
+
+  // Typing: written once it pauses, or when the input loses focus
+  function queueProp(keys, prop, value) {
+    clearTimeout(propsState.timer);
+    var session = propsState.session;
+    propsState.flush = function() { sendPropEdits(valueEdits(keys, prop, value), session); };
+    propsState.timer = setTimeout(flushProps, PROPS_DELAY_MS);
+  }
+
+  function newSession() {
+    propsState.session = 'p' + (++propsState.seq) + '-' + Date.now();
+    return propsState.session;
+  }
+
+  function defFor(control) {
+    var type = refOfKey(control.getAttribute('data-keys').split(' ')[0]).type;
+    var prop = control.getAttribute('data-prop');
+    if (propsState.column && prop === 'content' && type === 'text') return { key: 'content', kind: 'text' };
+    return (propDefs[type] || []).filter(function(d) { return d.key === prop; })[0] || { key: prop, kind: 'text' };
+  }
+
+  function propValid(def, v) {
+    var int = function(min, max) {
+      return /^-?\d+$/.test(v) && Number(v) >= (min === undefined ? -Infinity : min) && Number(v) <= (max === undefined ? Infinity : max);
+    };
+    switch (def.kind) {
+      case 'int': return (def.optional && v === '') || int(def.min, def.max);
+      case 'range': return int(def.min, def.max);
+      case 'bgsize': return int(1);
+      case 'image': case 'bgfile': return v.trim() !== '' && !/[\r\n"]/.test(v);
+      case 'text': return !/[\r\n]/.test(v) && (!def.pattern || new RegExp(def.pattern).test(v));
+      default: return true;
+    }
+  }
+
+  // The file's value of a control's property, for Esc
+  function fileValueOf(control) {
+    var keys = control.getAttribute('data-keys').split(' ');
+    var prop = control.getAttribute('data-prop');
+    var all = keys.map(function(k) { return propValues[k] ? propValues[k].values[prop] : ''; });
+    return all.every(function(v) { return v === all[0]; }) ? all[0] : '';
+  }
+
+  function onPropsInput(e) {
+    var control = e.target;
+    if (!control.hasAttribute || !control.hasAttribute('data-prop')) return;
+    var kind = control.getAttribute('data-kind');
+    var part = control.getAttribute('data-part');
+    var keys = control.getAttribute('data-keys').split(' ').filter(Boolean);
+    if (!keys.length) return;
+    if (control.type === 'checkbox' || control.type === 'radio' || control.tagName === 'SELECT') return; // their change event writes
+    if (kind === 'bgfile' && part === 'color') {
+      queueProp(keys, 'file', rgbOf(control.value));
+      return;
+    }
+    if (TEXT_KINDS.indexOf(kind) < 0 && kind !== 'bgsize' && kind !== 'bgfile') return;
+    var def = defFor(control);
+    var value = kind === 'lines' ? control.value : control.value.trim();
+    var ok = propValid(def, value);
+    control.classList.toggle('invalid', !ok);
+    if (kind === 'range') {
+      var label = control.parentNode.querySelector('.props-range-value');
+      if (label) label.textContent = control.value;
+    }
+    if (ok) queueProp(keys, control.getAttribute('data-prop'), value);
+    else { clearTimeout(propsState.timer); propsState.flush = null; }
+  }
+
+  function onPropsChange(e) {
+    var control = e.target;
+    if (!control.hasAttribute || !control.hasAttribute('data-prop')) return;
+    var kind = control.getAttribute('data-kind');
+    var prop = control.getAttribute('data-prop');
+    var keys = control.getAttribute('data-keys').split(' ').filter(Boolean);
+    if (!keys.length) return;
+    var part = control.getAttribute('data-part');
+    // Typed values are written by their input event; leaving the input writes what is still waiting
+    if (control.tagName === 'TEXTAREA' || (control.tagName === 'INPUT' && control.type !== 'checkbox' && control.type !== 'radio')) {
+      flushProps();
+      return;
+    }
+    var session = newSession();
+    if (kind === 'flags') {
+      var bit = Number(control.getAttribute('data-bit'));
+      sendPropEdits(keys.map(function(k) { return Object.assign(refOfKey(k), { key: prop, bit: bit, on: control.checked }); }), session);
+    } else if (kind === 'tabs') {
+      var tab = control.getAttribute('data-tab');
+      var ids = tabs.map(function(t) { return t.id; });
+      var edits = [];
+      var emptied = 0;
+      keys.forEach(function(k) {
+        var now = tabList(propValues[k].values.tabs);
+        var next;
+        if (tab === 'all') next = control.checked ? ids : [currentActiveTab];
+        else if (control.checked) next = uniq(now.concat(Number(tab)));
+        else next = now.filter(function(id) { return id !== Number(tab); });
+        if (!next.length) { emptied++; return; }
+        var value = ids.every(function(id) { return next.indexOf(id) >= 0; }) ? 'all' : next.sort(function(a, b) { return a - b; }).join(' ');
+        edits.push(Object.assign(refOfKey(k), { key: 'tabs', value: value }));
+        // The next click, before the file has caught up, starts from this
+        propValues[k].values.tabs = value;
+      });
+      if (emptied) showNotice('An element must be on at least one tab');
+      sendPropEdits(edits, session);
+      updatePropsPanel();
+    } else if (kind === 'check') {
+      sendPropEdits(valueEdits(keys, prop, control.checked ? '1' : ''), session);
+    } else if (kind === 'select') {
+      sendPropEdits(valueEdits(keys, prop, control.value), session);
+    } else if (kind === 'bgsize' && part === 'mode') {
+      var px = control.parentNode.querySelector('[data-part="px"]');
+      if (control.value === 'px') {
+        px.disabled = false;
+        if (!propValid({ kind: 'bgsize' }, px.value.trim())) px.value = '200';
+        sendPropEdits(valueEdits(keys, prop, px.value.trim()), session);
+        px.focus();
+        px.select();
+      } else {
+        sendPropEdits(valueEdits(keys, prop, control.value), session);
+      }
+    } else if (kind === 'bgfile' && part === 'kind') {
+      keys.forEach(function(k) { propsState.bgKind[k] = control.value; });
+      if (control.value === 'color' && !isColour(fileValueOf(control))) sendPropEdits(valueEdits(keys, 'file', 'RGB(255,255,255)'), session);
+      updatePropsPanel();
+      var next = propsPanel().querySelector(control.value === 'color' ? '[data-part="color"]' : '[data-part="file"]');
+      if (next) next.focus();
+    }
+  }
+
+  function onPropsKeydown(e) {
+    var control = e.target;
+    if (!control.hasAttribute || !control.hasAttribute('data-prop')) return;
+    if (e.key === 'Enter' && (control.tagName !== 'TEXTAREA' || e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      flushProps();
+      restoreCanvasFocus();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      clearTimeout(propsState.timer);
+      propsState.flush = null;
+      var kind = control.getAttribute('data-kind');
+      var typed = control.type !== 'checkbox' && control.type !== 'radio' && control.tagName !== 'SELECT' && kind !== 'bgsize' && kind !== 'bgfile';
+      var file = fileValueOf(control);
+      if (typed && control.value !== file) {
+        control.value = file;
+        control.classList.remove('invalid');
+      } else {
+        restoreCanvasFocus();
+      }
+    }
+  }
+
+  function onPropsFocus(e) {
+    if (e.target.hasAttribute && e.target.hasAttribute('data-prop')) newSession();
+  }
+
+  function onPropsClick(e) {
+    var hide = e.target.closest && e.target.closest('[data-action="hide-fields"]');
+    if (!hide) return;
+    var keys = hide.getAttribute('data-keys').split(' ').filter(Boolean);
+    var session = newSession();
+    sendPropEdits(valueEdits(keys, 'row', '1000').concat(valueEdits(keys, 'col', '1000')), session);
+  }
+
+  function setupPropsPanel() {
+    var panel = propsPanel();
+    if (!panel) return;
+    panel.addEventListener('input', onPropsInput);
+    panel.addEventListener('change', onPropsChange);
+    panel.addEventListener('keydown', onPropsKeydown);
+    panel.addEventListener('focusin', onPropsFocus);
+    panel.addEventListener('focusout', function() { flushProps(); });
+    panel.addEventListener('click', onPropsClick);
+    window.addEventListener('message', onPropsMessage);
+  }
+
+  // F2, Enter, double-click and Edit: select the element and put the cursor in the panel
+  function focusPropsPanel(element, prop) {
+    if (!element) return;
+    if (element.classList.contains('trigger-item')) {
+      if (selectedRows.length !== 1 || selectedRows[0] !== element || selectedElements.length) setSelection([], null, null, null, [element]);
+    } else if (selectedElements.length !== 1 || selectedElement !== element) {
+      selectElement(element);
+    }
+    var panel = propsPanel();
+    if (!panel || panel.classList.contains('hidden')) {
+      if (isLocked(element)) showNotice('An element without an index can\'t be edited here');
+      return;
+    }
+    var target = prop ? panel.querySelector('[data-prop="' + prop + '"]') : null;
+    if (target) target.focus({ preventScroll: false });
+    else focusFirstModalInput(panel);
+    if (target || panel.contains(document.activeElement)) document.activeElement.scrollIntoView({ block: 'nearest' });
+  }
+
   // Initialize drag and drop and keyboard navigation after DOM is ready
   setupShortcuts(); // first, so its capture-phase Escape runs before the resize handlers end a drag
+  setupPropsPanel();
   setupToolbox(); // before anything else that listens to the mouse, so nothing under an armed tool reacts
   setupWindowResize();
   setupElementResize();

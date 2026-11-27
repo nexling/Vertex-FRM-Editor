@@ -9,13 +9,13 @@ import { copyStatements, deleteStatements, pasteStatements, validTriggerRefs } f
 import { parseButtonAssignment } from './buttonAssignment';
 import { elementsInSelections, findElement, findTriggerStatements } from './elementLookup';
 import {
-  Section, bannerLength, classifyStatement, collectContinuedStatement, formatIndexStatement, insertIntoSection, isBlankLine,
-  isCommentLine, isSeparatorLine, parseIndexList, statementKeyword, statementValue, wrapWidthFromFirstLine
+  Section, bannerLength, classifyStatement, collectContinuedStatement, insertIntoSection, isBlankLine,
+  isCommentLine, isSeparatorLine, parseIndexList
 } from './frmSections';
-import { newButtonKeyword } from './frmStatements';
 import { ALIGNMENTS, Background, BackgroundEdit, addBackground, editBackground, findBackgrounds, imageCandidates, isTif, parseColor, validTabs } from './backgrounds';
 import { convertButtons, registerLanguageFeatures, usesMixedButtons } from './languageFeatures';
 import { EXO_FIELD, Listview, columnOrder, hasNoColumnHeaders, listviewTabs, parseFilterRow, parseListviews } from './listview';
+import { ElementProps, PROP_DEFS, PropDef, readElementProps, setElementFlag, setElementProp } from './elementProps';
 
 // The extension's install folder; the preview page's styles and script are in its media/ folder
 let extensionUri: vscode.Uri | undefined;
@@ -240,7 +240,11 @@ interface BackgroundMessage { background?: BackgroundEdit; tabIds?: unknown; }
 
 interface EditElementMessage extends ElementContent, BackgroundMessage { elementIndex: number; }
 
-interface MoveElementMessage extends ElementRefMessage { targetTabIds: 'all' | number[]; }
+/** One change from the Properties panel: a value, or one bit of a flags property. */
+interface PropEdit { type: string; index: number; key: string; value?: string; bit?: number; on?: boolean; }
+
+/** Changes from the Properties panel. session: one input's focus session, which undoes as one step. */
+interface SetPropsMessage { session?: unknown; edits?: unknown; }
 
 interface HeaderMessage { title?: string; }
 
@@ -489,6 +493,8 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         handleDeleteElements(doc, msg);
       } else if (msg?.command === 'editElement') {
         handleEditElement(doc, msg);
+      } else if (msg?.command === 'setProps') {
+        handleSetProps(doc, createdPanel, msg);
       } else if (msg?.command === 'updateHeader') {
         handleUpdateHeader(doc, msg);
       } else if (msg?.command === 'resolveFieldValues' && Array.isArray(msg?.names)) {
@@ -507,8 +513,6 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         queueEdit(doc, () => handleResizeElement(doc, msg));
       } else if (msg?.command === 'setTextBox') {
         handleSetTextBox(doc, msg);
-      } else if (msg?.command === 'moveElement') {
-        handleMoveElement(doc, msg);
       } else if (msg?.command === 'duplicateElements') {
         handleDuplicateElements(doc, createdPanel, msg);
       } else if (msg?.command === 'copyElements' || msg?.command === 'cutElements') {
@@ -557,6 +561,66 @@ function replaceLines(doc: vscode.TextDocument, lines: string[]): Thenable<boole
   const edit = new vscode.WorkspaceEdit();
   edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), lines.join('\n'));
   return vscode.workspace.applyEdit(edit);
+}
+
+// The Properties panel's last write: later writes of the same input session join its undo step
+let lastPropWrite: { uri: string; session: string; version: number } | undefined;
+
+/**
+ * Write new lines as one edit of only the part that changed, so the editor's cursor and scroll stay.
+ * Writes of the same panel session undo as one step, as long as nothing else changed the file in between.
+ */
+async function writePropLines(doc: vscode.TextDocument, lines: string[], session: string): Promise<boolean> {
+  const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+  const oldText = doc.getText();
+  const newText = lines.join(eol);
+  if (oldText === newText) return true;
+  let start = 0;
+  const shorter = Math.min(oldText.length, newText.length);
+  while (start < shorter && oldText[start] === newText[start]) start++;
+  let tail = 0;
+  while (tail < shorter - start && oldText[oldText.length - 1 - tail] === newText[newText.length - 1 - tail]) tail++;
+  const range = new vscode.Range(doc.positionAt(start), doc.positionAt(oldText.length - tail));
+  const text = newText.slice(start, newText.length - tail);
+  const uri = doc.uri.toString();
+  const joins = !!session && lastPropWrite?.uri === uri && lastPropWrite.session === session && lastPropWrite.version === doc.version;
+  const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === uri);
+  let done: boolean;
+  if (editor) {
+    done = await editor.edit(b => b.replace(range, text), { undoStopBefore: !joins, undoStopAfter: false });
+  } else {
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, range, text);
+    done = await vscode.workspace.applyEdit(edit);
+  }
+  lastPropWrite = done && session ? { uri, session, version: doc.version } : undefined;
+  return done;
+}
+
+function validPropEdits(edits: unknown): Array<PropEdit & ElementRef> {
+  if (!Array.isArray(edits)) return [];
+  return edits.filter((e): e is PropEdit & ElementRef => !!e && typeof e.key === 'string' &&
+    validRefs([{ type: e.type, index: e.index }], undefined, true).length === 1 &&
+    (typeof e.value === 'string' || (typeof e.bit === 'number' && typeof e.on === 'boolean')));
+}
+
+/** Changes from the Properties panel, applied one after the other and written as one edit. */
+function handleSetProps(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: SetPropsMessage) {
+  const edits = validPropEdits(msg.edits);
+  if (!edits.length) return;
+  const session = typeof msg.session === 'string' ? msg.session : '';
+  queueEdit(doc, async () => {
+    let lines = doc.getText().split(/\r?\n/);
+    const failed: string[] = [];
+    for (const e of edits) {
+      const ref = { type: e.type, index: e.index };
+      const next = typeof e.bit === 'number' ? setElementFlag(lines, ref, e.key, e.bit, !!e.on) : setElementProp(lines, ref, e.key, e.value!);
+      if (next) lines = next;
+      else failed.push(`${e.type}(${e.index})`);
+    }
+    if (failed.length) showNotice(panel, `Could not change ${[...new Set(failed)].join(', ')}`);
+    if (!await writePropLines(doc, lines, session)) vscode.window.showErrorMessage('Failed to write the change');
+  });
 }
 
 const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
@@ -1092,94 +1156,6 @@ function handleEditElement(doc: vscode.TextDocument, msg: EditElementMessage) {
   }
 }
 
-function handleMoveElement(doc: vscode.TextDocument, msg: MoveElementMessage) {
-  try {
-    const text = doc.getText();
-    const model = parseFrm(text);
-    const lines = text.split(/\r?\n/);
-    const elementType = msg.elementType;
-    const elementIndex = msg.elementIndex;
-    const targetTabIds = msg.targetTabIds; // Can be 'all' or array of tab IDs
-
-    if (!model.tabs || model.tabs.length === 0) {
-      vscode.window.showErrorMessage('No tabs defined in this form');
-      return;
-    }
-
-    // Determine the opt_ list name
-    const optTypeName = elementType === 'pushbutton' ? '(?:pushbutton|button)' : elementType;
-    
-    // Remove from all existing opt_ lists
-    const optPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*(\\d+)\\s*\\)\\s*=`, 'i');
-    for (let i = 0; i < lines.length; i++) {
-      if (!optPattern.test(lines[i])) continue;
-      const collected = collectContinuedStatement(lines, i);
-      const list = parseIndexList(statementValue(collected.text));
-      const newList = list.filter(idx => idx !== elementIndex);
-      if (newList.length === list.length) continue;
-      if (newList.length === 0) {
-        lines.splice(i, collected.endIndex - i + 1);
-        i--;
-      } else {
-        const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
-        const newLines = formatIndexStatement(statementKeyword(lines[i]), newList.map(String), wrapAt);
-        lines.splice(i, collected.endIndex - i + 1, ...newLines);
-        i += newLines.length - 1;
-      }
-    }
-
-    // Determine which tabs to add element to
-    const tabsToAdd = targetTabIds === 'all' ? model.tabs.map(t => t.id) : targetTabIds;
-
-    // Add to each target tab's opt_ list
-    const optKeyword = elementType === 'pushbutton' ? `opt_${newButtonKeyword(lines)}` : `opt_${elementType}`;
-    
-    for (const targetTabId of tabsToAdd) {
-      const targetOptPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*${targetTabId}\\s*\\)\\s*=`, 'i');
-      let targetLineIndex = -1;
-      for (let i = 0; i < lines.length; i++) {
-        if (targetOptPattern.test(lines[i])) {
-          targetLineIndex = i;
-          break;
-        }
-      }
-
-      if (targetLineIndex !== -1) {
-        const collected = collectContinuedStatement(lines, targetLineIndex);
-        const currentList = parseIndexList(statementValue(collected.text));
-        if (!currentList.includes(elementIndex)) {
-          currentList.push(elementIndex);
-          const wrapAt = collected.endIndex > targetLineIndex ? wrapWidthFromFirstLine(lines[targetLineIndex]) : undefined;
-          const newLines = formatIndexStatement(statementKeyword(lines[targetLineIndex]), currentList.map(String), wrapAt);
-          lines.splice(targetLineIndex, collected.endIndex - targetLineIndex + 1, ...newLines);
-        }
-      } else {
-        // Create new opt_ list in the opt section
-        insertIntoSection(lines, Section.Opt, [`${optKeyword}(${targetTabId})= ${elementIndex}`]);
-      }
-    }
-
-    const newText = lines.join('\n');
-
-    // Apply the edit
-    const edit = new vscode.WorkspaceEdit();
-    edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), newText);
-
-    vscode.workspace.applyEdit(edit).then(success => {
-      if (success) {
-        const message = targetTabIds === 'all' 
-          ? `Set ${elementType}(${elementIndex}) visible on ALL tabs`
-          : `Set ${elementType}(${elementIndex}) visible on ${tabsToAdd.length} tab(s)`;
-        vscode.window.showInformationMessage(message);
-      } else {
-        vscode.window.showErrorMessage(`Failed to update tab visibility for ${elementType}(${elementIndex})`);
-      }
-    });
-  } catch (error) {
-    vscode.window.showErrorMessage(`Error updating tab visibility: ${error}`);
-  }
-}
-
 /**
  * Undo/redo from the preview: run VS Code's own undo/redo on the .frm document, so the preview
  * and the text editor share one history, then hand focus back to the preview.
@@ -1502,7 +1478,8 @@ function updateWebview(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
   const availableTriggerPrograms = getAvailableTriggerPrograms();
   const showZoomControls = vscode.workspace.getConfiguration('vertexFrmPreview').get<boolean>('showZoomControls', true);
   const mixedButtons = !mixedButtonsDismissed.has(key) && usesMixedButtons(text);
-  const parts = renderPreview(model, { initialZoom, initialActiveTab: initialTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed, mixedButtons });
+  const props = readElementProps(text.split(/\r?\n/));
+  const parts = renderPreview(model, { initialZoom, initialActiveTab: initialTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed, mixedButtons, props });
   shownTextByDoc.set(doc.uri.toString(), text);
   if (readyPanels.has(panel)) {
     // Patch the loaded page in place: no reload (which flashes), and the styles and script aren't sent again
@@ -2775,6 +2752,10 @@ interface PreviewData {
   portCols: number;
   boxOffset: number;
   toolbox: ToolboxState;
+  /** Every element's properties for the Properties panel, by type:index. */
+  props: Record<string, ElementProps>;
+  propDefs: Record<string, PropDef[]>;
+  fieldNames: string[];
 }
 
 interface PreviewOptions {
@@ -2786,6 +2767,7 @@ interface PreviewOptions {
   unindexed: { texts: number; buttons: number };
   /** Show the banner offering to convert pushbuttons to buttons. */
   mixedButtons: boolean;
+  props: Record<string, ElementProps>;
 }
 
 /** One render of the form: the page body's markup and the data its script runs with. */
@@ -3152,6 +3134,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
             ` : ''}
           </div>
           <div class="side-panels">
+            <div id="propsPanel" class="props-panel hidden" data-keep-children role="region" aria-label="Properties"></div>
             <div class="triggers-panel">
               <h4>
                 Triggers
@@ -3226,37 +3209,6 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     <div id="tabOrderContextMenu" class="context-menu hidden">
       <div class="context-menu-item" data-action="confirm-tab-order" style="color: var(--vscode-button-background, #0078d4); font-weight: 600;">✓ Confirm Tab Order<span class="context-menu-shortcut">Enter</span></div>
       <div class="context-menu-item" data-action="cancel-tab-order" style="color: #c42b1c;">✕ Cancel<span class="context-menu-shortcut">Esc</span></div>
-    </div>
-
-    <!-- Modal for Moving Element to Tab -->
-    <div id="moveModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="moveModalTitle">Set Tab Visibility</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label>Visible on Tabs</label>
-            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="moveTabAll" />
-                <strong>ALL TABS</strong>
-              </label>
-              <div id="moveTabsList" style="display: flex; flex-direction: column; gap: 6px; margin-left: 8px;">
-                ${model.tabs && model.tabs.length ? model.tabs.map(t => `
-                  <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                    <input type="checkbox" class="move-tab-checkbox" value="${t.id}" />
-                    ${escapeHtml(t.label)}
-                  </label>
-                `).join('') : ''}
-              </div>
-            </div>
-            <small>Select one or more tabs where this element should be visible</small>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-move">Confirm</button>
-          </div>
-        </div>
-      </div>
     </div>
 
     <!-- Modal for Trigger Input -->
@@ -3768,7 +3720,10 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     portRows: Number(model.portRows ?? 0),
     portCols: Number(model.portCols ?? 0),
     boxOffset: BOX_LABEL_OFFSET,
-    toolbox: savedToolbox()
+    toolbox: savedToolbox(),
+    props: opts.props,
+    propDefs: PROP_DEFS,
+    fieldNames: [...new Set(model.fields.map(f => f.name))]
   };
   return { body, data };
 }
