@@ -2,20 +2,20 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  ElementContent, ElementCopy, ElementMove, ElementRef, ImageEdit, NewElement, addElement, duplicateElements, editImage,
+  ElementCopy, ElementMove, ElementRef, NewElement, addElement, duplicateElements,
   isCopy, isMove, keyOf, moveElements, validRefs
 } from './elementEdits';
 import { copyStatements, deleteStatements, pasteStatements, validTriggerRefs } from './formClipboard';
 import { parseButtonAssignment } from './buttonAssignment';
 import { elementsInSelections, findElement, findTriggerStatements } from './elementLookup';
 import {
-  Section, bannerLength, classifyStatement, collectContinuedStatement, formatIndexStatement, insertIntoSection, isBlankLine,
-  isCommentLine, isSeparatorLine, parseIndexList, statementKeyword, statementValue, wrapWidthFromFirstLine
+  Section, bannerLength, classifyStatement, collectContinuedStatement, insertIntoSection, isBlankLine,
+  isCommentLine, isSeparatorLine, parseIndexList
 } from './frmSections';
-import { newButtonKeyword } from './frmStatements';
-import { ALIGNMENTS, Background, BackgroundEdit, addBackground, editBackground, findBackgrounds, imageCandidates, isTif, parseColor, validTabs } from './backgrounds';
+import { Background, BackgroundEdit, addBackground, findBackgrounds, imageCandidates, isTif, parseColor, validTabs } from './backgrounds';
 import { convertButtons, registerLanguageFeatures, usesMixedButtons } from './languageFeatures';
 import { EXO_FIELD, Listview, columnOrder, hasNoColumnHeaders, listviewTabs, parseFilterRow, parseListviews } from './listview';
+import { ElementProps, PROP_DEFS, PropDef, readElementProps, setElementFlag, setElementProp } from './elementProps';
 
 // The extension's install folder; the preview page's styles and script are in its media/ folder
 let extensionUri: vscode.Uri | undefined;
@@ -238,9 +238,11 @@ interface DuplicateElementsMessage { elements: ElementCopy[]; primary?: ElementR
 /** What the preview sends for a bgimage; tabIds is 'all' or the tabs it is on. */
 interface BackgroundMessage { background?: BackgroundEdit; tabIds?: unknown; }
 
-interface EditElementMessage extends ElementContent, BackgroundMessage { elementIndex: number; }
+/** One change from the Properties panel: a value, or one bit of a flags property. */
+interface PropEdit { type: string; index: number; key: string; value?: string; bit?: number; on?: boolean; }
 
-interface MoveElementMessage extends ElementRefMessage { targetTabIds: 'all' | number[]; }
+/** Changes from the Properties panel. session: one input's focus session, which undoes as one step. */
+interface SetPropsMessage { session?: unknown; edits?: unknown; }
 
 interface HeaderMessage { title?: string; }
 
@@ -487,8 +489,8 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         handleAddElement(doc, createdPanel, msg);
       } else if (msg?.command === 'deleteElements') {
         handleDeleteElements(doc, msg);
-      } else if (msg?.command === 'editElement') {
-        handleEditElement(doc, msg);
+      } else if (msg?.command === 'setProps') {
+        handleSetProps(doc, createdPanel, msg);
       } else if (msg?.command === 'updateHeader') {
         handleUpdateHeader(doc, msg);
       } else if (msg?.command === 'resolveFieldValues' && Array.isArray(msg?.names)) {
@@ -507,8 +509,6 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         queueEdit(doc, () => handleResizeElement(doc, msg));
       } else if (msg?.command === 'setTextBox') {
         handleSetTextBox(doc, msg);
-      } else if (msg?.command === 'moveElement') {
-        handleMoveElement(doc, msg);
       } else if (msg?.command === 'duplicateElements') {
         handleDuplicateElements(doc, createdPanel, msg);
       } else if (msg?.command === 'copyElements' || msg?.command === 'cutElements') {
@@ -557,6 +557,66 @@ function replaceLines(doc: vscode.TextDocument, lines: string[]): Thenable<boole
   const edit = new vscode.WorkspaceEdit();
   edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), lines.join('\n'));
   return vscode.workspace.applyEdit(edit);
+}
+
+// The Properties panel's last write: later writes of the same input session join its undo step
+let lastPropWrite: { uri: string; session: string; version: number } | undefined;
+
+/**
+ * Write new lines as one edit of only the part that changed, so the editor's cursor and scroll stay.
+ * Writes of the same panel session undo as one step, as long as nothing else changed the file in between.
+ */
+async function writePropLines(doc: vscode.TextDocument, lines: string[], session: string): Promise<boolean> {
+  const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+  const oldText = doc.getText();
+  const newText = lines.join(eol);
+  if (oldText === newText) return true;
+  let start = 0;
+  const shorter = Math.min(oldText.length, newText.length);
+  while (start < shorter && oldText[start] === newText[start]) start++;
+  let tail = 0;
+  while (tail < shorter - start && oldText[oldText.length - 1 - tail] === newText[newText.length - 1 - tail]) tail++;
+  const range = new vscode.Range(doc.positionAt(start), doc.positionAt(oldText.length - tail));
+  const text = newText.slice(start, newText.length - tail);
+  const uri = doc.uri.toString();
+  const joins = !!session && lastPropWrite?.uri === uri && lastPropWrite.session === session && lastPropWrite.version === doc.version;
+  const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === uri);
+  let done: boolean;
+  if (editor) {
+    done = await editor.edit(b => b.replace(range, text), { undoStopBefore: !joins, undoStopAfter: false });
+  } else {
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, range, text);
+    done = await vscode.workspace.applyEdit(edit);
+  }
+  lastPropWrite = done && session ? { uri, session, version: doc.version } : undefined;
+  return done;
+}
+
+function validPropEdits(edits: unknown): Array<PropEdit & ElementRef> {
+  if (!Array.isArray(edits)) return [];
+  return edits.filter((e): e is PropEdit & ElementRef => !!e && typeof e.key === 'string' &&
+    validRefs([{ type: e.type, index: e.index }], undefined, true).length === 1 &&
+    (typeof e.value === 'string' || (typeof e.bit === 'number' && typeof e.on === 'boolean')));
+}
+
+/** Changes from the Properties panel, applied one after the other and written as one edit. */
+function handleSetProps(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: SetPropsMessage) {
+  const edits = validPropEdits(msg.edits);
+  if (!edits.length) return;
+  const session = typeof msg.session === 'string' ? msg.session : '';
+  queueEdit(doc, async () => {
+    let lines = doc.getText().split(/\r?\n/);
+    const failed: string[] = [];
+    for (const e of edits) {
+      const ref = { type: e.type, index: e.index };
+      const next = typeof e.bit === 'number' ? setElementFlag(lines, ref, e.key, e.bit, !!e.on) : setElementProp(lines, ref, e.key, e.value!);
+      if (next) lines = next;
+      else failed.push(`${e.type}(${e.index})`);
+    }
+    if (failed.length) showNotice(panel, `Could not change ${[...new Set(failed)].join(', ')}`);
+    if (!await writePropLines(doc, lines, session)) vscode.window.showErrorMessage('Failed to write the change');
+  });
 }
 
 const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
@@ -942,244 +1002,6 @@ function handleSetTextBox(doc: vscode.TextDocument, msg: TextBoxMessage) {
   }
 }
 
-function handleEditBackground(doc: vscode.TextDocument, msg: EditElementMessage) {
-  const index = msg.elementIndex;
-  queueEdit(doc, async () => {
-    const lines = doc.getText().split(/\r?\n/);
-    const edited = editBackground(lines, index, msg.background ?? {}, validTabs(msg.tabIds));
-    if (!edited) {
-      vscode.window.showErrorMessage(`Could not edit bgimage(${index})`);
-      return;
-    }
-    if (edited.join('\n') === lines.join('\n')) return;
-    if (await replaceLines(doc, edited)) vscode.window.showInformationMessage(`Updated bgimage(${index})`);
-    else vscode.window.showErrorMessage(`Failed to update bgimage(${index})`);
-  });
-}
-
-function handleEditImage(doc: vscode.TextDocument, msg: EditElementMessage) {
-  const index = msg.elementIndex;
-  const edit: ImageEdit = { index, rows: msg.rows, cols: msg.cols, mode: msg.mode, file: msg.file };
-  queueEdit(doc, async () => {
-    const lines = doc.getText().split(/\r?\n/);
-    const edited = editImage(lines, edit);
-    if (!edited) {
-      vscode.window.showErrorMessage(`Could not edit image(${index})`);
-      return;
-    }
-    if (edited.join('\n') === lines.join('\n')) return;
-    if (await replaceLines(doc, edited)) vscode.window.showInformationMessage(`Updated image(${index})`);
-    else vscode.window.showErrorMessage(`Failed to update image(${index})`);
-  });
-}
-
-function handleEditElement(doc: vscode.TextDocument, msg: EditElementMessage) {
-  if (msg.elementType === 'image') {
-    handleEditImage(doc, msg);
-    return;
-  }
-  if (msg.elementType === 'bgimage') {
-    handleEditBackground(doc, msg);
-    return;
-  }
-  try {
-    const text = doc.getText();
-    const lines = text.split(/\r?\n/);
-    const elementType = msg.elementType;
-    const elementIndex = msg.elementIndex;
-
-    // Find the element line
-    const elementLineIndex = findElement(lines, elementType, elementIndex)?.startLine ?? -1;
-
-    if (elementLineIndex === -1) {
-      vscode.window.showErrorMessage(`Could not find ${elementType}(${elementIndex})`);
-      return;
-    }
-
-    // Build the new line based on element type
-    let newLine = '';
-    if (elementType === 'text') {
-      const content = msg.content || '';
-      // Add box directive if box dimensions are provided
-      const boxDirective = (msg.boxRows && msg.boxCols) ? `+" #[${msg.boxRows},${msg.boxCols}]*"` : '';
-      // Use curly braces when there's a box directive, quotes otherwise
-      if (boxDirective) {
-        newLine = `text(${elementIndex})= ${msg.row} ${msg.col} {"${content}"${boxDirective}}`;
-      } else {
-        newLine = `text(${elementIndex})= ${msg.row} ${msg.col} "${content}"`;
-      }
-    } else if (elementType === 'field') {
-      const name = msg.name || 'FIELD';
-      const type = msg.type || '1';
-      const len = msg.len || 10;
-      const ignore = msg.ignore !== undefined && msg.ignore !== null && msg.ignore !== '' ? msg.ignore : 7;
-      const values = msg.values || [];
-      let valuesStr = '';
-      if (values.length > 0) {
-        valuesStr = ' ' + values.map((v: string) => `"${v}"`).join(' ');
-      }
-      // Format field name according to nameFormat (default to plain if not specified)
-      const nameFormat = msg.nameFormat || {};
-      let formattedName = name;
-      if (nameFormat.angle && nameFormat.quoted) {
-        formattedName = `"<${name}>"`;
-      } else if (nameFormat.angle) {
-        formattedName = `<${name}>`;
-      } else if (nameFormat.quoted) {
-        formattedName = `"${name}"`;
-      }
-      newLine = `field(${elementIndex})= ${formattedName} ${type} ${msg.row} ${msg.col} ${len} ${ignore}${valuesStr}`;
-    } else if (elementType === 'pushbutton') {
-      // Keep the spelling the line already uses
-      const buttonKeyword = lines[elementLineIndex].match(/^\s*((?:push)?button)\b/i)?.[1] ?? 'button';
-      const label = msg.label || '';
-      const kind = msg.kind || 'select';
-      if (kind === 'checkbox') {
-        const name = msg.name || 'VAR';
-        const value = msg.value || '1;0';
-        newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" CHECKBOX ${name}=${value}`;
-      } else if (kind === 'radio') {
-        const name = msg.name || 'VAR';
-        const value = msg.value ?? '1';
-        newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" RADIO ${name}=${value}`;
-      } else {
-        // General button
-        if (msg.program) {
-          // Program call
-          let program = msg.program;
-          if (!program.startsWith('@')) {
-            program = '@' + program;
-          }
-          newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${program} P`;
-        } else if (msg.name) {
-          // Variable assignment (less common for general buttons, but supported)
-          const value = msg.value ?? '1';
-          newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}" ${msg.name}=${value}`;
-        } else {
-          // Basic button with no action
-          newLine = `${buttonKeyword}(${elementIndex})= ${msg.row} ${msg.col} "${label}"`;
-        }
-      }
-    } else if (elementType === 'preview') {
-      const rows = msg.rows || 10;
-      const cols = msg.cols || 30;
-      const mode = msg.mode || '0';
-      const path = msg.path || '$DIR_PICTS/file.vxp';
-      const field = msg.field || '';
-      const portType = msg.portType || 'PORT_2D';
-      const portStyleRaw = msg.portStyle ?? 'SIMPLE';
-      const portStyle = portStyleRaw === '' ? '""' : portStyleRaw;
-      newLine = `preview(${elementIndex})= ${msg.row} ${msg.col} ${rows} ${cols} ${mode} "${path}" "${field}" ${portType} ${portStyle}`;
-    }
-
-    // Replace the line
-    lines[elementLineIndex] = newLine;
-    const newText = lines.join('\n');
-
-    // Apply the edit
-    const edit = new vscode.WorkspaceEdit();
-    edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), newText);
-
-    vscode.workspace.applyEdit(edit).then(success => {
-      if (success) {
-        vscode.window.showInformationMessage(`Updated ${elementType}(${elementIndex})`);
-      } else {
-        vscode.window.showErrorMessage(`Failed to update ${elementType}(${elementIndex})`);
-      }
-    });
-  } catch (error) {
-    vscode.window.showErrorMessage(`Error editing element: ${error}`);
-  }
-}
-
-function handleMoveElement(doc: vscode.TextDocument, msg: MoveElementMessage) {
-  try {
-    const text = doc.getText();
-    const model = parseFrm(text);
-    const lines = text.split(/\r?\n/);
-    const elementType = msg.elementType;
-    const elementIndex = msg.elementIndex;
-    const targetTabIds = msg.targetTabIds; // Can be 'all' or array of tab IDs
-
-    if (!model.tabs || model.tabs.length === 0) {
-      vscode.window.showErrorMessage('No tabs defined in this form');
-      return;
-    }
-
-    // Determine the opt_ list name
-    const optTypeName = elementType === 'pushbutton' ? '(?:pushbutton|button)' : elementType;
-    
-    // Remove from all existing opt_ lists
-    const optPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*(\\d+)\\s*\\)\\s*=`, 'i');
-    for (let i = 0; i < lines.length; i++) {
-      if (!optPattern.test(lines[i])) continue;
-      const collected = collectContinuedStatement(lines, i);
-      const list = parseIndexList(statementValue(collected.text));
-      const newList = list.filter(idx => idx !== elementIndex);
-      if (newList.length === list.length) continue;
-      if (newList.length === 0) {
-        lines.splice(i, collected.endIndex - i + 1);
-        i--;
-      } else {
-        const wrapAt = collected.endIndex > i ? wrapWidthFromFirstLine(lines[i]) : undefined;
-        const newLines = formatIndexStatement(statementKeyword(lines[i]), newList.map(String), wrapAt);
-        lines.splice(i, collected.endIndex - i + 1, ...newLines);
-        i += newLines.length - 1;
-      }
-    }
-
-    // Determine which tabs to add element to
-    const tabsToAdd = targetTabIds === 'all' ? model.tabs.map(t => t.id) : targetTabIds;
-
-    // Add to each target tab's opt_ list
-    const optKeyword = elementType === 'pushbutton' ? `opt_${newButtonKeyword(lines)}` : `opt_${elementType}`;
-    
-    for (const targetTabId of tabsToAdd) {
-      const targetOptPattern = new RegExp(`^\\s*opt_${optTypeName}\\s*\\(\\s*${targetTabId}\\s*\\)\\s*=`, 'i');
-      let targetLineIndex = -1;
-      for (let i = 0; i < lines.length; i++) {
-        if (targetOptPattern.test(lines[i])) {
-          targetLineIndex = i;
-          break;
-        }
-      }
-
-      if (targetLineIndex !== -1) {
-        const collected = collectContinuedStatement(lines, targetLineIndex);
-        const currentList = parseIndexList(statementValue(collected.text));
-        if (!currentList.includes(elementIndex)) {
-          currentList.push(elementIndex);
-          const wrapAt = collected.endIndex > targetLineIndex ? wrapWidthFromFirstLine(lines[targetLineIndex]) : undefined;
-          const newLines = formatIndexStatement(statementKeyword(lines[targetLineIndex]), currentList.map(String), wrapAt);
-          lines.splice(targetLineIndex, collected.endIndex - targetLineIndex + 1, ...newLines);
-        }
-      } else {
-        // Create new opt_ list in the opt section
-        insertIntoSection(lines, Section.Opt, [`${optKeyword}(${targetTabId})= ${elementIndex}`]);
-      }
-    }
-
-    const newText = lines.join('\n');
-
-    // Apply the edit
-    const edit = new vscode.WorkspaceEdit();
-    edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), newText);
-
-    vscode.workspace.applyEdit(edit).then(success => {
-      if (success) {
-        const message = targetTabIds === 'all' 
-          ? `Set ${elementType}(${elementIndex}) visible on ALL tabs`
-          : `Set ${elementType}(${elementIndex}) visible on ${tabsToAdd.length} tab(s)`;
-        vscode.window.showInformationMessage(message);
-      } else {
-        vscode.window.showErrorMessage(`Failed to update tab visibility for ${elementType}(${elementIndex})`);
-      }
-    });
-  } catch (error) {
-    vscode.window.showErrorMessage(`Error updating tab visibility: ${error}`);
-  }
-}
-
 /**
  * Undo/redo from the preview: run VS Code's own undo/redo on the .frm document, so the preview
  * and the text editor share one history, then hand focus back to the preview.
@@ -1502,7 +1324,8 @@ function updateWebview(panel: vscode.WebviewPanel, doc: vscode.TextDocument) {
   const availableTriggerPrograms = getAvailableTriggerPrograms();
   const showZoomControls = vscode.workspace.getConfiguration('vertexFrmPreview').get<boolean>('showZoomControls', true);
   const mixedButtons = !mixedButtonsDismissed.has(key) && usesMixedButtons(text);
-  const parts = renderPreview(model, { initialZoom, initialActiveTab: initialTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed, mixedButtons });
+  const props = readElementProps(text.split(/\r?\n/));
+  const parts = renderPreview(model, { initialZoom, initialActiveTab: initialTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed, mixedButtons, props });
   shownTextByDoc.set(doc.uri.toString(), text);
   if (readyPanels.has(panel)) {
     // Patch the loaded page in place: no reload (which flashes), and the styles and script aren't sent again
@@ -2757,7 +2580,6 @@ function extractBoxesFromContent(content: string, startRow: number, startCol: nu
 
 /** Values the page script reads (media/preview.js); everything else it needs is in the markup. */
 interface PreviewData {
-  winstyle: string;
   tabOrder: number[];
   initialZoom: number;
   initialGridOn: boolean;
@@ -2775,6 +2597,10 @@ interface PreviewData {
   portCols: number;
   boxOffset: number;
   toolbox: ToolboxState;
+  /** Every element's properties for the Properties panel, by type:index. */
+  props: Record<string, ElementProps>;
+  propDefs: Record<string, PropDef[]>;
+  fieldNames: string[];
 }
 
 interface PreviewOptions {
@@ -2786,6 +2612,7 @@ interface PreviewOptions {
   unindexed: { texts: number; buttons: number };
   /** Show the banner offering to convert pushbuttons to buttons. */
   mixedButtons: boolean;
+  props: Record<string, ElementProps>;
 }
 
 /** One render of the form: the page body's markup and the data its script runs with. */
@@ -3152,6 +2979,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
             ` : ''}
           </div>
           <div class="side-panels">
+            <div id="propsPanel" class="props-panel hidden" data-keep-children role="region" aria-label="Properties"></div>
             <div class="triggers-panel">
               <h4>
                 Triggers
@@ -3226,37 +3054,6 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     <div id="tabOrderContextMenu" class="context-menu hidden">
       <div class="context-menu-item" data-action="confirm-tab-order" style="color: var(--vscode-button-background, #0078d4); font-weight: 600;">✓ Confirm Tab Order<span class="context-menu-shortcut">Enter</span></div>
       <div class="context-menu-item" data-action="cancel-tab-order" style="color: #c42b1c;">✕ Cancel<span class="context-menu-shortcut">Esc</span></div>
-    </div>
-
-    <!-- Modal for Moving Element to Tab -->
-    <div id="moveModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="moveModalTitle">Set Tab Visibility</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label>Visible on Tabs</label>
-            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="moveTabAll" />
-                <strong>ALL TABS</strong>
-              </label>
-              <div id="moveTabsList" style="display: flex; flex-direction: column; gap: 6px; margin-left: 8px;">
-                ${model.tabs && model.tabs.length ? model.tabs.map(t => `
-                  <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                    <input type="checkbox" class="move-tab-checkbox" value="${t.id}" />
-                    ${escapeHtml(t.label)}
-                  </label>
-                `).join('') : ''}
-              </div>
-            </div>
-            <small>Select one or more tabs where this element should be visible</small>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-move">Confirm</button>
-          </div>
-        </div>
-      </div>
     </div>
 
     <!-- Modal for Trigger Input -->
@@ -3357,351 +3154,8 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
       </div>
     </div>
 
-    <!-- Modal for Field Input -->
-    <div id="fieldModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="fieldModalTitle">Add Field</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label>Field Name</label>
-            <input type="text" id="fieldName" placeholder="e.g., DX, DY, CS" style="text-transform: uppercase;" />
-            <div style="display: flex; gap: 16px; margin-top: 6px;">
-              <label style="display: flex; align-items: center; gap: 6px; font-weight: normal; font-size: 12px;">
-                <input type="checkbox" id="fieldNameAngle" />
-                <span>Angle brackets &lt;&gt;</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 6px; font-weight: normal; font-size: 12px;">
-                <input type="checkbox" id="fieldNameQuoted" />
-                <span>Quoted ""</span>
-              </label>
-            </div>
-            <small>Variable name (uppercase, alphanumeric, underscore, or $ prefix)</small>
-          </div>
-          <div class="modal-field">
-            <label>Type</label>
-            <div style="display: flex; flex-direction: column; gap: 6px; margin-top: 4px;">
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType1" value="1" checked />
-                <span>Active field (1)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType2" value="2" />
-                <span>No free-text field (2)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType4" value="4" />
-                <span>Locked field (4)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType8" value="8" />
-                <span>Must assign field (8), does not allow closing without assigning value to this field</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType16" value="16" />
-                <span>unknown value (16)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType32" value="32" />
-                <span>unknown value (32)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType64" value="64" />
-                <span>unknown value (64)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType128" value="128" />
-                <span>unknown value (128)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType256" value="256" />
-                <span>unknown value (256)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType512" value="512" />
-                <span>unknown value (512)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType1024" value="1024" />
-                <span>unknown value (1024)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType2048" value="2048" />
-                <span>Unknown value (2048)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType4096" value="4096" />
-                <span>EXO field (4096)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType8192" value="8192" />
-                <span>Transparent field (8192)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType16384" value="16384" />
-                <span>Right align (16384)</span>
-              </label>
-              <label style="display: flex; align-items: center; gap: 8px; font-weight: normal;">
-                <input type="checkbox" id="fieldType32768" value="32768" />
-                <span>Center align (32768)</span>
-              </label>
-            </div>
-            <input type="text" id="fieldType" value="1" placeholder="e.g., 1, 4, 2048+4+1" style="margin-top: 8px;" />
-            <small>Select checkboxes above or type manually (e.g., 1+4, 2048+4+1)</small>
-          </div>
-          <div class="modal-field">
-            <label>Length (columns)</label>
-            <input type="number" id="fieldLen" value="10" min="1" />
-            <small>Width of the field in grid columns</small>
-          </div>
-          <div class="modal-field">
-            <label>Ignore Value (optional)</label>
-            <input type="number" id="fieldIgnore" value="${model.winstyle?.toLowerCase() === 'only' ? 4 : 7}" />
-            <small>Usually 7, leave as is if unsure</small>
-          </div>
-          <div class="modal-field">
-            <label>Dropdown Values (optional)</label>
-            <textarea id="fieldValues" placeholder='One per line, or "value1" "value2". Can also use description syntax like "Description [realvalue]*" "Description2 [realvalue2]*"'></textarea>
-            <small>For dropdown fields, enter choices (one per line or quoted). "path:name" reads choices from forms/fieldvalues</small>
-            <small id="fieldValuesHint" class="fv-hint"></small>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="hide-field">Add as/Make Hidden!</button>
-            <button class="modal-button primary" data-action="confirm-field">Confirm</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal for Button Input -->
-    <div id="buttonModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="buttonModalTitle">Add Button</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label>Button Label</label>
-            <input type="text" id="buttonLabel" placeholder="Enter button text" />
-            <small>Optional. Leave empty to create a button with an empty label ("").</small>
-          </div>
-          <div class="modal-field" id="buttonTypeField">
-            <label>Action Type</label>
-            <select id="buttonActionType">
-              <option value="program">Run Program (@...)</option>
-              <option value="variable">Set Variable</option>
-            </select>
-          </div>
-          <div class="modal-field" id="buttonProgramField">
-            <label>Program Call</label>
-            <input type="text" id="buttonProgram" placeholder="e.g., help_adapt.prg(DOC,topic)" />
-            <small>Format: @program.prg(ARGS) - the @ is optional</small>
-          </div>
-          <div class="modal-field hidden" id="buttonVariableField">
-            <label>Variable Name</label>
-            <div style="display: flex; gap: 8px;">
-              <select id="buttonVariableSelect" style="flex: 1;">
-                <option value="">-- Select existing field or type custom --</option>
-                ${model.fields.map(f => `<option value="${escapeAttr(f.name)}">${escapeHtml(f.name)}</option>`).join('')}
-              </select>
-              <input type="text" id="buttonVariable" placeholder="or type custom" style="flex: 1; text-transform: uppercase;" />
-            </div>
-            <small>Select an existing field from dropdown or type a custom variable name</small>
-          </div>
-          <div class="modal-field hidden" id="buttonValueField">
-            <label>Value</label>
-            <input type="text" id="buttonValue" placeholder="e.g., 1;0 for toggle" />
-            <small>For checkbox: value when checked;unchecked (e.g., 1;0). For the others, leave empty to set the variable to blank</small>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-button">Confirm</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal for Preview Input -->
-    <div id="previewModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="previewModalTitle">Add Preview</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label>File Path</label>
-            <input type="text" id="previewPath" placeholder="e.g., $DIR_PICTS/wind_zones.vxp" />
-            <small>Path to the preview file (use $DIR_PICTS for pictures directory)</small>
-          </div>
-          <div class="modal-field">
-            <label>Field Name (Optional)</label>
-            <input type="text" id="previewField" placeholder="Leave empty or specify field" />
-            <small>Database field containing the file name to preview</small>
-            <small>Or file path from the specified path, for example:</small>
-            <small>if Path is "$DIR_SYSPROGS/" and field can then be "filename.vxp"</small>
-          </div>
-          <div style="display: flex; gap: 12px;">
-            <div class="modal-field" style="flex: 1;">
-              <label>Rows (Height)</label>
-              <input type="number" id="previewRows" value="25" min="1" />
-            </div>
-            <div class="modal-field" style="flex: 1;">
-              <label>Columns (Width)</label>
-              <input type="number" id="previewCols" value="72" min="1" />
-            </div>
-          </div>
-          <div class="modal-field">
-            <label>Mode</label>
-            <input type="text" id="previewMode" value="0" placeholder="e.g., 0 or 1+2" />
-            <small>Bitwise flags: 1=no H stretch, 2=no V stretch, 4=auto search subfolders</small>
-            <small>8= auto search from custom branches, 16=auto search from shared branch</small>
-            <small>32=update list view also with multiple selection</small>
-          </div>
-          <div class="modal-field">
-            <label>Port Type</label>
-            <select id="previewPortType">
-              <option value="PORT_2D">PORT_2D</option>
-              <option value="PORT_3D">PORT_3D</option>
-              <option value="PORT_BMP">PORT_BMP</option>
-            </select>
-            <small>Type of preview window</small>
-          </div>
-          <div class="modal-field">
-            <label>Port Style</label>
-            <select id="previewPortStyle">
-              <option value="SIMPLE">SIMPLE</option>
-              <option value='""'>empty (full frame)</option>
-              <option value="WIREFRAME">WIREFRAME</option>
-              <option value="HIDDEN_LINE">HIDDEN_LINE</option>
-              <option value="OPENGL">OPENGL</option>
-              <option value="LW">LW</option>
-              <option value="SIMPLE_T">SIMPLE_T</option>
-            </select>
-            <small>Style for PORT_2D/PORT_3D/PORT_BMP (SIMPLE = no frame/toolbar)</small>
-            <small>Leave empty for full frame with toolbar</small>
-            <small>WIREFRAME, HIDDEN_LINE, OPENGL, LW are for 3D only</small>
-            <small>For PORT_BMP, SIMPLE_T can be used for transparent background</small>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-preview">Confirm</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
     <div id="marquee" class="marquee hidden"></div>
     <div id="selectionNotice" class="selection-notice hidden" role="status"></div>
-
-    <!-- Modal for Image Input -->
-    <div id="imageModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="imageModalTitle">Add Image</h3>
-        <div class="modal-form">
-          <div class="modal-field">
-            <label for="imageFile">File</label>
-            <input type="text" id="imageFile" placeholder="Search, or type a name such as logo.png" autocomplete="off" spellcheck="false" />
-            <div id="imageList" class="image-list" role="listbox" aria-label="Images"></div>
-            <small id="imageHint" class="fv-hint"></small>
-          </div>
-          <div style="display: flex; gap: 12px;">
-            <div class="modal-field" style="flex: 1;">
-              <label for="imageRows">Rows (Height)</label>
-              <input type="number" id="imageRows" value="10" min="1" />
-            </div>
-            <div class="modal-field" style="flex: 1;">
-              <label for="imageCols">Columns (Width)</label>
-              <input type="number" id="imageCols" value="20" min="1" />
-            </div>
-          </div>
-          <div class="modal-field">
-            <label>Type</label>
-            <div id="imageModes" class="image-modes">
-              <label><input type="checkbox" value="1" /> No horizontal stretch</label>
-              <label><input type="checkbox" value="2" /> No vertical stretch</label>
-              <label><input type="checkbox" value="64" /> Transparent by alpha channel</label>
-              <label><input type="checkbox" value="128" /> Transparent by top left corner's colour</label>
-            </div>
-            <small id="imageModeNote"></small>
-          </div>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-image">Confirm</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Background Dialog -->
-    <div id="bgModal" class="modal-overlay hidden">
-      <div class="modal">
-        <h3 id="bgModalTitle">Add Background</h3>
-        <div class="modal-form">
-          <div class="modal-field" id="bgKinds">
-            <div class="bg-options">
-              <label><input type="radio" name="bgKind" value="picture" /> Picture</label>
-              <label><input type="radio" name="bgKind" value="color" /> Colour</label>
-            </div>
-          </div>
-          <div class="modal-field bg-picture">
-            <label for="bgFile">File</label>
-            <input type="text" id="bgFile" placeholder="Search, or type a name such as logo.png" autocomplete="off" spellcheck="false" />
-            <div id="bgList" class="image-list" role="listbox" aria-label="Images"></div>
-            <small id="bgHint" class="fv-hint"></small>
-          </div>
-          <div class="modal-field bg-color">
-            <label for="bgColor">Colour</label>
-            <input type="color" id="bgColor" />
-          </div>
-          ${['Width', 'Height'].map(side => `
-          <div class="modal-field bg-picture" data-bg-part="${side.toLowerCase()}">
-            <label for="bg${side}">${side}</label>
-            <div class="bg-size">
-              <select id="bg${side}">
-                <option value="-1">Stretch</option>
-                <option value="0">Original size</option>
-                <option value="px">Pixels</option>
-              </select>
-              <input type="number" id="bg${side}Px" min="1" value="200" aria-label="${side} in pixels" />
-            </div>
-          </div>`).join('')}
-          <div class="modal-field" data-bg-part="transparency">
-            <label for="bgTransparency">Transparency <span id="bgTransparencyLabel"></span></label>
-            <input type="range" id="bgTransparency" min="0" max="255" step="1" />
-          </div>
-          <div class="modal-field bg-picture" data-bg-part="mode">
-            <label>Mode</label>
-            <div id="bgModes" class="image-modes">
-              <label><input type="checkbox" value="64" /> Transparent by alpha channel</label>
-              <label><input type="checkbox" value="128" /> Transparent by top left corner's colour</label>
-            </div>
-          </div>
-          <div class="modal-field" data-bg-part="placement">
-            <label for="bgPlacement">Placement</label>
-            <select id="bgPlacement">
-              <option value="FRAME">Inside the frame (FRAME)</option>
-              <option value="NOTFRAME">Outside the frame (NOTFRAME)</option>
-              <option value="DIALOG">Whole dialog (DIALOG)</option>
-            </select>
-          </div>
-          <div class="modal-field bg-picture" data-bg-part="alignment">
-            <label>Alignment</label>
-            <div id="bgAlignment" class="bg-alignment">
-              ${ALIGNMENTS.map(a => `<label title="${a}"><input type="radio" name="bgAlign" value="${a}" aria-label="${a}" />${a === 'TILED' ? ' Tiled' : ''}</label>`).join('')}
-            </div>
-          </div>
-          ${model.tabs && model.tabs.length ? `
-          <div class="modal-field">
-            <label>Tabs</label>
-            <div id="bgTabs" class="image-modes">
-              <label><input type="checkbox" id="bgAllTabs" /> All tabs</label>
-              ${model.tabs.map(t => `<label><input type="checkbox" class="bg-tab" value="${t.id}" /> ${escapeHtml(t.label.replace(/_/g, ' '))}</label>`).join('')}
-            </div>
-          </div>` : ''}
-          <small id="bgKept" class="fv-hint"></small>
-          <div class="modal-buttons">
-            <button class="modal-button" data-action="cancel">Cancel</button>
-            <button class="modal-button primary" data-action="confirm-background">Confirm</button>
-          </div>
-        </div>
-      </div>
-    </div>
 
     <!-- Keyboard Shortcuts -->
     <div id="shortcutsModal" class="modal-overlay hidden">
@@ -3715,14 +3169,14 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
           <h4>Selected elements</h4>
           <span><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span><span>Move one cell</span>
           <span><kbd>Shift</kbd>+<kbd>Arrow</kbd></span><span>Stretch (one field, image or preview)</span>
-          <span><kbd>F2</kbd> / <kbd>Enter</kbd></span><span>Edit (one element)</span>
+          <span><kbd>F2</kbd> / <kbd>Enter</kbd> / double-click</span><span>Edit in the Properties panel (a text: double-click edits it in place)</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>D</kbd></span><span>Duplicate one row below (several: below the group)</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>C</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>X</kbd></span><span>Copy / cut, also selected triggers, hidden fields and backgrounds</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>V</kbd></span><span>Paste at the cell under the pointer, in any form (away from the form: at the original place)</span>
           <span><kbd>Del</kbd> / <kbd>Backspace</kbd></span><span>Delete</span>
           <span><kbd>Esc</kbd></span><span>Deselect</span>
           <h4>Adding</h4>
-          <span><kbd>T</kbd> <kbd>F</kbd> <kbd>B</kbd> <kbd>C</kbd> <kbd>R</kbd> <kbd>P</kbd> <kbd>I</kbd></span><span>Add text, field, button, checkbox, radio button, preview or image at the cell under the pointer</span>
+          <span><kbd>T</kbd> <kbd>F</kbd> <kbd>B</kbd> <kbd>C</kbd> <kbd>R</kbd> <kbd>P</kbd> <kbd>I</kbd></span><span>Add text, field, button, checkbox, radio button, preview or image at the cell under the pointer; the Properties panel takes the cursor</span>
           <span>Click a tool, then a cell</span><span>Add it there (drag to size fields, previews and images; double-click the tool to add several; <kbd>Esc</kbd> or right-click stops)</span>
           <h4>Form</h4>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Z</kbd></span><span>Undo (shared with the .frm source)</span>
@@ -3734,10 +3188,14 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>=</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>−</kbd></span><span>Zoom in / out (5%)</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>0</kbd></span><span>Reset to 100%</span>
           <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>1</kbd></span><span>Fit the form to the panel</span>
-          <h4>Dialogs</h4>
-          <span><kbd>Esc</kbd></span><span>Cancel, discarding changes</span>
-          <span><kbd data-kbd-mod>Ctrl</kbd>+<kbd>Enter</kbd></span><span>Confirm</span>
+          <h4>Properties panel</h4>
+          <span>Typing</span><span>Written to the file when you pause; red means the value is not written</span>
+          <span><kbd>Enter</kbd></span><span>Write and go back to the form (dropdown values: <kbd data-kbd-mod>Ctrl</kbd>+<kbd>Enter</kbd>)</span>
+          <span><kbd>Esc</kbd></span><span>Back to the value in the file; again: back to the form</span>
           <span><kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd></span><span>Next / previous input</span>
+          <span><kbd>↑</kbd><kbd>↓</kbd> / <kbd>Enter</kbd></span><span>In a file name: walk the images list / take the highlighted one</span>
+          <h4>Dialogs (triggers)</h4>
+          <span><kbd>Esc</kbd> / <kbd data-kbd-mod>Ctrl</kbd>+<kbd>Enter</kbd></span><span>Cancel / confirm</span>
           <span>Click outside</span><span>Close (asks first if anything changed)</span>
           <h4>Context menus</h4>
           <span><kbd>↑</kbd><kbd>↓</kbd></span><span>Move highlight</span>
@@ -3751,7 +3209,6 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     </div>
 `;
   const data: PreviewData = {
-    winstyle: model.winstyle || 'VXUI',
     tabOrder: model.tabOrder || [],
     initialZoom,
     initialGridOn: typeof initialGridOn === 'boolean' ? initialGridOn : false,
@@ -3768,7 +3225,10 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     portRows: Number(model.portRows ?? 0),
     portCols: Number(model.portCols ?? 0),
     boxOffset: BOX_LABEL_OFFSET,
-    toolbox: savedToolbox()
+    toolbox: savedToolbox(),
+    props: opts.props,
+    propDefs: PROP_DEFS,
+    fieldNames: [...new Set(model.fields.map(f => f.name))]
   };
   return { body, data };
 }

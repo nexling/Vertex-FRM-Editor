@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-11-27
+
+### Added
+
+- A Properties panel replaces the add and edit dialogs. While elements are selected it covers the side lists and shows their properties; every change is written to the file as you type (when you pause; checkboxes at once). Only the changed value is rewritten, so spacing, comments, quotes and braces stay, and one input's typing is one undo step. Invalid values are shown red and not written; Esc goes back to the file's value, Enter back to the form.
+- The panel covers texts (content, box), fields (name with brackets and quotes, type flags, length, ignore value, dropdown values with what `path:` reads, group), buttons (label, kind, action), images, previews, backgrounds, list view tables, and a table column with its heading (click the heading). Tabs are ticked per element.
+- Several selected elements are edited at once: the panel shows what they have in common, values that differ show as "mixed", and a flag or tab clicked there is set or cleared on each of them without touching the rest.
+- A field's group can be changed: it moves to the end of that `group(n)`, which is made like `group(1)` if needed; a group left empty goes. A field in no group is pointed out.
+- The images list (with thumbnails) opens under a file name while it has the cursor; a missing file is reported, and a new image that wasn't drawn takes its picture's size.
+
+### Changed
+
+- Adding writes the element straight away with defaults (field `FIELD<n>` of length 10, button `Button`, checkbox and radio button with `VAR`, preview 5 × 20 and image without a file) and puts the cursor in the panel. + Add in the Backgrounds panel adds a white background.
+- F2, Enter, double-click and right-click > Edit put the cursor in the panel, also with several elements selected. Double-clicking a text still edits it in place, now showing an `{EXPRESSION}` as written.
+- The panel steps aside while you drag, so fields can still be dropped on Hidden Fields.
+
+### Removed
+
+- The field, button, preview, image, background and Set Tab Visibility dialogs.
+
 ## 2026-11-25
 
 ### Added

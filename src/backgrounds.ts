@@ -3,7 +3,7 @@
 import { addToTab, updateOptLists } from './elementEdits';
 import { findElementStatements } from './elementLookup';
 import { Section, insertIntoSection } from './frmSections';
-import { LineEdit, Statement, Token, applyLineEdits, itemsOf, parseStatements, trailingCommentStart } from './frmStatements';
+import { LineEdit, Statement, Token, applyLineEdits, itemsOf, parseStatements, valueTokens } from './frmStatements';
 
 export const PLACEMENTS = ['FRAME', 'NOTFRAME', 'DIALOG'];
 export const ALIGNMENTS = [
@@ -37,19 +37,7 @@ export type BackgroundEdit = Partial<BackgroundValues>;
 
 /** The value's tokens: strings and brace expressions are one token each. Stops at a comment. */
 export function backgroundTokens(lines: string[], s: Statement): Token[] {
-  const tokens: Token[] = [];
-  if (s.valueStart < 0) return tokens;
-  for (let line = s.startLine; line <= s.endLine; line++) {
-    const content = lines[line].slice(0, trailingCommentStart(lines[line])).replace(/\s*\\\s*$/, '');
-    const regex = /"[^"]*"|\{[^}]*\}|[^\s"{]+/g;
-    regex.lastIndex = line === s.startLine ? s.valueStart : 0;
-    let m: RegExpExecArray | null;
-    while ((m = regex.exec(content))) {
-      if (m[0].startsWith('!')) break;
-      tokens.push({ line, start: m.index, end: m.index + m[0].length, text: m[0] });
-    }
-  }
-  return tokens;
+  return valueTokens(lines, s);
 }
 
 /** A token without quotes, or null for a brace expression that isn't just a string. */

@@ -80,6 +80,8 @@
       return;
     }
     patchAttributes(node, next);
+    // The page script owns what is inside (the Properties panel): an input there keeps its focus and text
+    if (node.hasAttribute('data-keep-children')) return;
     patchChildren(node, next, null);
     // Form controls reset to what the markup says, as freshly created ones would be
     if (node.nodeName === 'INPUT') {
@@ -175,8 +177,6 @@ window.__frmMain = function(D) {
   vscodeApi = window.__frmVscodeApi || undefined;
   var root = document.documentElement;
   var basePx = 11; // default matches CSS
-  var winstyle = D.winstyle; // vxdbase_winstyle from FRM file
-  var defaultIgnoreValue = winstyle.toLowerCase() === 'only' ? 4 : 7;
   try {
     var fs = getComputedStyle(root).getPropertyValue('--frm-font-size').trim();
     // Never matches a size like "11px" (it was written as [\d.] inside a template string, which dropped the
@@ -512,20 +512,29 @@ window.__frmMain = function(D) {
     if (over && thumb) thumb.style.width = Math.max(8, 100 * cols.clientWidth / cols.scrollWidth) + '%';
   }
 
-  // Clicking a column heading selects the table and shows the column's field(n) and text(n) in the editor
+  // Clicking a column heading selects the table and its column: the Properties panel shows the column's
+  // field(n) and heading text(n), and the editor shows their lines
   function setupListviewColumns() {
     document.querySelectorAll('.grid > .listview .lv-col').forEach(function(col) {
       col.addEventListener('click', function(e) {
         if (tabOrderMode || e.ctrlKey || e.metaKey || e.shiftKey) return;
         if (!e.target.closest('.lv-head, .lv-filter')) return;
         e.stopPropagation();
-        selectElement(col.closest('.listview')); // clears the previous column mark
-        col.classList.add('lv-col-active');
+        var table = col.closest('.listview');
         var field = parseInt(col.getAttribute('data-col-field'), 10);
+        propsState.column = isFinite(field) ? { key: elementKey(table), field: field } : null;
+        selectElement(table);
+        col.classList.add('lv-col-active');
         if (isFinite(field) && vscodeApi && vscodeApi.postMessage) {
           vscodeApi.postMessage({ command: 'showColumnInSource', fieldIndex: field });
         }
       });
+    });
+  }
+
+  function markColumn(table, field) {
+    table.querySelectorAll('.lv-col').forEach(function(c) {
+      c.classList.toggle('lv-col-active', c.getAttribute('data-col-field') === String(field));
     });
   }
 
@@ -657,8 +666,7 @@ window.__frmMain = function(D) {
   // Context menu and element creation functionality
   var contextMenuState = {
     row: 0,
-    col: 0,
-    buttonType: 'select' // 'select', 'checkbox', 'radio'
+    col: 0
   };
 
   var elementContextMenuState = {
@@ -818,136 +826,17 @@ window.__frmMain = function(D) {
     if (!topModal()) restoreCanvasFocus();
   }
 
-  // Type, index and the data the edit dialogs need, read from a rendered element
+  // Type, index, position and (texts) box of a rendered element
   function collectElementInfo(element) {
-    var elementType = element.getAttribute('data-type');
-    var elementIndex = 0;
-    var elementData = {
-      row: parseInt(element.getAttribute('data-row')),
-      col: parseInt(element.getAttribute('data-col'))
-    };
-
-    // Get element index based on type
-    if (elementType === 'text') {
-      elementIndex = parseInt(element.getAttribute('data-text-idx'));
-    } else if (elementType === 'field') {
-      elementIndex = parseInt(element.getAttribute('data-field-idx'));
-    } else if (elementType === 'pushbutton') {
-      elementIndex = parseInt(element.getAttribute('data-pb-idx'));
-    } else if (elementType === 'bgimage') {
-      elementIndex = parseInt(element.getAttribute('data-bgimage-idx'));
-    } else if (elementType === 'image') {
-      elementIndex = parseInt(element.getAttribute('data-image-idx'));
-    } else if (elementType === 'preview') {
-      elementIndex = parseInt(element.getAttribute('data-preview-idx'));
-    } else if (elementType === 'listview') {
-      elementIndex = parseInt(element.getAttribute('data-listview-idx'));
+    var data = { row: parseInt(element.getAttribute('data-row'), 10), col: parseInt(element.getAttribute('data-col'), 10) };
+    var boxRows = element.getAttribute('data-box-rows');
+    var boxCols = element.getAttribute('data-box-cols');
+    if (boxRows && boxCols) {
+      data.boxRows = parseInt(boxRows, 10);
+      data.boxCols = parseInt(boxCols, 10);
     }
-
-    // Get element-specific data from the element
-    if (elementType === 'text') {
-      // Get text content excluding drag-handle and delete-button
-      var textContent = '';
-      for (var i = 0; i < element.childNodes.length; i++) {
-        var node = element.childNodes[i];
-        // Include text nodes and skip delete-button elements
-        if (node.nodeType === 3) { // Text node
-          textContent += node.textContent;
-        } else if (node.nodeType === 1 && !node.classList.contains('delete-button') && !node.classList.contains('insertion-point')) {
-          textContent += node.textContent;
-        }
-      }
-      elementData.content = textContent.trim();
-      // Extract box dimensions if present
-      var boxRows = element.getAttribute('data-box-rows');
-      var boxCols = element.getAttribute('data-box-cols');
-      if (boxRows && boxCols) {
-        elementData.boxRows = parseInt(boxRows);
-        elementData.boxCols = parseInt(boxCols);
-      }
-    } else if (elementType === 'field') {
-      elementData.name = element.getAttribute('data-field-name') || '';
-      const nameFormatAttr = element.getAttribute('data-field-nameformat');
-      try {
-        elementData.nameFormat = nameFormatAttr ? JSON.parse(nameFormatAttr) : {};
-      } catch {
-        elementData.nameFormat = {};
-      }
-      const rawFieldType = element.getAttribute('data-field-type');
-      elementData.type = rawFieldType && rawFieldType.trim()
-        ? rawFieldType.trim()
-        : (element.classList.contains('locked') ? '4' : '1');
-      // Use stored length attribute to avoid including dropdown padding
-      const storedLen = element.getAttribute('data-field-len');
-      if (storedLen) {
-        elementData.len = parseInt(storedLen);
-      } else {
-        // Fallback: extract from grid span and subtract 2 if dropdown
-        const span = element.style.gridColumnEnd ? 
-          parseInt(element.style.gridColumnEnd.replace('span ', '')) : 10;
-        const isDropdown = element.classList.contains('dropdown');
-        elementData.len = isDropdown ? Math.max(1, span - 2) : span;
-      }
-      const rawValues = element.getAttribute('data-field-values');
-      if (rawValues) {
-        try {
-          elementData.values = JSON.parse(rawValues);
-        } catch {
-          elementData.values = [];
-        }
-      } else {
-        elementData.values = [];
-      }
-    } else if (elementType === 'pushbutton') {
-      var labelEl = element.querySelector('.label, .btn');
-      elementData.label = labelEl ? labelEl.textContent.trim() : '';
-      var kindAttr = element.getAttribute('data-pb-kind');
-      elementData.kind = kindAttr || (element.classList.contains('checkbox') ? 'checkbox' : element.classList.contains('radio') ? 'radio' : 'select');
-      var dataName = element.getAttribute('data-pb-name');
-      if (dataName) {
-        elementData.name = dataName;
-      }
-      var dataValue = element.getAttribute('data-pb-value');
-      if (dataValue !== null) {
-        elementData.value = dataValue; // '' sets the variable to blank
-      } else {
-        if (elementData.kind === 'checkbox') {
-          elementData.value = '1;0';
-        } else if (elementData.kind === 'radio') {
-          elementData.value = '1';
-        }
-      }
-      var dataProgram = element.getAttribute('data-pb-program');
-      if (dataProgram) {
-        elementData.program = dataProgram;
-      }
-      var dataAction = element.getAttribute('data-pb-action');
-      if (dataAction) {
-        elementData.action = dataAction;
-      } else if (elementData.kind === 'checkbox' || elementData.kind === 'radio' || elementData.name) {
-        elementData.action = 'variable';
-      } else if (elementData.program) {
-        elementData.action = 'program';
-      }
-    } else if (elementType === 'preview') {
-      elementData.mode = element.getAttribute('data-preview-mode') || '0';
-      elementData.path = element.getAttribute('data-preview-path') || '$DIR_PICTS/file.vxp';
-      elementData.field = element.getAttribute('data-preview-field') || '';
-      elementData.portType = element.getAttribute('data-preview-porttype') || 'PORT_2D';
-      elementData.portStyle = element.getAttribute('data-preview-portstyle') || 'SIMPLE';
-      // Get rows and cols from data attributes
-      const rowsAttr = element.getAttribute('data-preview-rows');
-      const colsAttr = element.getAttribute('data-preview-cols');
-      elementData.rows = rowsAttr ? parseInt(rowsAttr) : 25;
-      elementData.cols = colsAttr ? parseInt(colsAttr) : 72;
-    } else if (elementType === 'image') {
-      elementData.file = (element.getAttribute('data-image-file') || '').replace(/^"|"$/g, '');
-      elementData.mode = element.getAttribute('data-image-mode') || '0';
-      elementData.rows = parseInt(element.getAttribute('data-image-rows'), 10);
-      elementData.cols = parseInt(element.getAttribute('data-image-cols'), 10);
-    }
-
-    return { type: elementType, index: elementIndex, data: elementData };
+    var index = elementIndexOf(element);
+    return { type: element.getAttribute('data-type'), index: index === null ? NaN : index, data: data };
   }
 
   function setupContextMenu() {
@@ -1029,140 +918,13 @@ window.__frmMain = function(D) {
         
         var elementType = elementContextMenuState.elementType;
         var elementIndex = elementContextMenuState.elementIndex;
-        var elementData = elementContextMenuState.elementData;
         
         switch(action) {
           case 'edit-element':
-            // Open appropriate modal with existing data
-            if (elementType === 'listview') {
-              // No dialog: the table's numbers are edited in the file
-              if (vscodeApi && vscodeApi.postMessage) {
-                vscodeApi.postMessage({ command: 'showInSource', elementType: 'listview', elementIndex: elementIndex });
-              }
-            } else if (elementType === 'text') {
-              startTextEdit(elementContextMenuState.element);
-            } else if (elementType === 'field') {
-              document.getElementById('fieldModalTitle').textContent = 'Edit Field';
-              document.getElementById('fieldName').value = elementData.name || '';
-              
-              // Set name format checkboxes
-              document.getElementById('fieldNameAngle').checked = elementData.nameFormat?.angle || false;
-              document.getElementById('fieldNameQuoted').checked = elementData.nameFormat?.quoted || false;
-              
-              // Parse type expression and set checkboxes
-              var typeExpr = (elementData.type || '1').toString();
-              var typeValues = typeExpr.split('+').map(function(v) { return v.trim(); });
-              
-              // Reset all checkboxes
-              document.getElementById('fieldType1').checked = false;
-              document.getElementById('fieldType4').checked = false;
-              document.getElementById('fieldType8').checked = false;
-              document.getElementById('fieldType16').checked = false;
-              document.getElementById('fieldType32').checked = false;
-              document.getElementById('fieldType64').checked = false;
-              document.getElementById('fieldType128').checked = false;
-              document.getElementById('fieldType256').checked = false;
-              document.getElementById('fieldType512').checked = false;
-              document.getElementById('fieldType1024').checked = false;
-              document.getElementById('fieldType2048').checked = false;
-              document.getElementById('fieldType4096').checked = false;
-              document.getElementById('fieldType8192').checked = false;
-              document.getElementById('fieldType16384').checked = false;
-              document.getElementById('fieldType32768').checked = false;
-              
-              // Set checkboxes based on type expression
-              typeValues.forEach(function(val) {
-                if (val === '1') document.getElementById('fieldType1').checked = true;
-                else if (val === '4') document.getElementById('fieldType4').checked = true;
-                else if (val === '8') document.getElementById('fieldType8').checked = true;
-                else if (val === '16') document.getElementById('fieldType16').checked = true;
-                else if (val === '32') document.getElementById('fieldType32').checked = true;
-                else if (val === '64') document.getElementById('fieldType64').checked = true;
-                else if (val === '128') document.getElementById('fieldType128').checked = true;
-                else if (val === '256') document.getElementById('fieldType256').checked = true;
-                else if (val === '512') document.getElementById('fieldType512').checked = true;
-                else if (val === '1024') document.getElementById('fieldType1024').checked = true;
-                else if (val === '2048') document.getElementById('fieldType2048').checked = true;
-                else if (val === '4096') document.getElementById('fieldType4096').checked = true;
-                else if (val === '8192') document.getElementById('fieldType8192').checked = true;
-                else if (val === '16384') document.getElementById('fieldType16384').checked = true;
-                else if (val === '32768') document.getElementById('fieldType32768').checked = true;
-              });
-              
-              document.getElementById('fieldType').value = typeExpr;
-              document.getElementById('fieldLen').value = elementData.len || 10;
-              
-              // Populate dropdown values if any
-              var valuesTextarea = document.getElementById('fieldValues');
-              if (valuesTextarea && elementData.values && elementData.values.length > 0) {
-                valuesTextarea.value = elementData.values.map(function(v) { return '"' + v + '"'; }).join(' ');
-              } else if (valuesTextarea) {
-                valuesTextarea.value = '';
-              }
-              updateFieldValuesHint();
-
-              document.getElementById('fieldModal').setAttribute('data-edit-mode', 'true');
-              document.getElementById('fieldModal').setAttribute('data-edit-index', elementIndex);
-              document.getElementById('fieldModal').setAttribute('data-nameformat', JSON.stringify(elementData.nameFormat || {}));
-              showModal('fieldModal');
-              document.getElementById('fieldName').focus();
-            } else if (elementType === 'pushbutton') {
-              clearButtonModal();
-              document.getElementById('buttonModalTitle').textContent = 'Edit Button';
-              document.getElementById('buttonLabel').value = elementData.label || '';
-              contextMenuState.buttonType = elementData.kind || 'select';
-              document.getElementById('buttonModal').setAttribute('data-edit-mode', 'true');
-              document.getElementById('buttonModal').setAttribute('data-edit-index', elementIndex);
-              var actionSelect = document.getElementById('buttonActionType');
-              if (actionSelect) {
-                actionSelect.value = elementData.action === 'variable' ? 'variable' : 'program';
-              }
-              if (elementData.program) {
-                document.getElementById('buttonProgram').value = elementData.program;
-              }
-              if (elementData.name) {
-                document.getElementById('buttonVariable').value = elementData.name;
-              }
-              if (elementData.value != null) {
-                document.getElementById('buttonValue').value = elementData.value;
-              } else if (elementData.kind === 'checkbox') {
-                document.getElementById('buttonValue').value = '1;0';
-              } else if (elementData.kind === 'radio') {
-                document.getElementById('buttonValue').value = '1';
-              }
-              setupButtonModal('Edit ' + (elementData.kind === 'checkbox' ? 'Checkbox' : elementData.kind === 'radio' ? 'Radio Button' : 'Button'));
-              if (contextMenuState.buttonType === 'select') {
-                updateButtonFieldVisibility();
-              }
-              showModal('buttonModal');
-              document.getElementById('buttonLabel').focus();
-            } else if (elementType === 'preview') {
-              document.getElementById('previewModalTitle').textContent = 'Edit Preview';
-              document.getElementById('previewPath').value = elementData.path || '$DIR_PICTS/file.vxp';
-              document.getElementById('previewField').value = elementData.field || '';
-              document.getElementById('previewRows').value = elementData.rows || 25;
-              document.getElementById('previewCols').value = elementData.cols || 72;
-              document.getElementById('previewMode').value = elementData.mode || '0';
-              document.getElementById('previewPortType').value = elementData.portType || 'PORT_2D';
-              document.getElementById('previewPortStyle').value = elementData.portStyle ?? 'SIMPLE';
-              document.getElementById('previewModal').setAttribute('data-edit-mode', 'true');
-              document.getElementById('previewModal').setAttribute('data-edit-index', elementIndex);
-              showModal('previewModal');
-              document.getElementById('previewPath').focus();
-            } else if (elementType === 'bgimage') {
-              openBackgroundModal(elementContextMenuState.element);
-            } else if (elementType === 'image' && isFinite(elementIndex)) {
-              openImageModal({ index: elementIndex, data: elementData }, null);
-            }
+            focusPropsPanel(elementContextMenuState.element);
             break;
           case 'move-element':
-            // Open move modal
-            document.getElementById('moveModalTitle').textContent = 'Set Tab Visibility for ' + elementType + '(' + elementIndex + ')';
-            document.getElementById('moveModal').setAttribute('data-element-type', elementType);
-            document.getElementById('moveModal').setAttribute('data-element-index', elementIndex);
-            // Populate current visibility state
-            populateTabVisibility(elementType, elementIndex);
-            showModal('moveModal');
+            focusPropsPanel(elementContextMenuState.element, 'tabs');
             break;
           case 'toggle-box':
             if (elementContextMenuState.element) toggleTextBox(elementContextMenuState.element);
@@ -1198,12 +960,6 @@ window.__frmMain = function(D) {
     // Setup modal action handlers
     setupHeaderEdit();
     setupTextEdit();
-    setupFieldModal();
-    setupButtonModal();
-    setupPreviewModal();
-    setupImageModal();
-    setupBackgroundModal();
-    setupMoveModal();
     setupTriggerModal();
 
     // Setup document-level context menu for outside-grid clicks
@@ -1242,105 +998,6 @@ window.__frmMain = function(D) {
           showModal('triggerModal');
         }
       });
-    });
-  }
-
-  function setupMoveModal() {
-    var modal = document.getElementById('moveModal');
-    if (!modal) return;
-
-    // Handle ALL checkbox toggle
-    var allCheckbox = document.getElementById('moveTabAll');
-    if (allCheckbox) {
-      allCheckbox.addEventListener('change', function() {
-        var checkboxes = document.querySelectorAll('.move-tab-checkbox');
-        checkboxes.forEach(function(cb) {
-          cb.disabled = this.checked;
-          if (this.checked) {
-            cb.checked = false;
-          }
-        }.bind(this));
-      });
-    }
-
-    // When individual checkboxes are clicked, uncheck ALL
-    document.querySelectorAll('.move-tab-checkbox').forEach(function(cb) {
-      cb.addEventListener('change', function() {
-        if (this.checked && allCheckbox) {
-          allCheckbox.checked = false;
-        }
-      });
-    });
-
-    // Cancel button
-    modal.querySelector('[data-action="cancel"]').addEventListener('click', function() {
-      hideModal('moveModal');
-    });
-
-    // Confirm button
-    modal.querySelector('[data-action="confirm-move"]').addEventListener('click', function() {
-      var elementType = modal.getAttribute('data-element-type');
-      var elementIndex = parseInt(modal.getAttribute('data-element-index'));
-
-      if (!elementType || !elementIndex) {
-        return;
-      }
-
-      // Get selected tabs
-      var targetTabIds = [];
-      var allChecked = document.getElementById('moveTabAll').checked;
-      
-      if (allChecked) {
-        targetTabIds = 'all';
-      } else {
-        document.querySelectorAll('.move-tab-checkbox:checked').forEach(function(cb) {
-          targetTabIds.push(parseInt(cb.value));
-        });
-        
-        if (targetTabIds.length === 0) {
-          // Skip if no tabs selected
-          return;
-        }
-      }
-
-      // Send to VS Code
-      if (vscodeApi && vscodeApi.postMessage) {
-        vscodeApi.postMessage({
-          command: 'moveElement',
-          elementType: elementType,
-          elementIndex: elementIndex,
-          targetTabIds: targetTabIds
-        });
-      }
-
-      hideModal('moveModal');
-    });
-  }
-
-  function populateTabVisibility(elementType, elementIndex) {
-    // Determine which tabs currently show this element
-    var currentTabs = [];
-    
-    // Check each tab's opt_ list
-    var tabLists = elementType === 'text' ? D.tabTexts :
-                   elementType === 'field' ? D.tabFields :
-                   elementType === 'pushbutton' ? D.tabPushButtons :
-                   elementType === 'image' ? D.tabImages :
-                   elementType === 'preview' ? D.tabPreviews : {};
-    D.tabs.forEach(function(t) {
-      if ((tabLists[t.id] || []).indexOf(elementIndex) !== -1) currentTabs.push(t.id);
-    });
-    
-    // Check if element is visible on all tabs
-    var allTabs = D.tabs.map(function(t) { return t.id; });
-    var isOnAllTabs = allTabs.length > 0 && currentTabs.length === allTabs.length;
-    
-    // Update checkboxes
-    document.getElementById('moveTabAll').checked = isOnAllTabs;
-    document.querySelectorAll('.move-tab-checkbox').forEach(function(cb) {
-      var tabId = parseInt(cb.value);
-      cb.checked = !isOnAllTabs && currentTabs.indexOf(tabId) !== -1;
-      cb.disabled = isOnAllTabs;
     });
   }
 
@@ -1404,12 +1061,14 @@ window.__frmMain = function(D) {
     });
   }
 
-  // Edit an existing text in place (double-click, F2/Enter, or Edit in its context menu)
+  // Edit an existing text in place (double-click). Shows the content as the Properties panel does:
+  // plain text, or an {EXPRESSION} as written.
   function startTextEdit(el) {
     if (!el || el.getAttribute('data-type') !== 'text' || tabOrderMode) return;
     var info = collectElementInfo(el);
-    if (!isFinite(info.index)) return;
-    var old = info.data.content || '';
+    var props = propValues['text:' + info.index];
+    if (!isFinite(info.index) || !props) return;
+    var old = props.values.content;
     var label = Array.prototype.filter.call(el.childNodes, function(n) { return n.nodeType === 3; });
     selectElement(el);
     label.forEach(function(n) { n.remove(); });
@@ -1423,17 +1082,7 @@ window.__frmMain = function(D) {
       else label.forEach(function(n) { el.appendChild(n); });
       fitTextSpans();
       restoreCanvasFocus();
-      if (!changed || !vscodeApi || !vscodeApi.postMessage) return;
-      vscodeApi.postMessage({
-        command: 'editElement',
-        elementType: 'text',
-        elementIndex: info.index,
-        row: info.data.row,
-        col: info.data.col,
-        content: v,
-        boxRows: info.data.boxRows || null,
-        boxCols: info.data.boxCols || null
-      });
+      if (changed) sendPropEdits([{ type: 'text', index: info.index, key: 'content', value: v }], newSession());
     });
   }
 
@@ -1464,14 +1113,16 @@ window.__frmMain = function(D) {
     });
   }
 
+  // Double-click: a text is edited where it is drawn, other elements in the Properties panel
   function setupTextEdit() {
     document.addEventListener('dblclick', function(e) {
-      if (e.target.closest('.inline-edit, .el-resize, .box-resize')) return;
-      var el = e.target.closest('.grid > .text.draggable');
-      if (!el || !el.hasAttribute('data-text-idx')) return;
+      if (tabOrderMode || e.target.closest('.inline-edit, .el-resize, .box-resize, .lv-col')) return;
+      var el = e.target.closest('.grid > .draggable');
+      if (!el) return;
       e.preventDefault();
       e.stopPropagation();
-      startTextEdit(el);
+      if (el.classList.contains('text') && el.hasAttribute('data-text-idx')) startTextEdit(el);
+      else focusPropsPanel(el);
     });
   }
 
@@ -1490,520 +1141,6 @@ window.__frmMain = function(D) {
     var cols = Math.max(minCols, Math.min(Math.max(20, minCols), gridCols - newCol + 1));
     var rows = Math.max(1, Math.min(5, gridRows - row)); // drawn rows + 1 tall
     vscodeApi.postMessage({ command: 'setTextBox', index: info.index, col: newCol, boxRows: rows, boxCols: cols });
-  }
-
-  function setupFieldModal() {
-    var modal = document.getElementById('fieldModal');
-    if (!modal) return;
-
-    // Update type field when checkboxes change
-    function updateFieldTypeFromCheckboxes() {
-      var checkboxes = [
-        document.getElementById('fieldType1'),
-        document.getElementById('fieldType4'),
-        document.getElementById('fieldType8'),
-        document.getElementById('fieldType16'),
-        document.getElementById('fieldType32'),
-        document.getElementById('fieldType64'),
-        document.getElementById('fieldType128'),
-        document.getElementById('fieldType256'),
-        document.getElementById('fieldType512'),
-        document.getElementById('fieldType1024'),
-        document.getElementById('fieldType2048'),
-        document.getElementById('fieldType4096'),
-        document.getElementById('fieldType8192'),
-        document.getElementById('fieldType16384'),
-        document.getElementById('fieldType32768')
-      ];
-      var selectedValues = checkboxes
-        .filter(function(cb) { return cb && cb.checked; })
-        .map(function(cb) { return cb.value; });
-      
-      var typeExpr = selectedValues.length > 0 ? selectedValues.join('+') : '1';
-      document.getElementById('fieldType').value = typeExpr;
-    }
-
-    // Update checkboxes when user types in the field
-    function updateCheckboxesFromFieldType() {
-      var typeInput = document.getElementById('fieldType');
-      var typeExpr = typeInput.value.trim();
-      var typeValues = typeExpr.split('+').map(function(v) { return v.trim(); });
-      
-      // Update checkboxes based on typed expression
-      document.getElementById('fieldType1').checked = typeValues.includes('1');
-      document.getElementById('fieldType4').checked = typeValues.includes('4');
-      document.getElementById('fieldType8').checked = typeValues.includes('8');
-      document.getElementById('fieldType16').checked = typeValues.includes('16');
-      document.getElementById('fieldType32').checked = typeValues.includes('32');
-      document.getElementById('fieldType64').checked = typeValues.includes('64');
-      document.getElementById('fieldType128').checked = typeValues.includes('128');
-      document.getElementById('fieldType256').checked = typeValues.includes('256');
-      document.getElementById('fieldType512').checked = typeValues.includes('512');
-      document.getElementById('fieldType1024').checked = typeValues.includes('1024');
-      document.getElementById('fieldType2048').checked = typeValues.includes('2048');
-      document.getElementById('fieldType4096').checked = typeValues.includes('4096');
-      document.getElementById('fieldType8192').checked = typeValues.includes('8192');
-      document.getElementById('fieldType16384').checked = typeValues.includes('16384');
-      document.getElementById('fieldType32768').checked = typeValues.includes('32768');
-    }
-
-    // Attach change listeners to checkboxes
-    ['fieldType1', 'fieldType4', 'fieldType8', 'fieldType16', 'fieldType32', 'fieldType64', 'fieldType128', 'fieldType256', 'fieldType512', 'fieldType1024', 'fieldType2048', 'fieldType4096', 'fieldType8192', 'fieldType16384', 'fieldType32768'].forEach(function(id) {
-      var checkbox = document.getElementById(id);
-      if (checkbox) {
-        checkbox.addEventListener('change', updateFieldTypeFromCheckboxes);
-      }
-    });
-
-    // Attach input listener to the text field
-    var fieldTypeInput = document.getElementById('fieldType');
-    if (fieldTypeInput) {
-      fieldTypeInput.addEventListener('input', updateCheckboxesFromFieldType);
-    }
-
-    // Cancel button
-    modal.querySelector('[data-action="cancel"]').addEventListener('click', function() {
-      hideModal('fieldModal');
-      clearFieldModal();
-    });
-
-    function submitField(forceHidden) {
-      var name = document.getElementById('fieldName').value.trim().toUpperCase();
-      var type = document.getElementById('fieldType').value.trim();
-      var len = parseInt(document.getElementById('fieldLen').value);
-      var ignore = parseInt(document.getElementById('fieldIgnore').value);
-      var valuesText = document.getElementById('fieldValues').value.trim();
-
-      if (!name || !/^[$A-Z0-9_]+$/.test(name)) {
-        // Skip if invalid field name
-        return;
-      }
-
-      if (!type) {
-        // Skip if no field type
-        return;
-      }
-
-      if (!len || len < 1) {
-        // Skip if invalid field length
-        return;
-      }
-
-      // Parse values (can be one per line or quoted values)
-      var values = [];
-      if (valuesText) {
-        // Try to extract quoted values first
-        var quotedMatches = valuesText.match(/"([^"]+)"/g);
-        if (quotedMatches) {
-          values = quotedMatches.map(function(v) { return v.slice(1, -1); });
-        } else {
-          // Split by newlines
-          values = valuesText.split('\n').map(function(v) { return v.trim(); }).filter(Boolean);
-        }
-      }
-
-      var isEditMode = modal.getAttribute('data-edit-mode') === 'true';
-      var editIndex = parseInt(modal.getAttribute('data-edit-index'));
-      var targetRow = forceHidden ? 1000 : contextMenuState.row;
-      var targetCol = forceHidden ? 1000 : contextMenuState.col;
-
-      // Send to VS Code
-      if (vscodeApi && vscodeApi.postMessage) {
-        if (isEditMode && editIndex) {
-          // Edit existing element
-          var elementData = elementContextMenuState.elementData;
-          if (!forceHidden && elementData) {
-            targetRow = elementData.row;
-            targetCol = elementData.col;
-          }
-          var nameFormatAttr = modal.getAttribute('data-nameformat');
-          var nameFormat = {};
-          try {
-            nameFormat = nameFormatAttr ? JSON.parse(nameFormatAttr) : {};
-          } catch {
-            nameFormat = {};
-          }
-          // Update with current checkbox values
-          nameFormat.angle = document.getElementById('fieldNameAngle').checked;
-          nameFormat.quoted = document.getElementById('fieldNameQuoted').checked;
-          vscodeApi.postMessage({
-            command: 'editElement',
-            elementType: 'field',
-            elementIndex: editIndex,
-            row: targetRow,
-            col: targetCol,
-            name: name,
-            nameFormat: nameFormat,
-            type: type,
-            len: len,
-            ignore: ignore,
-            values: values
-          });
-        } else {
-          // Add new element
-          var newNameFormat = {
-            angle: document.getElementById('fieldNameAngle').checked,
-            quoted: document.getElementById('fieldNameQuoted').checked
-          };
-          vscodeApi.postMessage({
-            command: 'addElement',
-            elementType: 'field',
-            row: targetRow,
-            col: targetCol,
-            name: name,
-            nameFormat: newNameFormat,
-            type: type,
-            len: len,
-            ignore: ignore,
-            values: values,
-            activeTabId: tabs.length > 0 ? currentActiveTab : undefined
-          });
-        }
-      }
-
-      hideModal('fieldModal');
-      clearFieldModal();
-      modal.removeAttribute('data-edit-mode');
-      modal.removeAttribute('data-edit-index');
-      modal.removeAttribute('data-nameformat');
-      document.getElementById('fieldModalTitle').textContent = 'Add Field';
-    }
-
-    // Confirm button
-    modal.querySelector('[data-action="confirm-field"]').addEventListener('click', function() {
-      submitField(false);
-    });
-
-    // Hide button
-    modal.querySelector('[data-action="hide-field"]').addEventListener('click', function() {
-      submitField(true);
-    });
-  }
-
-  // Hint under the dropdown values: what each "path:<name>" resolves to (asked of the extension)
-  function updateFieldValuesHint() {
-    var ta = document.getElementById('fieldValues');
-    var hint = document.getElementById('fieldValuesHint');
-    if (!ta || !hint) return;
-    var names = [];
-    var re = /path:([^"\s]+)/gi;
-    var m;
-    while ((m = re.exec(ta.value)) !== null) {
-      if (names.indexOf(m[1]) === -1) names.push(m[1]);
-    }
-    window.__frmFvHintRequest = (window.__frmFvHintRequest || 0) + 1;
-    if (names.length === 0 || !vscodeApi) {
-      hint.textContent = '';
-      return;
-    }
-    vscodeApi.postMessage({ command: 'resolveFieldValues', names: names, requestId: window.__frmFvHintRequest });
-  }
-  if (!window.__frmFvHintListener) {
-    // Installed once per page; this script re-runs on every in-place update
-    window.__frmFvHintListener = true;
-    window.addEventListener('message', function(ev) {
-      var msg = ev.data;
-      if (!msg || msg.command !== 'fieldValuesResolved' || msg.requestId !== window.__frmFvHintRequest) return;
-      var hint = document.getElementById('fieldValuesHint');
-      if (hint) hint.textContent = (msg.lines || []).join('\n');
-    });
-  }
-  (function() {
-    var ta = document.getElementById('fieldValues');
-    if (!ta) return;
-    var timer;
-    ta.addEventListener('input', function() {
-      clearTimeout(timer);
-      timer = setTimeout(updateFieldValuesHint, 200);
-    });
-  })();
-
-  function clearFieldModal() {
-    document.getElementById('fieldName').value = '';
-    document.getElementById('fieldType').value = '1';
-    document.getElementById('fieldLen').value = '10';
-    document.getElementById('fieldIgnore').value = defaultIgnoreValue;
-    document.getElementById('fieldValues').value = '';
-    updateFieldValuesHint();
-    
-    // Reset checkboxes to default (only fieldType1 checked)
-    document.getElementById('fieldType1').checked = true;
-    document.getElementById('fieldType4').checked = false;
-    document.getElementById('fieldType8').checked = false;
-    document.getElementById('fieldType16').checked = false;
-    document.getElementById('fieldType32').checked = false;
-    document.getElementById('fieldType64').checked = false;
-    document.getElementById('fieldType128').checked = false;
-    document.getElementById('fieldType256').checked = false;
-    document.getElementById('fieldType512').checked = false;
-    document.getElementById('fieldType1024').checked = false;
-    document.getElementById('fieldType2048').checked = false;
-    document.getElementById('fieldType4096').checked = false;
-    document.getElementById('fieldType8192').checked = false;
-    document.getElementById('fieldType16384').checked = false;
-    document.getElementById('fieldType32768').checked = false;
-    
-    // Reset name format checkboxes
-    document.getElementById('fieldNameAngle').checked = false;
-    document.getElementById('fieldNameQuoted').checked = false;
-  }
-
-  function setupButtonModal(title) {
-    var modal = document.getElementById('buttonModal');
-    if (!modal) return;
-
-    // Set title if provided
-    if (title) {
-      var titleEl = document.getElementById('buttonModalTitle');
-      if (titleEl) titleEl.textContent = 'Add ' + title;
-    }
-
-    // Show/hide fields based on button type
-    var actionType = document.getElementById('buttonActionType');
-    var programField = document.getElementById('buttonProgramField');
-    var variableField = document.getElementById('buttonVariableField');
-    var valueField = document.getElementById('buttonValueField');
-    var typeField = document.getElementById('buttonTypeField');
-
-    // For checkbox and radio, show variable/value fields
-    if (contextMenuState.buttonType === 'checkbox' || contextMenuState.buttonType === 'radio') {
-      if (typeField) typeField.classList.add('hidden');
-      if (programField) programField.classList.add('hidden');
-      if (variableField) variableField.classList.remove('hidden');
-      if (valueField) valueField.classList.remove('hidden');
-    } else {
-      // For general button, show action type selector
-      if (typeField) typeField.classList.remove('hidden');
-      updateButtonFieldVisibility();
-    }
-
-    // Handle action type change
-    if (actionType) {
-      actionType.removeEventListener('change', updateButtonFieldVisibility); // Remove old listener
-      actionType.addEventListener('change', updateButtonFieldVisibility);
-    }
-
-    // Sync select dropdown with text input
-    var variableSelect = document.getElementById('buttonVariableSelect');
-    var variableInput = document.getElementById('buttonVariable');
-    if (variableSelect && variableInput) {
-      // When dropdown changes, update text input
-      variableSelect.addEventListener('change', function() {
-        if (this.value) {
-          variableInput.value = this.value;
-        }
-      });
-      // When text input changes, clear dropdown selection if it doesn't match
-      variableInput.addEventListener('input', function() {
-        var inputVal = this.value.toUpperCase();
-        var matchFound = false;
-        for (var i = 0; i < variableSelect.options.length; i++) {
-          if (variableSelect.options[i].value === inputVal) {
-            variableSelect.selectedIndex = i;
-            matchFound = true;
-            break;
-          }
-        }
-        if (!matchFound) {
-          variableSelect.selectedIndex = 0; // Reset to placeholder
-        }
-      });
-    }
-
-    // Cancel button
-    var cancelBtn = modal.querySelector('[data-action="cancel"]');
-    if (cancelBtn) {
-      var newCancelBtn = cancelBtn.cloneNode(true);
-      cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
-      newCancelBtn.addEventListener('click', function() {
-        hideModal('buttonModal');
-        clearButtonModal();
-      });
-    }
-
-    // Confirm button
-    var confirmBtn = modal.querySelector('[data-action="confirm-button"]');
-    if (confirmBtn) {
-      var newConfirmBtn = confirmBtn.cloneNode(true);
-      confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
-      newConfirmBtn.addEventListener('click', function() {
-        var label = document.getElementById('buttonLabel').value.trim();
-
-        var isEditMode = modal.getAttribute('data-edit-mode') === 'true';
-        var editIndex = parseInt(modal.getAttribute('data-edit-index'));
-
-        var data = {
-          command: isEditMode && editIndex ? 'editElement' : 'addElement',
-          elementType: 'pushbutton',
-          row: isEditMode ? elementContextMenuState.elementData.row : contextMenuState.row,
-          col: isEditMode ? elementContextMenuState.elementData.col : contextMenuState.col,
-          label: label,
-          kind: contextMenuState.buttonType
-        };
-
-        if (isEditMode && editIndex) {
-          data.elementIndex = editIndex;
-        }
-
-        var variable, value;
-        // For checkbox/radio, get variable and value
-        if (contextMenuState.buttonType === 'checkbox' || contextMenuState.buttonType === 'radio') {
-          variable = document.getElementById('buttonVariable').value.trim().toUpperCase();
-          value = document.getElementById('buttonValue').value.trim();
-
-          if (!variable) {
-            // Skip if no variable name
-            return;
-          }
-
-          data.name = variable;
-          data.value = contextMenuState.buttonType === 'checkbox' ? value || '1;0' : value;
-        } else {
-          // For general button, get action
-          var actionTypeVal = document.getElementById('buttonActionType').value;
-          
-          if (actionTypeVal === 'program') {
-            var program = document.getElementById('buttonProgram').value.trim();
-            if (!program) {
-              // Skip if no program call
-              return;
-            }
-            // Ensure @ prefix
-            if (!program.startsWith('@')) {
-              program = '@' + program;
-            }
-            data.program = program;
-          } else {
-            variable = document.getElementById('buttonVariable').value.trim().toUpperCase();
-            value = document.getElementById('buttonValue').value.trim();
-            
-            if (!variable) {
-              // Skip if no variable name
-              return;
-            }
-            
-            data.name = variable;
-            data.value = value;
-          }
-        }
-
-        // Send to VS Code
-        if (vscodeApi && vscodeApi.postMessage) {
-          if (!isEditMode) {
-            data.activeTabId = tabs.length > 0 ? currentActiveTab : undefined;
-          }
-          vscodeApi.postMessage(data);
-        }
-
-        hideModal('buttonModal');
-        clearButtonModal();
-        modal.removeAttribute('data-edit-mode');
-        modal.removeAttribute('data-edit-index');
-        document.getElementById('buttonModalTitle').textContent = 'Add Button';
-      });
-    }
-  }
-
-  function setupPreviewModal() {
-    var modal = document.getElementById('previewModal');
-    if (!modal) return;
-
-    // Cancel button
-    var cancelBtn = modal.querySelector('[data-action="cancel"]');
-    if (cancelBtn) {
-      var newCancelBtn = cancelBtn.cloneNode(true);
-      cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
-      newCancelBtn.addEventListener('click', function() {
-        hideModal('previewModal');
-        modal.removeAttribute('data-edit-mode');
-        modal.removeAttribute('data-edit-index');
-        document.getElementById('previewModalTitle').textContent = 'Add Preview';
-      });
-    }
-
-    // Confirm button
-    var confirmBtn = modal.querySelector('[data-action="confirm-preview"]');
-    if (confirmBtn) {
-      var newConfirmBtn = confirmBtn.cloneNode(true);
-      confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
-      newConfirmBtn.addEventListener('click', function() {
-        var path = document.getElementById('previewPath').value.trim();
-        var field = document.getElementById('previewField').value.trim();
-        var rows = parseInt(document.getElementById('previewRows').value) || 25;
-        var cols = parseInt(document.getElementById('previewCols').value) || 72;
-        var mode = document.getElementById('previewMode').value.trim() || '0';
-        var portType = document.getElementById('previewPortType').value || 'PORT_2D';
-        var portStyle = document.getElementById('previewPortStyle').value;
-        if (portStyle === undefined || portStyle === null) {
-          portStyle = 'SIMPLE';
-        }
-
-        if (!path) {
-          return;
-        }
-
-        var isEditMode = modal.getAttribute('data-edit-mode') === 'true';
-        var editIndex = parseInt(modal.getAttribute('data-edit-index'));
-
-        var data = {
-          command: isEditMode && editIndex ? 'editElement' : 'addElement',
-          elementType: 'preview',
-          row: isEditMode ? elementContextMenuState.elementData.row : contextMenuState.row,
-          col: isEditMode ? elementContextMenuState.elementData.col : contextMenuState.col,
-          path: path,
-          field: field,
-          rows: rows,
-          cols: cols,
-          mode: mode,
-          portType: portType,
-          portStyle: portStyle
-        };
-
-        if (isEditMode && editIndex) {
-          data.elementIndex = editIndex;
-        }
-
-        // Send to VS Code
-        if (vscodeApi && vscodeApi.postMessage) {
-          if (!isEditMode) {
-            data.activeTabId = tabs.length > 0 ? currentActiveTab : undefined;
-          }
-          vscodeApi.postMessage(data);
-        }
-
-        hideModal('previewModal');
-        modal.removeAttribute('data-edit-mode');
-        modal.removeAttribute('data-edit-index');
-        document.getElementById('previewModalTitle').textContent = 'Add Preview';
-      });
-    }
-  }
-
-  function updateButtonFieldVisibility() {
-    var actionType = document.getElementById('buttonActionType');
-    var programField = document.getElementById('buttonProgramField');
-    var variableField = document.getElementById('buttonVariableField');
-    var valueField = document.getElementById('buttonValueField');
-
-    if (!actionType) return;
-
-    if (actionType.value === 'program') {
-      if (programField) programField.classList.remove('hidden');
-      if (variableField) variableField.classList.add('hidden');
-      if (valueField) valueField.classList.add('hidden');
-    } else {
-      if (programField) programField.classList.add('hidden');
-      if (variableField) variableField.classList.remove('hidden');
-      if (valueField) valueField.classList.remove('hidden');
-    }
-  }
-
-  function clearButtonModal() {
-    document.getElementById('buttonLabel').value = '';
-    document.getElementById('buttonProgram').value = '';
-    document.getElementById('buttonVariable').value = '';
-    document.getElementById('buttonValue').value = '';
-    document.getElementById('buttonActionType').value = 'program';
   }
 
   function setupTriggerModal() {
@@ -2333,24 +1470,7 @@ window.__frmMain = function(D) {
   window.deleteHiddenField = deleteHiddenField;
   window.showHiddenFieldInSource = showHiddenFieldInSource;
 
-  // ---- Image dialog -------------------------------------------------------------------------------
-  var IMAGE_LIST_MAX = 200;
-  var imageFiles = null; // from the extension: { name, custom, src }; null until they arrive
-  var imageEditing = null; // the edited image's { index, data }; null when adding
-  var imageSizeTouched = false; // the size was drawn or typed, so choosing a file leaves it alone
-
-  function splitImageMode(expr) {
-    if (!/^\d+(\+\d+)*$/.test(expr)) return null;
-    return expr.split('+').reduce(function(all, n) { return all | Number(n); }, 0);
-  }
-
-  function joinImageMode(bits) {
-    var parts = [];
-    for (var bit = 1; bit <= bits; bit *= 2) if (bits & bit) parts.push(bit);
-    return parts.join('+') || '0';
-  }
-
-  // Rows and columns an image of this many pixels covers at 100% zoom, shrunk to fit below and right of its cell
+  // ---- Images ---------------------------------------------------------------------------------------
   function imageCells(width, height, row, col) {
     var probe = document.createElement('div');
     probe.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap;line-height:1;font:' + basePx + 'px "Times New Roman",Times,serif';
@@ -2365,356 +1485,6 @@ window.__frmMain = function(D) {
       rows: Math.max(1, Math.min(maxRows, Math.round(height * scale / rowH))),
       cols: Math.max(1, Math.min(maxCols, Math.round(width * scale / colW)))
     };
-  }
-
-  function openImageModal(editing, size) {
-    var modal = document.getElementById('imageModal');
-    if (!modal) return;
-    picker = 'image';
-    imageEditing = editing;
-    imageSizeTouched = !!(editing || size);
-    var data = editing ? editing.data : { file: '', rows: size ? size.rows : 10, cols: size ? size.cols : 20, mode: '1+2' };
-    document.getElementById('imageModalTitle').textContent = editing ? 'Edit Image' : 'Add Image';
-    document.getElementById('imageFile').value = data.file;
-    document.getElementById('imageRows').value = data.rows;
-    document.getElementById('imageCols').value = data.cols;
-    var bits = splitImageMode(data.mode);
-    document.getElementById('imageModes').classList.toggle('hidden', bits === null);
-    list('#imageModes input').forEach(function(box) { box.checked = bits !== null && !!(bits & Number(box.value)); });
-    document.getElementById('imageModeNote').textContent = bits === null ? 'Type ' + data.mode + ' is kept as written' : '';
-    document.getElementById('imageHint').textContent = '';
-    imageFiles = null;
-    renderImageList();
-    showModal('imageModal');
-    requestImages();
-  }
-
-  function requestImages() {
-    if (vscodeApi) {
-      window.__frmImageListRequest = (window.__frmImageListRequest || 0) + 1;
-      vscodeApi.postMessage({ command: 'listImages', requestId: window.__frmImageListRequest });
-    }
-    checkImageName();
-  }
-
-  // Both dialogs with a file list; the ids of their parts start with picker
-  var picker = 'image';
-  function renderImageList() {
-    var box = document.getElementById(picker + 'List');
-    if (!box) return;
-    box.textContent = '';
-    function note(text) {
-      var n = document.createElement('div');
-      n.className = 'image-list-note';
-      n.textContent = text;
-      box.appendChild(n);
-    }
-    if (!imageFiles) { note('Loading…'); return; }
-    var typed = document.getElementById(picker + 'File').value.trim().toLowerCase();
-    var exact = imageFiles.some(function(f) { return f.name.toLowerCase() === typed; });
-    // A chosen file shows the whole list again, so another one can be picked
-    var shown = imageFiles.filter(function(f) { return exact || f.name.toLowerCase().indexOf(typed) >= 0; });
-    if (!shown.length) note(imageFiles.length ? 'No file name contains this' : 'No images in custom/forms/images or system/forms/images');
-    var at = exact ? shown.findIndex(function(f) { return f.name.toLowerCase() === typed; }) : 0;
-    var from = Math.max(0, Math.min(at - IMAGE_LIST_MAX / 2, shown.length - IMAGE_LIST_MAX));
-    var current = null;
-    shown.slice(from, from + IMAGE_LIST_MAX).forEach(function(f) {
-      var item = document.createElement('div');
-      item.className = 'image-list-item';
-      item.setAttribute('role', 'option');
-      item.setAttribute('data-name', f.name);
-      var thumb;
-      if (/\.tiff?$/i.test(f.name)) {
-        thumb = document.createElement('span');
-        thumb.textContent = 'TIF';
-      } else {
-        thumb = document.createElement('img');
-        thumb.loading = 'lazy';
-        thumb.alt = '';
-        thumb.src = f.src;
-      }
-      thumb.className = 'image-list-thumb';
-      var name = document.createElement('span');
-      name.className = 'image-list-name';
-      name.textContent = f.name;
-      var origin = document.createElement('span');
-      origin.className = 'image-list-origin';
-      origin.textContent = f.custom ? 'custom' : 'system';
-      item.append(thumb, name, origin);
-      if (f.name.toLowerCase() === typed) {
-        item.classList.add('active');
-        item.setAttribute('aria-selected', 'true');
-        current = item;
-      }
-      box.appendChild(item);
-    });
-    if (shown.length > IMAGE_LIST_MAX) note(shown.length + ' files; type to narrow the list');
-    if (current) box.scrollTop = current.offsetTop - box.offsetTop - 60;
-  }
-
-  // Is the typed file there, and how large is it
-  function checkImageName() {
-    var name = document.getElementById(picker + 'File').value.trim();
-    var hint = document.getElementById(picker + 'Hint');
-    var id = window.__frmImageRequest = (window.__frmImageRequest || 0) + 1;
-    hint.textContent = '';
-    if (!name || !vscodeApi) return;
-    vscodeApi.postMessage({ command: 'resolveImage', name: name, requestId: id });
-  }
-
-  function onImageMessage(msg) {
-    var modal = document.getElementById(picker + 'Modal');
-    if (!modal || modal.classList.contains('hidden')) return;
-    if (msg.command === 'imagesListed' && msg.requestId === window.__frmImageListRequest) {
-      imageFiles = msg.images || [];
-      renderImageList();
-    } else if (msg.command === 'imageResolved' && msg.requestId === window.__frmImageRequest) {
-      if (!msg.src) {
-        var missing = document.getElementById(picker + 'File').value.trim();
-        document.getElementById(picker + 'Hint').textContent = /[\\/]/.test(missing) ? 'Not found' : 'Not found in custom/forms/images or system/forms/images';
-        return;
-      }
-      if (picker !== 'image' || imageSizeTouched) return;
-      var img = new Image();
-      img.onload = onCurrentPage(function() {
-        if (imageSizeTouched || msg.requestId !== window.__frmImageRequest || !img.naturalWidth || !img.naturalHeight) return;
-        var cells = imageCells(img.naturalWidth, img.naturalHeight, contextMenuState.row, contextMenuState.col);
-        document.getElementById('imageRows').value = cells.rows;
-        document.getElementById('imageCols').value = cells.cols;
-      });
-      img.src = msg.src;
-    }
-  }
-
-  function setupImagePicker(ids) {
-    var file = document.getElementById(ids + 'File');
-    var box = document.getElementById(ids + 'List');
-    var timer;
-    function changed() {
-      renderImageList();
-      clearTimeout(timer);
-      window.__frmImageRequest = (window.__frmImageRequest || 0) + 1; // answers for the previous name no longer count
-      document.getElementById(ids + 'Hint').textContent = '';
-      timer = setTimeout(checkImageName, 200);
-    }
-    function pick(item) {
-      file.value = item.getAttribute('data-name');
-      changed();
-      file.focus();
-    }
-    file.addEventListener('input', changed);
-    file.addEventListener('keydown', function(e) {
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-      var items = list('#' + ids + 'List .image-list-item');
-      var at = items.findIndex(function(i) { return i.classList.contains('kbd-active'); });
-      if (e.key === 'Enter' && at >= 0) {
-        e.preventDefault();
-        pick(items[at]);
-      } else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && items.length) {
-        e.preventDefault();
-        if (at < 0) at = items.findIndex(function(i) { return i.classList.contains('active'); });
-        var next = Math.max(0, Math.min(items.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
-        items.forEach(function(i, n) { i.classList.toggle('kbd-active', n === next); });
-        items[next].scrollIntoView({ block: 'nearest' });
-      }
-    });
-    box.addEventListener('mousedown', function(e) { if (e.target.closest('.image-list-item')) e.preventDefault(); });
-    box.addEventListener('click', function(e) {
-      var item = e.target.closest('.image-list-item');
-      if (item) pick(item);
-    });
-  }
-
-  function setupImageModal() {
-    var modal = document.getElementById('imageModal');
-    if (!modal) return;
-    var file = document.getElementById('imageFile');
-    setupImagePicker('image');
-    ['imageRows', 'imageCols'].forEach(function(id) {
-      document.getElementById(id).addEventListener('input', function() { imageSizeTouched = true; });
-    });
-    window.addEventListener('message', function(ev) {
-      if (ev.data && (ev.data.command === 'imagesListed' || ev.data.command === 'imageResolved')) onImageMessage(ev.data);
-    });
-
-    modal.querySelector('[data-action="cancel"]').addEventListener('click', function() { hideModal('imageModal'); });
-    modal.querySelector('[data-action="confirm-image"]').addEventListener('click', function() {
-      var name = file.value.replace(/["{}]/g, '').trim();
-      var rows = parseInt(document.getElementById('imageRows').value, 10);
-      var cols = parseInt(document.getElementById('imageCols').value, 10);
-      if (!name) {
-        document.getElementById('imageHint').textContent = 'Enter a file name';
-        file.focus();
-        return;
-      }
-      if (!(rows >= 1) || !(cols >= 1)) return;
-      var old = imageEditing ? imageEditing.data : null;
-      var oldBits = old ? splitImageMode(old.mode) : 0;
-      var bits = oldBits;
-      if (bits !== null) {
-        list('#imageModes input').forEach(function(b) { bits = b.checked ? bits | Number(b.value) : bits & ~Number(b.value); });
-      }
-      var data;
-      if (old) {
-        // Only what changed, so the rest of the line stays as written
-        data = { command: 'editElement', elementType: 'image', elementIndex: imageEditing.index };
-        if (name !== old.file) data.file = name;
-        if (rows !== old.rows) data.rows = rows;
-        if (cols !== old.cols) data.cols = cols;
-        if (bits !== oldBits) data.mode = joinImageMode(bits);
-      } else {
-        data = {
-          command: 'addElement', elementType: 'image', row: contextMenuState.row, col: contextMenuState.col,
-          file: name, rows: rows, cols: cols, mode: joinImageMode(bits), activeTabId: tabs.length > 0 ? currentActiveTab : undefined
-        };
-      }
-      hideModal('imageModal');
-      if (vscodeApi && Object.keys(data).length > 3) vscodeApi.postMessage(data);
-    });
-  }
-
-  // ---- Background dialog --------------------------------------------------------------------------
-  var bgEditing = null; // the edited background's values; null when adding
-  var BG_NEW = { width: -1, height: -1, transparency: 0, mode: 64, placement: 'FRAME', alignment: 'TOPLEFT', file: '', color: null };
-
-  function bgKind() {
-    var on = document.querySelector('#bgKinds input:checked');
-    return on ? on.value : null;
-  }
-
-  function hex(color) {
-    return '#' + color.map(function(c) { return (c < 16 ? '0' : '') + c.toString(16); }).join('');
-  }
-
-  // What the chosen kind and the readable values need
-  function showBgControls() {
-    var kind = bgKind();
-    var kept = [];
-    document.getElementById('bgKinds').classList.toggle('hidden', kind === null);
-    if (kind === null) kept.push('file');
-    list('#bgModal .bg-picture').forEach(function(el) { el.classList.toggle('hidden', kind === 'color'); });
-    list('#bgModal [data-bg-part]:not(.bg-picture)').forEach(function(el) { el.classList.remove('hidden'); });
-    list('#bgModal .bg-color').forEach(function(el) { el.classList.toggle('hidden', kind !== 'color'); });
-    if (kind === null) document.getElementById('bgFile').parentElement.classList.add('hidden');
-    list('#bgModal [data-bg-part]').forEach(function(el) {
-      var part = el.getAttribute('data-bg-part');
-      if (!bgEditing || bgEditing[part] !== null) return;
-      if (!el.classList.contains('hidden')) kept.push(part);
-      el.classList.add('hidden');
-    });
-    document.getElementById('bgKept').textContent = kept.length ? 'Kept as written: ' + kept.join(', ') : '';
-    ['Width', 'Height'].forEach(function(side) {
-      document.getElementById('bg' + side + 'Px').classList.toggle('hidden', document.getElementById('bg' + side).value !== 'px');
-    });
-    var t = Number(document.getElementById('bgTransparency').value);
-    document.getElementById('bgTransparencyLabel').textContent = t + ' (' + Math.round((255 - t) / 2.55) + '% visible)';
-  }
-
-  // row: the edited background's row; null when adding
-  function openBackgroundModal(row) {
-    var modal = document.getElementById('bgModal');
-    if (!modal) return;
-    picker = 'bg';
-    bgEditing = row ? JSON.parse(row.getAttribute('data-bg')) : null;
-    var v = bgEditing || BG_NEW;
-    document.getElementById('bgModalTitle').textContent = bgEditing ? 'Edit Background' : 'Add Background';
-    var kind = v.file === null ? null : v.color ? 'color' : 'picture';
-    list('#bgKinds input').forEach(function(r) { r.checked = r.value === kind; });
-    document.getElementById('bgFile').value = v.color ? '' : v.file || '';
-    document.getElementById('bgHint').textContent = '';
-    document.getElementById('bgColor').value = hex(v.color || [240, 240, 240]);
-    ['width', 'height'].forEach(function(part) {
-      var id = part === 'width' ? 'bgWidth' : 'bgHeight';
-      var px = v[part] > 0;
-      document.getElementById(id).value = px ? 'px' : v[part] === 0 ? '0' : '-1';
-      document.getElementById(id + 'Px').value = px ? v[part] : 200;
-    });
-    document.getElementById('bgTransparency').value = v.transparency || 0;
-    list('#bgModes input').forEach(function(b) { b.checked = !!(v.mode & Number(b.value)); });
-    document.getElementById('bgPlacement').value = v.placement || 'FRAME';
-    list('#bgAlignment input').forEach(function(r) { r.checked = r.value === (v.alignment || 'TOPLEFT'); });
-    var on = bgEditing ? backgroundTabs(bgEditing.index) : [];
-    list('#bgTabs .bg-tab').forEach(function(b) { b.checked = on.indexOf(Number(b.value)) >= 0; });
-    var all = document.getElementById('bgAllTabs');
-    if (all) all.checked = !on.length;
-    imageFiles = null;
-    renderImageList();
-    showBgControls();
-    showModal('bgModal');
-    requestImages();
-  }
-
-  function setupBackgroundModal() {
-    var modal = document.getElementById('bgModal');
-    if (!modal) return;
-    setupImagePicker('bg');
-    document.getElementById('addBackgroundBtn').addEventListener('click', function(e) {
-      e.stopPropagation();
-      if (!tabOrderMode) openBackgroundModal(null);
-    });
-    list('#bgKinds input, #bgWidth, #bgHeight').forEach(function(el) { el.addEventListener('change', showBgControls); });
-    document.getElementById('bgTransparency').addEventListener('input', showBgControls);
-    var all = document.getElementById('bgAllTabs');
-    var boxes = list('#bgTabs .bg-tab');
-    if (all) {
-      all.addEventListener('change', function() {
-        if (all.checked) boxes.forEach(function(b) { b.checked = false; });
-        else if (boxes.length) boxes.forEach(function(b) { b.checked = Number(b.value) === Number(currentActiveTab); });
-      });
-      boxes.forEach(function(b) {
-        b.addEventListener('change', function() { all.checked = !boxes.some(function(x) { return x.checked; }); });
-      });
-    }
-
-    modal.querySelector('[data-action="cancel"]').addEventListener('click', function() { hideModal('bgModal'); });
-    modal.querySelector('[data-action="confirm-background"]').addEventListener('click', function() {
-      var kind = bgKind();
-      var old = bgEditing;
-      var values = {};
-      if (kind === 'color') {
-        values.file = 'RGB(' + document.getElementById('bgColor').value.slice(1).match(/../g).map(function(h) { return parseInt(h, 16); }).join(',') + ')';
-        if (old && old.color && hex(old.color) === document.getElementById('bgColor').value) values.file = old.file;
-      } else if (kind === 'picture') {
-        values.file = document.getElementById('bgFile').value.replace(/["{}]/g, '').trim();
-        if (!values.file) {
-          document.getElementById('bgHint').textContent = 'Choose or enter a file name';
-          document.getElementById('bgFile').focus();
-          return;
-        }
-      }
-      var bad = false;
-      ['width', 'height'].forEach(function(part) {
-        var id = part === 'width' ? 'bgWidth' : 'bgHeight';
-        var how = document.getElementById(id).value;
-        values[part] = how === 'px' ? parseInt(document.getElementById(id + 'Px').value, 10) : Number(how);
-        if (kind !== 'color' && !(old && old[part] === null) && !(values[part] >= -1 && (how !== 'px' || values[part] >= 1))) bad = true;
-      });
-      if (bad) return;
-      values.transparency = Number(document.getElementById('bgTransparency').value);
-      // A value outside the slider's range stays unless the slider is moved
-      if (old && old.transparency !== null && values.transparency === Math.max(0, Math.min(255, old.transparency))) values.transparency = old.transparency;
-      values.mode = old && old.mode !== null ? old.mode : 0;
-      list('#bgModes input').forEach(function(b) { values.mode = b.checked ? values.mode | Number(b.value) : values.mode & ~Number(b.value); });
-      values.placement = document.getElementById('bgPlacement').value;
-      var align = document.querySelector('#bgAlignment input:checked');
-      values.alignment = align ? align.value : 'TOPLEFT';
-      if (kind === 'color') {
-        // A colour shows transparency and placement only; its other values stay
-        ['width', 'height', 'mode', 'alignment'].forEach(function(part) { values[part] = old ? old[part] : part === 'mode' ? 0 : BG_NEW[part]; });
-      }
-      var on = boxes.filter(function(b) { return b.checked; }).map(function(b) { return Number(b.value); });
-      var msg = { command: old ? 'editElement' : 'addElement', elementType: 'bgimage' };
-      if (old) {
-        // Only what changed, so the rest of the line stays as written
-        Object.keys(values).forEach(function(part) { if (old[part] === null || values[part] === old[part]) delete values[part]; });
-        msg.elementIndex = old.index;
-      }
-      msg.background = values;
-      var before = old ? backgroundTabs(old.index) : [];
-      if (on.join() !== before.join()) msg.tabIds = on.length ? on : 'all';
-      hideModal('bgModal');
-      if (vscodeApi && (Object.keys(values).length || msg.tabIds)) vscodeApi.postMessage(msg);
-    });
   }
 
   // ---- Drawing backgrounds ------------------------------------------------------------------------
@@ -2808,6 +1578,8 @@ window.__frmMain = function(D) {
   }
 
   function setupBackgrounds() {
+    var add = document.getElementById('addBackgroundBtn');
+    if (add) add.addEventListener('click', function(e) { e.stopPropagation(); addBackground(); });
     window.__frmLayoutBackgrounds = layoutBackgrounds;
     if (window.__frmBgObserver) window.__frmBgObserver.disconnect();
     window.__frmBgObserver = new ResizeObserver(layoutBackgrounds);
@@ -2816,52 +1588,39 @@ window.__frmMain = function(D) {
   }
 
   // ---- Adding elements ----------------------------------------------------------------------------
-  // Opens the dialog for a new element, or the inline input for a text. size ({ rows, cols }) is what was drawn, if anything.
+  // A new element is written with defaults, then selected, and the Properties panel takes the cursor.
+  // A text is typed where it goes. size ({ rows, cols }) is what was drawn, if anything.
+  var NEW_FOCUS = { field: 'name', button: 'label', checkbox: 'label', radio: 'label', preview: 'path', image: 'file', bgimage: 'file' };
+
   function addElementAt(tool, row, col, size) {
     if (tabOrderMode) return;
     contextMenuState.row = row;
     contextMenuState.col = col;
-    ['fieldModal', 'buttonModal', 'previewModal'].forEach(function(id) {
-      var modal = document.getElementById(id);
-      // Left behind when an edit was cancelled
-      if (modal) ['data-edit-mode', 'data-edit-index', 'data-nameformat'].forEach(function(a) { modal.removeAttribute(a); });
-    });
-    switch (tool) {
-      case 'text':
-        startNewTextEdit(row, col);
-        break;
-      case 'field':
-        clearFieldModal();
-        document.getElementById('fieldModalTitle').textContent = 'Add Field';
-        if (size) document.getElementById('fieldLen').value = size.cols;
-        showModal('fieldModal');
-        document.getElementById('fieldName').focus();
-        break;
-      case 'button':
-      case 'checkbox':
-      case 'radio':
-        clearButtonModal();
-        contextMenuState.buttonType = tool === 'button' ? 'select' : tool;
-        document.getElementById('buttonValue').value = tool === 'checkbox' ? '1;0' : '1';
-        setupButtonModal({ button: 'General Button', checkbox: 'Checkbox', radio: 'Radio Button' }[tool]);
-        showModal('buttonModal');
-        break;
-      case 'preview':
-        document.getElementById('previewModalTitle').textContent = 'Add Preview';
-        document.getElementById('previewPath').value = '';
-        document.getElementById('previewField').value = '';
-        document.getElementById('previewRows').value = size ? size.rows : 25;
-        document.getElementById('previewCols').value = size ? size.cols : 72;
-        document.getElementById('previewMode').value = '0';
-        document.getElementById('previewPortType').value = 'PORT_2D';
-        document.getElementById('previewPortStyle').value = 'SIMPLE';
-        showModal('previewModal');
-        document.getElementById('previewPath').focus();
-        break;
-      case 'image':
-        openImageModal(null, size);
-        break;
+    if (tool === 'text') {
+      startNewTextEdit(row, col);
+      return;
     }
+    var msg = { command: 'addElement', row: row, col: col, activeTabId: tabs.length > 0 ? currentActiveTab : undefined };
+    if (tool === 'field') Object.assign(msg, { elementType: 'field', type: '1', len: size ? size.cols : 10 });
+    else if (tool === 'button') Object.assign(msg, { elementType: 'pushbutton', label: 'Button' });
+    else if (tool === 'checkbox') Object.assign(msg, { elementType: 'pushbutton', kind: 'checkbox', label: 'Checkbox', name: 'VAR', value: '1;0' });
+    else if (tool === 'radio') Object.assign(msg, { elementType: 'pushbutton', kind: 'radio', label: 'Radio button', name: 'VAR', value: '1' });
+    else if (tool === 'preview') Object.assign(msg, { elementType: 'preview', path: '', rows: size ? size.rows : 5, cols: size ? size.cols : 20 });
+    else if (tool === 'image') Object.assign(msg, { elementType: 'image', file: '', rows: size ? size.rows : 10, cols: size ? size.cols : 20, mode: '1+2' });
+    else return;
+    // An image that wasn't drawn gets the size of the picture chosen for it
+    propsState.afterAdd = { focus: NEW_FOCUS[tool], autoSize: tool === 'image' && !size, at: Date.now() };
+    if (vscodeApi && vscodeApi.postMessage) vscodeApi.postMessage(msg);
+  }
+
+  // + Add in the Backgrounds panel: a white background on every tab, ready to change in the panel
+  function addBackground() {
+    if (tabOrderMode || !vscodeApi || !vscodeApi.postMessage) return;
+    propsState.afterAdd = { focus: 'file', at: Date.now() };
+    vscodeApi.postMessage({
+      command: 'addElement', elementType: 'bgimage',
+      background: { width: -1, height: -1, transparency: 0, mode: 0, placement: 'FRAME', alignment: 'TOPLEFT', file: 'RGB(255,255,255)' }
+    });
   }
 
   // ---- Toolbox ------------------------------------------------------------------------------------
@@ -3175,12 +1934,6 @@ window.__frmMain = function(D) {
       cancelToolDrags();
       disarm();
     }, true);
-    // Cancelling a new element's dialog ends repeat mode
-    document.addEventListener('click', function(e) {
-      var cancel = e.target.closest && e.target.closest('.modal-overlay [data-action="cancel"]');
-      if (cancel && !cancel.closest('#shortcutsModal')) disarm();
-    }, true);
-
     // Out of the way while form elements are dragged
     document.body.classList.remove('element-dragging');
     document.addEventListener('dragstart', function() { document.body.classList.add('element-dragging'); });
@@ -3671,6 +2424,13 @@ window.__frmMain = function(D) {
     document.body.classList.toggle('multi-selected', els.length > 1);
     window.__frmCodeSelection = null; // a selection made here replaces one still waiting from the code
     showTriggers();
+    // A table's column stays chosen while the table alone stays selected
+    var column = propsState && propsState.column;
+    if (column) {
+      if (els.length === 1 && !selectedRows.length && elementKey(els[0]) === column.key) markColumn(els[0], column.field);
+      else propsState.column = null;
+    }
+    updatePropsPanel();
   }
 
   function clearSelection() {
@@ -3770,7 +2530,7 @@ window.__frmMain = function(D) {
     if (carry && carry.otherwise && !carry.keys.some(function(k) { return findByKey(k); }) &&
         !(carry.rows && !carry.keys.length && findRows(carry).length)) {
       // The new elements may come with the next refresh; until then the selection stays
-      if (!carry.retried) pendingSelection = { keys: carry.keys, primary: carry.primary, visual: [], triggers: [], rows: carry.rows, triggerLines: carry.triggerLines, retried: true };
+      if (!carry.retried) pendingSelection = { keys: carry.keys, primary: carry.primary, visual: [], triggers: [], rows: carry.rows, triggerLines: carry.triggerLines, retried: true, afterAdd: carry.afterAdd };
       carry = carry.otherwise;
     }
     if (carry) {
@@ -3784,6 +2544,7 @@ window.__frmMain = function(D) {
           var row = t.idx === null ? null : triggerRow(t.idx);
           return t.idx === null || (row && row.getAttribute('data-trigger-target') === t.target);
         }), findRows(carry));
+      if (carry.afterAdd) focusAfterAdd(carry.afterAdd);
     } else {
       showTriggers();
     }
@@ -4042,7 +2803,7 @@ window.__frmMain = function(D) {
     // Deselect when clicking on empty area (not when using a dialog or menu)
     document.addEventListener('click', function(e) {
       // Switching form tabs keeps the selection
-      if (e.target.closest('.modal-overlay, .context-menu, .tabs, .toolbox, .toolbox-show')) return;
+      if (e.target.closest('.modal-overlay, .context-menu, .tabs, .toolbox, .toolbox-show, .props-panel')) return;
       if (!e.target.closest('.draggable, .trigger-item')) clearSelection();
     });
   }
@@ -4932,6 +3693,7 @@ window.__frmMain = function(D) {
   function isTypingTarget(t) {
     if (!t || !t.tagName) return false;
     if (t.classList && t.classList.contains('inline-edit')) return true; // in-place header/text editor
+    if (t.closest && t.closest('.props-panel')) return true; // keys in the Properties panel are its own
     if (t.closest && t.closest('.draggable')) return false; // mock controls drawn inside form elements
     if (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return true;
     return t.tagName === 'INPUT' && !/^(checkbox|radio|button|submit|reset|range)$/i.test(t.type);
@@ -4962,7 +3724,7 @@ window.__frmMain = function(D) {
 
   function restoreCanvasFocus() {
     var active = document.activeElement;
-    if (active && active.closest && active.closest('.modal-overlay')) active.blur();
+    if (active && active.closest && active.closest('.modal-overlay, .props-panel')) active.blur();
     if (selectedElement && document.contains(selectedElement)) {
       selectedElement.focus({ preventScroll: true });
     }
@@ -5133,14 +3895,7 @@ window.__frmMain = function(D) {
 
   // Same as choosing Edit in the element's context menu
   function openElementEditor(element) {
-    var info = collectElementInfo(element);
-    if (!info.type) return;
-    elementContextMenuState.element = element;
-    elementContextMenuState.elementType = info.type;
-    elementContextMenuState.elementIndex = info.index;
-    elementContextMenuState.elementData = info.data;
-    var item = document.querySelector('#elementContextMenu .context-menu-item[data-action="edit-element"]');
-    if (item) item.click();
+    focusPropsPanel(element);
   }
 
   function consumeKey(e) {
@@ -5250,20 +4005,25 @@ window.__frmMain = function(D) {
       return;
     }
     if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length === 1 && !selectedElements.length &&
-        selectedRows[0].classList.contains('bg-item') && !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON')) {
-      if (isLocked(selectedRows[0])) showNotice('A background without an index can\'t be edited here');
-      else openBackgroundModal(selectedRows[0]);
+        !isTriggerRow(selectedRows[0]) && !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON')) {
+      // A background or hidden field
+      focusPropsPanel(selectedRows[0]);
       consumeKey(e);
       return;
     }
-    if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedRows.length &&
-        !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
-      showNotice(selectedElements.length + selectedRows.length > 1 ? 'Several selected: select one element to edit' : 'Triggers and hidden fields can\'t be edited with this key');
+    var editKey = !mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') &&
+      !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'));
+    // Several selected: the panel edits what they share
+    if (editKey && selectedElements.length + selectedRows.length > 1 && focusPanelInput()) {
       consumeKey(e);
       return;
     }
-    if (!mod && !e.altKey && !e.shiftKey && (e.key === 'F2' || e.key === 'Enter') && selectedElement &&
-        !(e.key === 'Enter' && e.target && e.target.tagName === 'BUTTON' && !e.target.closest('.draggable'))) {
+    if (editKey && selectedRows.length) {
+      showNotice(selectedElements.length + selectedRows.length > 1 ? 'Triggers can\'t be edited together with other elements' : 'Triggers are edited from their row');
+      consumeKey(e);
+      return;
+    }
+    if (editKey && selectedElement) {
       if (!editKeysBlocked()) openElementEditor(selectedElement);
       consumeKey(e);
     }
@@ -5298,6 +4058,10 @@ window.__frmMain = function(D) {
           keys: msg.keys.filter(function(key) { return !isRow(key); }), primary: isRow(msg.primary || '') ? null : msg.primary, visual: [], triggers: [],
           rows: (msg.hiddenFields || []).map(function(index) { return 'field:' + index; }).concat(msg.keys.filter(isRow)), triggerLines: msg.triggerLines || []
         };
+        // An element added from here: the panel takes the cursor once it is selected
+        var added = propsState.afterAdd;
+        propsState.afterAdd = null;
+        if (added && Date.now() - added.at < 10000) pendingSelection.afterAdd = added;
       }
       if (msg && msg.command === 'frmNotice' && typeof msg.text === 'string') showNotice(msg.text, 5000);
       if (msg && msg.command === 'frmZoom' && typeof msg.action === 'string') {
@@ -5324,8 +4088,771 @@ window.__frmMain = function(D) {
     }
   }
 
+  // ---- Properties panel -------------------------------------------------------------------------------
+  // The selected elements' properties, written to the file while they are typed. The panel's children
+  // outlive page updates (data-keep-children), so an input keeps its focus and unsent text. Its listeners
+  // sit on the panel itself and are added again on every run of this script, like all the others.
+  var propsState = window.__frmPropsState = window.__frmPropsState ||
+    { sig: '', session: '', seq: 0, timer: null, flush: null, column: null, bgKind: {}, images: null, imagesAsked: false };
+  var propValues = D.props || {};
+  var propDefs = D.propDefs || {};
+  var PROPS_DELAY_MS = 250;
+  var SHOWN_TYPE = { pushbutton: 'button', listview: 'page_listview' };
+  var NOUNS = { text: 'text', field: 'field', pushbutton: 'button', image: 'image', preview: 'preview', listview: 'table', bgimage: 'background' };
+  var TEXT_KINDS = ['int', 'text', 'lines', 'image', 'range'];
+  // What sets one element apart: shown only while one element is selected
+  var SINGLE_ONLY = ['name', 'nameAngle', 'nameQuoted', 'label', 'content'];
+
+  function propsPanel() { return document.getElementById('propsPanel'); }
+
+  function refOfKey(key) {
+    var parts = key.split(':');
+    return { type: parts[0], index: Number(parts[1]) };
+  }
+
+  function uniq(list) {
+    return list.filter(function(v, i) { return list.indexOf(v) === i; });
+  }
+
+  // What the panel changes: the selected form elements and Hidden Fields / Backgrounds rows, by key
+  function propsTargets() {
+    var keys = [];
+    selectedElements.concat(selectedRows.filter(function(row) { return !isTriggerRow(row); })).forEach(function(el) {
+      if (isLocked(el)) return;
+      var key = elementKey(el);
+      if (propValues[key] && keys.indexOf(key) < 0) keys.push(key);
+    });
+    return keys;
+  }
+
+  // Everything about a property but its label, to tell whether two types share it
+  function defShape(def) {
+    return JSON.stringify([def.kind, def.min, def.max, def.optional, def.pattern, def.options, def.bits]);
+  }
+
+  // The properties every element has in the same form, in the first one's order, whose conditions hold for all
+  function sharedDefs(keys) {
+    var types = uniq(keys.map(function(k) { return refOfKey(k).type; }));
+    return (propDefs[types[0]] || []).filter(function(def) {
+      var shared = types.every(function(t) {
+        return (propDefs[t] || []).some(function(d) { return d.key === def.key && defShape(d) === defShape(def); });
+      });
+      return shared && keys.every(function(k) {
+        var values = propValues[k].values;
+        if (values[def.key] === undefined) return false; // a bottom-bar button's row, tabs on a form without tabs
+        return !def.when || def.when.values.indexOf(values[def.when.key]) >= 0;
+      });
+    });
+  }
+
+  function countText(keys) {
+    var byType = {};
+    keys.forEach(function(k) { var t = refOfKey(k).type; byType[t] = (byType[t] || 0) + 1; });
+    return Object.keys(byType).map(function(t) { return byType[t] + ' ' + NOUNS[t] + (byType[t] > 1 ? 's' : ''); }).join(', ');
+  }
+
+  // What the panel shows: a title and rows, each a property and the elements it changes
+  function propsLayout(keys) {
+    if (!keys.length) return null;
+    var column = propsState.column;
+    if (column && keys.length === 1 && keys[0] === column.key && propValues['field:' + column.field]) {
+      var fieldKey = 'field:' + column.field;
+      var textKey = 'text:' + column.field;
+      var heading = { key: 'content', label: 'Heading', kind: 'text' };
+      if (!propValues[textKey]) heading.hint = 'No text(' + column.field + ') to show as the heading';
+      return {
+        title: 'Column: field(' + column.field + ')', sub: propValues[fieldKey].values.name, fields: [fieldKey],
+        rows: [{ def: heading, keys: propValues[textKey] ? [textKey] : [] }].concat(sharedDefs([fieldKey]).map(function(def) {
+          return { def: def, keys: [fieldKey] };
+        }))
+      };
+    }
+    var ref = refOfKey(keys[0]);
+    var single = keys.length === 1;
+    return {
+      title: single ? (SHOWN_TYPE[ref.type] || ref.type) + '(' + ref.index + ')' : keys.length + ' elements',
+      sub: single ? (ref.type === 'field' ? propValues[keys[0]].values.name : '') : countText(keys),
+      fields: keys.filter(function(k) { return /^field:/.test(k); }),
+      rows: sharedDefs(keys).filter(function(def) { return single || SINGLE_ONLY.indexOf(def.key) < 0; }).map(function(def) {
+        return { def: def, keys: keys };
+      })
+    };
+  }
+
+  // A row's value: the same in all its elements, or mixed
+  function rowValue(row) {
+    var all = row.keys.map(function(k) { return propValues[k].values[row.def.key]; });
+    var same = all.every(function(v) { return v === all[0]; });
+    return { value: same && all.length ? all[0] : '', mixed: !same, all: all };
+  }
+
+  function flagBits(expr) {
+    return String(expr || '').split('+').reduce(function(all, n) { return all | (Number(n) || 0); }, 0);
+  }
+
+  function tabList(value) {
+    if (value === 'all') return tabs.map(function(t) { return t.id; });
+    return value ? value.split(' ').map(Number) : [];
+  }
+
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function(name) {
+      var v = attrs[name];
+      if (v === null || v === undefined || v === false) return;
+      if (name === 'text') node.textContent = v;
+      else node.setAttribute(name, v === true ? '' : v);
+    });
+    (children || []).forEach(function(c) { if (c) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return node;
+  }
+
+  function hexOf(file) {
+    var m = /^RGB\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i.exec(file || '');
+    if (!m) return '#ffffff';
+    return '#' + [m[1], m[2], m[3]].map(function(n) { return ('0' + Math.min(255, Number(n)).toString(16)).slice(-2); }).join('');
+  }
+
+  function rgbOf(hex) {
+    return 'RGB(' + [1, 3, 5].map(function(i) { return parseInt(hex.slice(i, i + 2), 16); }).join(',') + ')';
+  }
+
+  function isColour(file) { return /^RGB\s*\(/i.test(file || ''); }
+
+  // A background shows its picture controls, or its colour; Picture can be chosen before a file is typed
+  function bgKindOf(key, file) {
+    return propsState.bgKind[key] || (isColour(file) ? 'color' : 'picture');
+  }
+
+  // The control of one row; data-prop and data-keys say what it changes
+  function buildControl(row, n) {
+    var def = row.def;
+    var id = 'prop-' + n;
+    var common = { 'data-prop': def.key, 'data-keys': row.keys.join(' '), 'data-kind': def.kind, id: id };
+    if (!row.keys.length) common.disabled = true;
+    switch (def.kind) {
+      case 'check':
+        return el('label', { class: 'props-check' }, [el('input', Object.assign({ type: 'checkbox' }, common)), ' ' + def.label]);
+      case 'select':
+        return el('select', common, def.options.map(function(o) { return el('option', { value: o.value, text: o.label }); }));
+      case 'lines':
+        return el('textarea', Object.assign({ rows: 3, spellcheck: 'false' }, common));
+      case 'flags':
+        return el('div', { class: 'props-flags', 'data-group': def.key }, def.bits.map(function(b) {
+          return el('label', { class: 'props-check' }, [
+            el('input', Object.assign({}, common, { type: 'checkbox', id: null, 'data-bit': b.bit })), ' ' + b.label + ' (' + b.bit + ')'
+          ]);
+        }).concat([el('div', { class: 'props-flags-sum', 'data-flags-sum': def.key })]));
+      case 'tabs':
+        return el('div', { class: 'props-flags' }, [
+          el('label', { class: 'props-check' }, [el('input', Object.assign({}, common, { type: 'checkbox', id: null, 'data-tab': 'all' })), ' All tabs'])
+        ].concat(tabs.map(function(t) {
+          return el('label', { class: 'props-check' }, [
+            el('input', Object.assign({}, common, { type: 'checkbox', id: null, 'data-tab': t.id })), ' ' + t.label.replace(/_/g, ' ')
+          ]);
+        })));
+      case 'range':
+        return el('div', { class: 'props-range' }, [
+          el('input', Object.assign({ type: 'range', min: def.min, max: def.max, step: 1 }, common)),
+          el('span', { class: 'props-range-value', 'data-range-value': def.key })
+        ]);
+      case 'bgsize':
+        return el('div', { class: 'props-pair' }, [
+          el('select', Object.assign({}, common, { 'data-part': 'mode' }), [
+            el('option', { value: '-1', text: 'Stretch' }), el('option', { value: '0', text: 'Original size' }), el('option', { value: 'px', text: 'Pixels' })
+          ]),
+          el('input', Object.assign({ type: 'text', inputmode: 'numeric', 'aria-label': def.label + ' in pixels' }, common, { id: null, 'data-part': 'px' }))
+        ]);
+      case 'bgfile': {
+        var key = row.keys[0];
+        var colour = bgKindOf(key, rowValue(row).value) === 'color';
+        return el('div', { class: 'props-bgfile' }, [
+          el('div', { class: 'props-pair' }, ['picture', 'color'].map(function(kind) {
+            return el('label', { class: 'props-check' }, [
+              el('input', Object.assign({}, common, { type: 'radio', id: null, name: id + '-kind', 'data-part': 'kind', value: kind, checked: (kind === 'color') === colour })),
+              kind === 'color' ? ' Colour' : ' Picture'
+            ]);
+          })),
+          colour
+            ? el('input', Object.assign({ type: 'color' }, common, { 'data-part': 'color' }))
+            : imagePicker(Object.assign({}, common, { 'data-part': 'file' }))
+        ]);
+      }
+      case 'image':
+        return imagePicker(common);
+      default: {
+        var attrs = Object.assign({ type: 'text', spellcheck: 'false', autocomplete: 'off' }, common);
+        if (def.kind === 'int') attrs.inputmode = 'numeric';
+        if (def.suggest === 'fields') attrs.list = 'propsFields';
+        return el('input', attrs);
+      }
+    }
+  }
+
+  // A file name with the images folders' files below it while it has the focus, and whether the file is there
+  function imagePicker(attrs) {
+    return el('div', { class: 'props-picker' }, [
+      el('input', Object.assign({ type: 'text', spellcheck: 'false', autocomplete: 'off', placeholder: 'Search, or type a name such as logo.png', 'data-picker': '' }, attrs)),
+      el('div', { class: 'image-list props-image-list hidden', role: 'listbox', 'aria-label': 'Images', 'data-image-list': '' }),
+      el('small', { class: 'props-hint', 'data-image-hint': '' })
+    ]);
+  }
+
+  // The panel's markup for a layout; values are filled in by fillProps
+  function buildProps(panel, layout) {
+    panel.textContent = '';
+    panel.appendChild(el('div', { class: 'props-header' }, [
+      el('div', { class: 'props-title', text: layout.title }),
+      layout.sub ? el('div', { class: 'props-sub', text: layout.sub }) : null
+    ]));
+    var body = el('div', { class: 'props-body' });
+    var line = null;
+    layout.rows.forEach(function(row, n) {
+      var def = row.def;
+      var label = def.kind === 'check' ? null : el('label', { class: 'props-label', for: ['flags', 'tabs'].indexOf(def.kind) < 0 ? 'prop-' + n : null, text: def.label });
+      var field = el('div', { class: 'props-field', 'data-field': def.key }, [
+        label, buildControl(row, n), def.hint ? el('small', { class: 'props-hint', text: def.hint }) : null
+      ]);
+      if (def.key === 'group') field.appendChild(el('small', { class: 'props-warning hidden', 'data-group-warning': '', text: 'Not in any group' }));
+      if (def.key === 'values') field.appendChild(el('small', { class: 'props-hint props-fv-hint', 'data-values-hint': '' }));
+      if (def.pair && line) {
+        line.appendChild(field);
+      } else {
+        line = el('div', { class: 'props-line' }, [field]);
+        body.appendChild(line);
+      }
+    });
+    if (layout.fields.length) {
+      body.appendChild(el('div', { class: 'props-actions' }, [
+        el('button', { type: 'button', class: 'props-button', 'data-action': 'hide-fields', 'data-keys': layout.fields.join(' '),
+          text: layout.fields.length > 1 ? 'Hide ' + layout.fields.length + ' fields' : 'Hide field' })
+      ]));
+    }
+    body.appendChild(el('datalist', { id: 'propsFields' }, (D.fieldNames || []).map(function(name) { return el('option', { value: name }); })));
+    panel.appendChild(body);
+  }
+
+  function rowsByProp(layout) {
+    var map = {};
+    layout.rows.forEach(function(row) { map[row.def.key + '|' + row.keys.join(' ')] = row; });
+    return map;
+  }
+
+  // Put the file's values in the controls. The input being typed in keeps what it has.
+  function fillProps(panel, layout) {
+    var rows = rowsByProp(layout);
+    var active = document.activeElement;
+    panel.querySelectorAll('[data-prop]').forEach(function(control) {
+      var row = rows[control.getAttribute('data-prop') + '|' + control.getAttribute('data-keys')];
+      if (!row) return;
+      var v = rowValue(row);
+      var kind = row.def.kind;
+      var typing = control === active && control.type !== 'checkbox' && control.type !== 'radio' && control.tagName !== 'SELECT';
+      if (typing) return;
+      control.classList.remove('invalid');
+      if (kind === 'flags') {
+        var bit = Number(control.getAttribute('data-bit'));
+        var on = v.all.filter(function(x) { return (flagBits(x) & bit) !== 0; }).length;
+        control.checked = on === v.all.length && on > 0;
+        control.indeterminate = on > 0 && on < v.all.length;
+      } else if (kind === 'tabs') {
+        var tab = control.getAttribute('data-tab');
+        var count = v.all.filter(function(x) { return tab === 'all' ? x === 'all' : tabList(x).indexOf(Number(tab)) >= 0; }).length;
+        control.checked = count === v.all.length && count > 0;
+        control.indeterminate = count > 0 && count < v.all.length;
+      } else if (kind === 'check') {
+        control.checked = !v.mixed && v.value === '1';
+        control.indeterminate = v.mixed;
+      } else if (kind === 'bgsize') {
+        var px = v.value !== '-1' && v.value !== '0';
+        if (control.getAttribute('data-part') === 'mode') control.value = v.mixed ? '' : px ? 'px' : v.value;
+        else { control.value = px && !v.mixed ? v.value : ''; control.disabled = !px || v.mixed; }
+      } else if (kind === 'bgfile') {
+        var part = control.getAttribute('data-part');
+        if (part === 'color') control.value = hexOf(v.value);
+        else if (part === 'file') control.value = isColour(v.value) ? '' : v.value;
+      } else if (kind === 'select') {
+        control.value = v.mixed ? '' : v.value;
+        if (v.mixed) control.selectedIndex = -1;
+      } else {
+        control.value = v.mixed ? '' : v.value;
+        control.placeholder = v.mixed ? 'mixed' : '';
+        if (kind === 'range') {
+          var label = panel.querySelector('[data-range-value="' + row.def.key + '"]');
+          if (label) label.textContent = v.mixed ? 'mixed' : v.value;
+        }
+      }
+    });
+    layout.rows.forEach(function(row) {
+      if (row.def.kind === 'flags') {
+        var sum = panel.querySelector('[data-flags-sum="' + row.def.key + '"]');
+        var v = rowValue(row);
+        if (sum) sum.textContent = v.mixed ? 'mixed' : '= ' + v.value + (/\+/.test(v.value) ? ' (' + flagBits(v.value) + ')' : '');
+      }
+      if (row.def.key === 'group') {
+        var warning = panel.querySelector('[data-group-warning]');
+        if (warning) warning.classList.toggle('hidden', !rowValue(row).all.some(function(g) { return g === ''; }));
+      }
+    });
+  }
+
+  // Which control has the focus, to find it again after the panel is rebuilt
+  function controlId(control) {
+    if (!control || !control.getAttribute || !control.hasAttribute('data-prop')) return null;
+    return ['data-prop', 'data-keys', 'data-bit', 'data-tab', 'data-part'].map(function(a) { return control.getAttribute(a); }).join('|');
+  }
+
+  function findControl(panel, id) {
+    var found = null;
+    panel.querySelectorAll('[data-prop]').forEach(function(c) { if (!found && controlId(c) === id) found = c; });
+    return found;
+  }
+
+  // Show the panel for the selection, or hide it. Runs after every selection change and page update.
+  function updatePropsPanel() {
+    var panel = propsPanel();
+    if (!panel || !propsState) return;
+    var keys = propsTargets();
+    var layout = propsLayout(keys);
+    var side = panel.closest('.side-panels');
+    panel.classList.toggle('hidden', !layout);
+    if (side) side.classList.toggle('props-open', !!layout);
+    if (!layout) {
+      flushProps();
+      propsState.sig = '';
+      panel.textContent = '';
+      return;
+    }
+    var sig = JSON.stringify([layout.title, layout.rows.map(function(r) { return [r.def.key, r.keys]; }), keys.map(function(k) {
+      return propValues[k].values.file !== undefined && refOfKey(k).type === 'bgimage' ? bgKindOf(k, propValues[k].values.file) : '';
+    })]);
+    if (sig !== propsState.sig) {
+      flushProps();
+      var focused = panel.contains(document.activeElement) ? controlId(document.activeElement) : null;
+      buildProps(panel, layout);
+      propsState.sig = sig;
+      fillProps(panel, layout);
+      var again = focused && findControl(panel, focused);
+      if (again) again.focus({ preventScroll: true });
+      // What the file's values point to: a picture that isn't there, the values a path: reads
+      panel.querySelectorAll('[data-picker]').forEach(function(input) {
+        if (input.value.trim()) checkPropsImage(input, input.value.trim());
+      });
+      var values = panel.querySelector('[data-prop="values"]');
+      if (values) askFieldValues(values);
+    } else {
+      fillProps(panel, layout);
+    }
+    if (layout.rows.some(function(r) { return r.def.kind === 'image' || r.def.kind === 'bgfile'; })) askImages();
+  }
+
+  function askImages() {
+    if (propsState.images || propsState.imagesAsked || !vscodeApi || !vscodeApi.postMessage) return;
+    propsState.imagesAsked = true;
+    vscodeApi.postMessage({ command: 'listImages', requestId: 'props-images' });
+  }
+
+  // ---- The images list under a file name ----
+  var IMAGE_LIST_MAX = 200;
+
+  function listOf(input) { return input.parentNode.querySelector('[data-image-list]'); }
+  function hintOf(input) { return input.parentNode.querySelector('[data-image-hint]'); }
+
+  function renderPropsImages(input) {
+    var box = listOf(input);
+    if (!box) return;
+    box.textContent = '';
+    var note = function(text) { box.appendChild(el('div', { class: 'image-list-note', text: text })); };
+    var files = propsState.images;
+    if (!files) { note('Loading…'); return; }
+    var typed = input.value.trim().toLowerCase();
+    var exact = files.some(function(f) { return f.name.toLowerCase() === typed; });
+    // A chosen file shows the whole list again, so another one can be picked
+    var shown = files.filter(function(f) { return exact || f.name.toLowerCase().indexOf(typed) >= 0; });
+    if (!shown.length) note(files.length ? 'No file name contains this' : 'No images in custom/forms/images or system/forms/images');
+    var at = exact ? shown.findIndex(function(f) { return f.name.toLowerCase() === typed; }) : 0;
+    var from = Math.max(0, Math.min(at - IMAGE_LIST_MAX / 2, shown.length - IMAGE_LIST_MAX));
+    var current = null;
+    shown.slice(from, from + IMAGE_LIST_MAX).forEach(function(f) {
+      var thumb = /\.tiff?$/i.test(f.name)
+        ? el('span', { class: 'image-list-thumb', text: 'TIF' })
+        : el('img', { class: 'image-list-thumb', loading: 'lazy', alt: '', src: f.src });
+      var item = el('div', { class: 'image-list-item', role: 'option', 'data-name': f.name }, [
+        thumb, el('span', { class: 'image-list-name', text: f.name }), el('span', { class: 'image-list-origin', text: f.custom ? 'custom' : 'system' })
+      ]);
+      if (f.name.toLowerCase() === typed) {
+        item.classList.add('active');
+        item.setAttribute('aria-selected', 'true');
+        current = item;
+      }
+      box.appendChild(item);
+    });
+    if (shown.length > IMAGE_LIST_MAX) note(shown.length + ' files; type to narrow the list');
+    if (current) box.scrollTop = current.offsetTop - box.offsetTop - 40;
+  }
+
+  function showImageList(input, on) {
+    var box = listOf(input);
+    if (!box) return;
+    box.classList.toggle('hidden', !on);
+    if (on) renderPropsImages(input);
+  }
+
+  // A file picked from the list is written at once
+  function pickImage(input, name) {
+    input.value = name;
+    input.classList.remove('invalid');
+    queueProp(input.getAttribute('data-keys').split(' '), input.getAttribute('data-prop'), name);
+    flushProps();
+    renderPropsImages(input);
+    input.focus();
+  }
+
+  // Is the file there; a new image that wasn't drawn takes the picture's size
+  function checkPropsImage(input, name) {
+    var hint = hintOf(input);
+    if (hint) hint.textContent = '';
+    if (!name || isColour(name) || !vscodeApi || !vscodeApi.postMessage) return;
+    var id = 'props-resolve:' + (++propsState.seq);
+    propsState.resolving = { id: id, name: name, keys: input.getAttribute('data-keys') };
+    vscodeApi.postMessage({ command: 'resolveImage', name: name, requestId: id });
+  }
+
+  function onImageResolved(msg) {
+    var asked = propsState.resolving;
+    if (!asked || msg.requestId !== asked.id) return;
+    propsState.resolving = null;
+    var input = propsPanel() && Array.prototype.filter.call(propsPanel().querySelectorAll('[data-picker]'), function(i) {
+      return i.getAttribute('data-keys') === asked.keys;
+    })[0];
+    if (!msg.src) {
+      if (input && hintOf(input)) hintOf(input).textContent = /[\\/]/.test(asked.name) ? 'Not found' : 'Not found in custom/forms/images or system/forms/images';
+      return;
+    }
+    var key = asked.keys;
+    if (propsState.autoSizeKey !== key || !propValues[key]) return;
+    propsState.autoSizeKey = null;
+    var img = new Image();
+    img.onload = function() {
+      var p = propValues[key] && propValues[key].values;
+      if (!p || !img.naturalWidth || !img.naturalHeight) return;
+      var cells = imageCells(img.naturalWidth, img.naturalHeight, Number(p.row), Number(p.col));
+      sendPropEdits(valueEdits([key], 'rows', String(cells.rows)).concat(valueEdits([key], 'cols', String(cells.cols))), newSession());
+    };
+    img.src = msg.src;
+  }
+
+  // What each "path:name" among the dropdown values reads, under them
+  function askFieldValues(textarea) {
+    var hint = textarea.parentNode.querySelector('[data-values-hint]');
+    var names = [];
+    var re = /path:([^"\s]+)/gi;
+    var m;
+    while ((m = re.exec(textarea.value)) !== null) if (names.indexOf(m[1]) < 0) names.push(m[1]);
+    propsState.fvRequest = 'props-fv:' + (++propsState.seq);
+    if (hint) hint.textContent = '';
+    if (names.length && vscodeApi && vscodeApi.postMessage) {
+      vscodeApi.postMessage({ command: 'resolveFieldValues', names: names, requestId: propsState.fvRequest });
+    }
+  }
+
+  function onPropsMessage(ev) {
+    var msg = ev.data;
+    if (!msg) return;
+    if (msg.command === 'imagesListed' && msg.requestId === 'props-images') {
+      propsState.images = msg.images || [];
+      var open = propsPanel() && propsPanel().querySelector('[data-image-list]:not(.hidden)');
+      if (open) renderPropsImages(open.parentNode.querySelector('[data-picker]'));
+    } else if (msg.command === 'imageResolved' && typeof msg.requestId === 'string') {
+      onImageResolved(msg);
+    } else if (msg.command === 'fieldValuesResolved' && msg.requestId === propsState.fvRequest) {
+      var hint = propsPanel() && propsPanel().querySelector('[data-values-hint]');
+      if (hint) hint.textContent = (msg.lines || []).join('\n');
+    }
+  }
+
+  function sendPropEdits(edits, session) {
+    if (!edits.length || !vscodeApi || !vscodeApi.postMessage) return;
+    vscodeApi.postMessage({ command: 'setProps', session: session || '', edits: edits });
+  }
+
+  function valueEdits(keys, prop, value) {
+    return keys.map(function(k) { return Object.assign(refOfKey(k), { key: prop, value: value }); });
+  }
+
+  function flushProps() {
+    clearTimeout(propsState.timer);
+    var flush = propsState.flush;
+    propsState.flush = null;
+    if (flush) flush();
+  }
+
+  // Typing: written once it pauses, or when the input loses focus. A file name is then looked for.
+  function queueProp(keys, prop, value) {
+    clearTimeout(propsState.timer);
+    var session = propsState.session;
+    propsState.flush = function() {
+      sendPropEdits(valueEdits(keys, prop, value), session);
+      if (prop !== 'file') return;
+      var input = propsPanel() && Array.prototype.filter.call(propsPanel().querySelectorAll('[data-picker]'), function(i) {
+        return i.getAttribute('data-keys') === keys.join(' ');
+      })[0];
+      if (input) checkPropsImage(input, value);
+    };
+    propsState.timer = setTimeout(flushProps, PROPS_DELAY_MS);
+  }
+
+  function newSession() {
+    propsState.session = 'p' + (++propsState.seq) + '-' + Date.now();
+    return propsState.session;
+  }
+
+  function defFor(control) {
+    var type = refOfKey(control.getAttribute('data-keys').split(' ')[0]).type;
+    var prop = control.getAttribute('data-prop');
+    if (propsState.column && prop === 'content' && type === 'text') return { key: 'content', kind: 'text' };
+    return (propDefs[type] || []).filter(function(d) { return d.key === prop; })[0] || { key: prop, kind: 'text' };
+  }
+
+  function propValid(def, v) {
+    var int = function(min, max) {
+      return /^-?\d+$/.test(v) && Number(v) >= (min === undefined ? -Infinity : min) && Number(v) <= (max === undefined ? Infinity : max);
+    };
+    switch (def.kind) {
+      case 'int': return (def.optional && v === '') || int(def.min, def.max);
+      case 'range': return int(def.min, def.max);
+      case 'bgsize': return int(1);
+      case 'image': case 'bgfile': return v.trim() !== '' && !/[\r\n"]/.test(v);
+      case 'text': return !/[\r\n]/.test(v) && (!def.pattern || new RegExp(def.pattern).test(v));
+      default: return true;
+    }
+  }
+
+  // The file's value of a control's property, for Esc
+  function fileValueOf(control) {
+    var keys = control.getAttribute('data-keys').split(' ');
+    var prop = control.getAttribute('data-prop');
+    var all = keys.map(function(k) { return propValues[k] ? propValues[k].values[prop] : ''; });
+    return all.every(function(v) { return v === all[0]; }) ? all[0] : '';
+  }
+
+  function onPropsInput(e) {
+    var control = e.target;
+    if (!control.hasAttribute || !control.hasAttribute('data-prop')) return;
+    var kind = control.getAttribute('data-kind');
+    var part = control.getAttribute('data-part');
+    var keys = control.getAttribute('data-keys').split(' ').filter(Boolean);
+    if (!keys.length) return;
+    if (control.type === 'checkbox' || control.type === 'radio' || control.tagName === 'SELECT') return; // their change event writes
+    if (kind === 'bgfile' && part === 'color') {
+      queueProp(keys, 'file', rgbOf(control.value));
+      return;
+    }
+    if (TEXT_KINDS.indexOf(kind) < 0 && kind !== 'bgsize' && kind !== 'bgfile') return;
+    var def = defFor(control);
+    var value = kind === 'lines' ? control.value : control.value.trim();
+    var ok = propValid(def, value);
+    control.classList.toggle('invalid', !ok);
+    if (kind === 'range') {
+      var label = control.parentNode.querySelector('.props-range-value');
+      if (label) label.textContent = control.value;
+    }
+    var prop = control.getAttribute('data-prop');
+    if (control.hasAttribute('data-picker')) {
+      renderPropsImages(control);
+      if (hintOf(control)) hintOf(control).textContent = '';
+    }
+    // A size typed by hand is kept
+    if (prop === 'rows' || prop === 'cols') propsState.autoSizeKey = null;
+    if (prop === 'values') {
+      clearTimeout(propsState.fvTimer);
+      propsState.fvTimer = setTimeout(function() { askFieldValues(control); }, 200);
+    }
+    if (ok) queueProp(keys, prop, value);
+    else { clearTimeout(propsState.timer); propsState.flush = null; }
+  }
+
+  function onPropsChange(e) {
+    var control = e.target;
+    if (!control.hasAttribute || !control.hasAttribute('data-prop')) return;
+    var kind = control.getAttribute('data-kind');
+    var prop = control.getAttribute('data-prop');
+    var keys = control.getAttribute('data-keys').split(' ').filter(Boolean);
+    if (!keys.length) return;
+    var part = control.getAttribute('data-part');
+    // Typed values are written by their input event; leaving the input writes what is still waiting
+    if (control.tagName === 'TEXTAREA' || (control.tagName === 'INPUT' && control.type !== 'checkbox' && control.type !== 'radio')) {
+      flushProps();
+      return;
+    }
+    var session = newSession();
+    if (kind === 'flags') {
+      var bit = Number(control.getAttribute('data-bit'));
+      sendPropEdits(keys.map(function(k) { return Object.assign(refOfKey(k), { key: prop, bit: bit, on: control.checked }); }), session);
+    } else if (kind === 'tabs') {
+      var tab = control.getAttribute('data-tab');
+      var ids = tabs.map(function(t) { return t.id; });
+      var edits = [];
+      var emptied = 0;
+      keys.forEach(function(k) {
+        var now = tabList(propValues[k].values.tabs);
+        var next;
+        if (tab === 'all') next = control.checked ? ids : [currentActiveTab];
+        else if (control.checked) next = uniq(now.concat(Number(tab)));
+        else next = now.filter(function(id) { return id !== Number(tab); });
+        if (!next.length) { emptied++; return; }
+        var value = ids.every(function(id) { return next.indexOf(id) >= 0; }) ? 'all' : next.sort(function(a, b) { return a - b; }).join(' ');
+        edits.push(Object.assign(refOfKey(k), { key: 'tabs', value: value }));
+        // The next click, before the file has caught up, starts from this
+        propValues[k].values.tabs = value;
+      });
+      if (emptied) showNotice('An element must be on at least one tab');
+      sendPropEdits(edits, session);
+      updatePropsPanel();
+    } else if (kind === 'check') {
+      sendPropEdits(valueEdits(keys, prop, control.checked ? '1' : ''), session);
+    } else if (kind === 'select') {
+      sendPropEdits(valueEdits(keys, prop, control.value), session);
+    } else if (kind === 'bgsize' && part === 'mode') {
+      var px = control.parentNode.querySelector('[data-part="px"]');
+      if (control.value === 'px') {
+        px.disabled = false;
+        if (!propValid({ kind: 'bgsize' }, px.value.trim())) px.value = '200';
+        sendPropEdits(valueEdits(keys, prop, px.value.trim()), session);
+        px.focus();
+        px.select();
+      } else {
+        sendPropEdits(valueEdits(keys, prop, control.value), session);
+      }
+    } else if (kind === 'bgfile' && part === 'kind') {
+      keys.forEach(function(k) { propsState.bgKind[k] = control.value; });
+      if (control.value === 'color' && !isColour(fileValueOf(control))) sendPropEdits(valueEdits(keys, 'file', 'RGB(255,255,255)'), session);
+      updatePropsPanel();
+      var next = propsPanel().querySelector(control.value === 'color' ? '[data-part="color"]' : '[data-part="file"]');
+      if (next) next.focus();
+    }
+  }
+
+  // Arrow keys walk the images list under a file name; Enter takes the highlighted one
+  function pickerKeydown(e, input) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    var items = Array.prototype.slice.call(listOf(input).querySelectorAll('.image-list-item'));
+    var at = items.findIndex(function(i) { return i.classList.contains('kbd-active'); });
+    if (e.key === 'Enter' && at >= 0) {
+      pickImage(input, items[at].getAttribute('data-name'));
+      return true;
+    }
+    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && items.length) {
+      if (at < 0) at = items.findIndex(function(i) { return i.classList.contains('active'); });
+      var next = Math.max(0, Math.min(items.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)));
+      items.forEach(function(i, n) { i.classList.toggle('kbd-active', n === next); });
+      items[next].scrollIntoView({ block: 'nearest' });
+      return true;
+    }
+    return false;
+  }
+
+  function onPropsKeydown(e) {
+    var control = e.target;
+    if (!control.hasAttribute || !control.hasAttribute('data-prop')) return;
+    if (control.hasAttribute('data-picker') && pickerKeydown(e, control)) {
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'Enter' && (control.tagName !== 'TEXTAREA' || e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      flushProps();
+      restoreCanvasFocus();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      clearTimeout(propsState.timer);
+      propsState.flush = null;
+      var kind = control.getAttribute('data-kind');
+      var typed = control.type !== 'checkbox' && control.type !== 'radio' && control.tagName !== 'SELECT' && kind !== 'bgsize' &&
+        control.type !== 'color';
+      var file = fileValueOf(control);
+      if (kind === 'bgfile' && isColour(file)) file = '';
+      if (typed && control.value !== file) {
+        control.value = file;
+        control.classList.remove('invalid');
+      } else {
+        restoreCanvasFocus();
+      }
+    }
+  }
+
+  function onPropsFocus(e) {
+    if (!e.target.hasAttribute || !e.target.hasAttribute('data-prop')) return;
+    newSession();
+    if (e.target.hasAttribute('data-picker')) showImageList(e.target, true);
+  }
+
+  function onPropsBlur(e) {
+    flushProps();
+    if (e.target.hasAttribute && e.target.hasAttribute('data-picker')) showImageList(e.target, false);
+  }
+
+  function onPropsClick(e) {
+    var item = e.target.closest && e.target.closest('.image-list-item');
+    if (item) {
+      pickImage(item.closest('.props-picker').querySelector('[data-picker]'), item.getAttribute('data-name'));
+      return;
+    }
+    var hide = e.target.closest && e.target.closest('[data-action="hide-fields"]');
+    if (!hide) return;
+    var keys = hide.getAttribute('data-keys').split(' ').filter(Boolean);
+    var session = newSession();
+    sendPropEdits(valueEdits(keys, 'row', '1000').concat(valueEdits(keys, 'col', '1000')), session);
+  }
+
+  function setupPropsPanel() {
+    var panel = propsPanel();
+    if (!panel) return;
+    panel.addEventListener('input', onPropsInput);
+    panel.addEventListener('change', onPropsChange);
+    panel.addEventListener('keydown', onPropsKeydown);
+    panel.addEventListener('focusin', onPropsFocus);
+    panel.addEventListener('focusout', onPropsBlur);
+    panel.addEventListener('click', onPropsClick);
+    // Clicking a file in the list leaves the cursor in the file name
+    panel.addEventListener('mousedown', function(e) { if (e.target.closest && e.target.closest('[data-image-list]')) e.preventDefault(); });
+    window.addEventListener('message', onPropsMessage);
+  }
+
+  // After an add: the new element is selected; the cursor goes in the panel, an image's list opens
+  function focusAfterAdd(added) {
+    var keys = propsTargets();
+    if (keys.length !== 1) return;
+    if (added.autoSize) propsState.autoSizeKey = keys[0];
+    focusPanelInput(added.focus);
+  }
+
+  // F2, Enter, double-click and Edit: select the element and put the cursor in the panel
+  function focusPropsPanel(element, prop) {
+    if (!element) return;
+    if (element.classList.contains('trigger-item')) {
+      if (selectedRows.length !== 1 || selectedRows[0] !== element || selectedElements.length) setSelection([], null, null, null, [element]);
+    } else if (selectedElements.length !== 1 || selectedElement !== element) {
+      selectElement(element);
+    }
+    if (!focusPanelInput(prop) && isLocked(element)) showNotice('An element without an index can\'t be edited here');
+  }
+
+  // Put the cursor in the panel: in the given property, or the first input. False when the panel is hidden.
+  function focusPanelInput(prop) {
+    var panel = propsPanel();
+    if (!panel || panel.classList.contains('hidden')) return false;
+    // A typed value rather than a choice (a background's file, not its Picture/Colour)
+    var target = prop ? panel.querySelector('[data-prop="' + prop + '"]:not([type="radio"])') || panel.querySelector('[data-prop="' + prop + '"]') : null;
+    if (target) target.focus({ preventScroll: false });
+    else focusFirstModalInput(panel);
+    if (panel.contains(document.activeElement)) document.activeElement.scrollIntoView({ block: 'nearest' });
+    return true;
+  }
+
   // Initialize drag and drop and keyboard navigation after DOM is ready
   setupShortcuts(); // first, so its capture-phase Escape runs before the resize handlers end a drag
+  setupPropsPanel();
   setupToolbox(); // before anything else that listens to the mouse, so nothing under an armed tool reacts
   setupWindowResize();
   setupElementResize();

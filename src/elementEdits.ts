@@ -242,7 +242,7 @@ function elementLine(lines: string[], index: number, msg: ElementContent, winsty
         : `text(${index})= ${at} "${content}"`;
     }
     case 'field': {
-      const name = msg.name || 'FIELD';
+      const name = msg.name || `FIELD${index}`;
       // Default ignore value: 7 for VXUI, 4 for only
       const ignore = msg.ignore !== undefined && msg.ignore !== null && msg.ignore !== '' ? msg.ignore
         : winstyle?.toLowerCase() === 'only' ? 4 : 7;
@@ -260,15 +260,14 @@ function elementLine(lines: string[], index: number, msg: ElementContent, winsty
       return start;
     }
     case 'image': {
-      const file = imageFileName(msg.file);
-      if (!file) return undefined;
+      // Without a file the Properties panel asks for one
       const mode = msg.mode && IMAGE_MODE.test(msg.mode) ? msg.mode : '0';
-      return `image(${index})= ${at} ${msg.rows || 10} ${msg.cols || 20} ${mode} "${file}"`;
+      return `image(${index})= ${at} ${msg.rows || 10} ${msg.cols || 20} ${mode} "${imageFileName(msg.file)}"`;
     }
     case 'preview': {
       const portStyle = msg.portStyle ?? 'SIMPLE';
       return `preview(${index})= ${at} ${msg.rows || 10} ${msg.cols || 30} ${msg.mode || '0'} ` +
-        `"${msg.path || '$DIR_PICTS/file.vxp'}" "${msg.field || ''}" ${msg.portType || 'PORT_2D'} ${portStyle === '' ? '""' : portStyle}`;
+        `"${(msg.path ?? '').replace(/"/g, '')}" "${msg.field || ''}" ${msg.portType || 'PORT_2D'} ${portStyle === '' ? '""' : portStyle}`;
     }
   }
   return undefined;
@@ -305,35 +304,3 @@ export function addToTab(lines: string[], type: string, index: number, tabId: nu
   replaceContinuedStatement(lines, i, formatIndexStatement(statementKeyword(lines[i]), list, wrapAt));
 }
 
-/** New values for an image; what is left out stays as written. */
-export interface ImageEdit { index: number; rows?: number; cols?: number; mode?: string; file?: string; }
-
-/**
- * Change an image's size, type or file name. Only those are rewritten: spacing, quotes or braces, comments
- * and continuation lines stay. Undefined when the image isn't found or can't be read.
- */
-export function editImage(source: string[], edit: ImageEdit): string[] | undefined {
-  const statement = findElement(source, 'image', edit.index);
-  if (!statement) return undefined;
-  const text = source.slice(statement.startLine, statement.endLine + 1).join('\n');
-  const gap = '(?:[ \\t]|\\\\[ \\t]*\\n)';
-  const m = text.match(new RegExp(`^(\\s*image\\s*\\(\\s*\\d+\\s*\\)\\s*=${gap}*\\d+${gap}+\\d+${gap}+)(\\d+)(${gap}+)(\\d+)(${gap}+)` +
-    `([^\\s"{\\\\]+)(?:(${gap}*)("[^"\\n]*"|\\{[^}\\n]*\\}))?`, 'i'));
-  if (!m) return undefined;
-  const rows = isInt(edit.rows, 1) ? String(edit.rows) : m[2];
-  const cols = isInt(edit.cols, 1) ? String(edit.cols) : m[4];
-  const mode = edit.mode !== undefined && IMAGE_MODE.test(edit.mode) ? edit.mode : m[6];
-  let fileGap = m[7] ?? '';
-  let file = m[8] ?? '';
-  const name = imageFileName(edit.file);
-  if (name) {
-    // {name}, {"name"} and "name" keep their delimiters
-    const wrap = file.match(/^(\{\s*"?|")[^]*?("?\s*\}|")$/);
-    file = wrap ? wrap[1] + name + wrap[2] : `"${name}"`;
-    if (m[8] === undefined) fileGap = ' ';
-  }
-  const changed = m[1] + rows + m[3] + cols + m[5] + mode + fileGap + file + text.slice(m[0].length);
-  const lines = [...source];
-  lines.splice(statement.startLine, statement.endLine - statement.startLine + 1, ...changed.split('\n'));
-  return lines;
-}

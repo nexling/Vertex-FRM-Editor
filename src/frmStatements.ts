@@ -109,6 +109,26 @@ export function listTokens(lines: string[], s: Statement): Token[] {
   return tokens;
 }
 
+/**
+ * Value tokens of an element statement, across continuations: strings and brace expressions are one
+ * token each. Stops at a comment.
+ */
+export function valueTokens(lines: string[], s: Statement): Token[] {
+  const tokens: Token[] = [];
+  if (s.valueStart < 0) return tokens;
+  for (let line = s.startLine; line <= s.endLine; line++) {
+    const content = lines[line].slice(0, trailingCommentStart(lines[line])).replace(/\s*\\\s*$/, '');
+    const regex = /"[^"]*"|\{[^}]*\}|[^\s"{]+/g;
+    regex.lastIndex = line === s.startLine ? s.valueStart : 0;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(content))) {
+      if (m[0].startsWith('!')) break;
+      tokens.push({ line, start: m.index, end: m.index + m[0].length, text: m[0] });
+    }
+  }
+  return tokens;
+}
+
 function isIndex(token: Token): boolean {
   return /^\d+$/.test(token.text);
 }

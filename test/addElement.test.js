@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { addElement, editImage } = require('../out/elementEdits.js');
+const { addElement } = require('../out/elementEdits.js');
+const { setElementProp } = require('../out/elementProps.js');
 
 const L = s => s.split('\n');
 const add = (form, msg, winstyle) => addElement(L(form), { row: 2, col: 3, ...msg }, winstyle);
@@ -30,26 +31,32 @@ test('buttons follow the spelling of the form, texts and radios their own format
   assert.ok(add('header= "x"', { elementType: 'text', content: 'Hi' }).lines.includes('text(1)= 2 3 "Hi"'));
 });
 
-test('an element without a known type, position or image file is refused', () => {
+test('an element without a known type or position is refused', () => {
   assert.equal(add('', { elementType: 'group' }), undefined);
   assert.equal(add('', { elementType: 'text', row: 0 }), undefined);
-  assert.equal(add('', { elementType: 'image', file: ' " ' }), undefined);
 });
 
-const edited = (line, edit) => editImage(L(line), { index: 1, ...edit })?.join('\n');
+test('a new element gets defaults for what the message leaves out', () => {
+  // Added from the toolbox: the Properties panel fills in the rest
+  assert.ok(add('field(1)= A 1 1 1 4 7\ngroup(1)= 0 1 1', { elementType: 'field' }).lines.includes('field(2)= FIELD2 1 2 3 10 7'));
+  assert.ok(add('', { elementType: 'image', file: ' " ' }).lines.includes('image(1)= 2 3 10 20 0 ""'));
+  assert.ok(add('', { elementType: 'image', rows: 4, cols: 6 }).lines.includes('image(1)= 2 3 4 6 0 ""'));
+  assert.ok(add('', { elementType: 'preview', rows: 5, cols: 20 }).lines.includes('preview(1)= 2 3 5 20 0 "" "" PORT_2D SIMPLE'));
+});
 
-test('editing an image changes only what is asked', () => {
+const setImage = (line, key, value) => setElementProp(L(line), { type: 'image', index: 1 }, key, value)?.join('\n');
+
+test('changing an image changes only what is asked', () => {
   const line = ' image( 1 ) =  8  2  4   10  1+x  {a.png}  ! note';
-  assert.equal(edited(line, {}), line);
-  assert.equal(edited(line, { rows: 6 }), ' image( 1 ) =  8  2  6   10  1+x  {a.png}  ! note');
-  assert.equal(edited(line, { cols: 9, file: 'b $&.png' }), ' image( 1 ) =  8  2  4   9  1+x  {b $&.png}  ! note');
-  assert.equal(edited(line, { mode: '2+64' }), ' image( 1 ) =  8  2  4   10  2+64  {a.png}  ! note');
-  assert.equal(edited(line, { mode: 'junk', rows: -1 }), line);
-  assert.equal(edited('image(1)= 1 1 2 2 0 {"a.png"}', { file: 'b.png' }), 'image(1)= 1 1 2 2 0 {"b.png"}');
-  assert.equal(edited('image(1)= 1 1 2 2 0 ! note', { file: 'b.png' }), 'image(1)= 1 1 2 2 0 "b.png" ! note');
-  assert.equal(edited('image(2)= 1 1 2 2 0 "a.png"', { rows: 3 }), undefined);
+  assert.equal(setImage(line, 'rows', '6'), ' image( 1 ) =  8  2  6   10  1+x  {a.png}  ! note');
+  assert.equal(setImage(line, 'file', 'b $&.png'), ' image( 1 ) =  8  2  4   10  1+x  {b $&.png}  ! note');
+  assert.equal(setImage(line, 'rows', '-1'), undefined);
+  assert.equal(setImage('image(1)= 1 1 2 2 0 {"a.png"}', 'file', 'b.png'), 'image(1)= 1 1 2 2 0 {"b.png"}');
+  assert.equal(setImage('image(1)= 1 1 2 2 0 ! note', 'file', 'b.png'), 'image(1)= 1 1 2 2 0 "b.png" ! note');
+  assert.equal(setImage('image(1)= 1 1 2 2 0 ""', 'file', 'b.png'), 'image(1)= 1 1 2 2 0 "b.png"');
+  assert.equal(setImage('image(2)= 1 1 2 2 0 "a.png"', 'rows', '3'), undefined);
 });
 
-test('editing an image keeps continuation lines', () => {
-  assert.equal(edited('image(1)= 1 1 2 2 \\\n   0 "a.png"', { rows: 3, file: 'b.png' }), 'image(1)= 1 1 3 2 \\\n   0 "b.png"');
+test('changing an image keeps continuation lines', () => {
+  assert.equal(setImage('image(1)= 1 1 2 2 \\\n   0 "a.png"', 'file', 'b.png'), 'image(1)= 1 1 2 2 \\\n   0 "b.png"');
 });
