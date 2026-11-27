@@ -181,6 +181,109 @@ page_header(tabindex) = "Tab Name"
 `
     },
     {
+        label: "page_listview",
+        detail: `Makes the form a list view and sets the table's position and size.
+- page: page_header index the table is shown on; 0 = every page that has no table of its own
+- srow scol: starting row and column
+- nrow ncol: height in rows and width in columns
+- mode: +1 no horizontal stretching, +2 no vertical stretching
+
+The columns are the fields (field type +4096, exo fields, are controls instead). Fields shown on every page come first, ordered by start column and then index; then the fields of opt_field(page) in listed order.
+The column heading is the text with the same index as the field; its row and column don't matter.
+Of a column field's values only the type and the width matter; width 0 fits the column to its content and heading.`,
+        documentation: `Example:\n
+\`\`\`vertexfrm
+page_listview(0)= 1 1 14 140 0
+\`\`\`
+Example2:\n
+\`\`\`vertexfrm
+page_listview(page)= srow scol nrow ncol mode
+\`\`\`
+`
+    },
+    {
+        label: "filter_row",
+        detail: `List view filter row above the rows.
+- 0 = no filter row
+- 1 = normal filter row (default up to 24.0)
+- 2 = a list of the different values in the unfiltered list; filters the whole list again
+- 3 = a list of the different values in the current list; filters cumulatively (20.0)
+- 11 = the list header's native filter (default from 25.0)
+- 12 = filter button with the values of the unfiltered list (25.0)
+- 13 = filter button with the values of the current list, cumulative (25.0)`,
+        documentation: `Example:\n
+\`\`\`vertexfrm
+filter_row= 0
+\`\`\`
+Example2:\n
+\`\`\`vertexfrm
+filter_row= mode
+\`\`\`
+`
+    },
+    {
+        label: "autofit_mode",
+        detail: `How list view columns with width 0 get their width (21.0).
+- 0 = no effect
+- +1 = fit the column content
+- +2 = fit the column heading
+- +4 = only when the form is first opened; later the saved (possibly user-changed) widths are used
+- +8 = all columns, also those with a width other than 0`,
+        documentation: `Example:\n
+\`\`\`vertexfrm
+autofit_mode= 1+2
+\`\`\`
+Example2:\n
+\`\`\`vertexfrm
+autofit_mode= mode
+\`\`\`
+`
+    },
+    {
+        label: "sort_mode",
+        detail: `Sort order used when a list view column heading is clicked, when it should differ from the field type (26.0). Each value is a mode letter followed by a field index:
+- A = textual (A1B, A10B, A2B, ...)
+- B = textual-numeric (A1B, A2B, A10B, ...)
+- N = numeric
+- L = by length, then textual
+- R = revision codes (1, 2, ..., 10 / 01, 02, ... / A, B, ..., Z, AA, ...)`,
+        documentation: `Example:\n
+\`\`\`vertexfrm
+sort_mode= R1
+\`\`\`
+Example2:\n
+\`\`\`vertexfrm
+sort_mode= mode1field1 mode2field2 ...
+\`\`\`
+`
+    },
+    {
+        label: "sort_order",
+        detail: `Initial sort order of the list, by field index; a negative index sorts that field in reverse (26.0). Overrides the order from the group keyword and uses the sort_mode modes.`,
+        documentation: `Example:\n
+\`\`\`vertexfrm
+sort_order= -1 -2
+\`\`\`
+Example2:\n
+\`\`\`vertexfrm
+sort_order= field1 field2 ...
+\`\`\`
+`
+    },
+    {
+        label: "start_page",
+        detail: `The page (page_header index) that is active when the form opens.`,
+        documentation: `Example:\n
+\`\`\`vertexfrm
+start_page= 2
+\`\`\`
+Example2:\n
+\`\`\`vertexfrm
+start_page= page
+\`\`\`
+`
+    },
+    {
         label: "opt_text",
         detail: `keyword for defining text that should belong and only be visible to certain tab. texts that are not defined with opt_text will be shown on all tabs.`,
         documentation: `Example:\n
@@ -279,7 +382,9 @@ Types:
 - 2 = Lines can be deleted
 - 4 = Browse order will not change
 - 8 = The specified browse order will be used
-- 16 = The first predefined choice is the default when a line is inserted`,
+- 16 = The first predefined choice is the default when a line is inserted
+- 512 = List view: clicking a column heading doesn't sort (25.0)
+- 1024 = List view: no column headings (26.0)`,
         documentation: `Example:\n
 \`\`\`vertexfrm
 group(1)= 1+2 1 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20

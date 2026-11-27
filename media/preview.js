@@ -53,7 +53,8 @@
     var type = n.getAttribute('data-type');
     if (!type) return null;
     var idx = n.getAttribute('data-text-idx') || n.getAttribute('data-field-idx') || n.getAttribute('data-push-idx') ||
-      n.getAttribute('data-image-idx') || n.getAttribute('data-preview-idx') || n.getAttribute('data-bgimage-idx');
+      n.getAttribute('data-image-idx') || n.getAttribute('data-preview-idx') || n.getAttribute('data-bgimage-idx') ||
+      n.getAttribute('data-listview-idx');
     if (idx === null) return null;
     return type + ':' + idx + (n.classList.contains('hidden-field-item') ? ':hidden' : '');
   }
@@ -275,6 +276,7 @@ window.__frmMain = function(D) {
       });
       spans.forEach(function(s) { s.el.style.gridColumn = s.value; });
       fitBoxGaps();
+      document.querySelectorAll('.grid > .listview').forEach(updateListviewScroll);
       // Spans changed: refresh which elements reach outside the window
       if (typeof gridRows === 'number' && typeof gridCols === 'number') updateOverflow(gridRows, gridCols);
     } catch { /* ignore */ }
@@ -479,10 +481,70 @@ window.__frmMain = function(D) {
   function backgroundTabs(idx) {
     return tabs.filter(function(t) { return (tabBackgrounds[t.id] || []).map(Number).indexOf(idx) >= 0; }).map(function(t) { return t.id; });
   }
+  // List view tables: a table is on the tabs in data-listview-tabs ('all' without tabs) and shows the
+  // columns data-listview-order lists for the tab, in that order
+  function layoutListviews(tabId) {
+    document.querySelectorAll('.grid > .listview').forEach(function(el) {
+      var on = (el.getAttribute('data-listview-tabs') || 'all').split(' ');
+      var key = on[0] === 'all' ? 'all' : String(tabId);
+      el.classList.toggle('hidden', on[0] !== 'all' && on.indexOf(key) < 0);
+      var order = {};
+      try { order = JSON.parse(el.getAttribute('data-listview-order') || '{}'); } catch { /* ignore */ }
+      var shown = (order[key] || []).map(String);
+      el.querySelectorAll('.lv-col').forEach(function(col) {
+        var at = shown.indexOf(col.getAttribute('data-col-pos'));
+        col.classList.toggle('hidden', at < 0);
+        col.style.order = at < 0 ? '' : String(at);
+      });
+      updateListviewScroll(el);
+    });
+  }
+
+  // Columns cut off at the right edge: show a scrollbar thumb sized to the part in view
+  function updateListviewScroll(el) {
+    var cols = el.querySelector('.lv-cols');
+    var bar = el.querySelector('.lv-hscroll');
+    if (!cols || !bar) return;
+    var over = cols.scrollWidth > cols.clientWidth + 1;
+    bar.classList.toggle('hidden', !over);
+    el.classList.toggle('lv-overflow', over);
+    var thumb = bar.querySelector('.lv-thumb');
+    if (over && thumb) thumb.style.width = Math.max(8, 100 * cols.clientWidth / cols.scrollWidth) + '%';
+  }
+
+  // Clicking a column heading selects the table and shows the column's field(n) and text(n) in the editor
+  function setupListviewColumns() {
+    document.querySelectorAll('.grid > .listview .lv-col').forEach(function(col) {
+      col.addEventListener('click', function(e) {
+        if (tabOrderMode || e.ctrlKey || e.metaKey || e.shiftKey) return;
+        if (!e.target.closest('.lv-head, .lv-filter')) return;
+        e.stopPropagation();
+        selectElement(col.closest('.listview')); // clears the previous column mark
+        col.classList.add('lv-col-active');
+        var field = parseInt(col.getAttribute('data-col-field'), 10);
+        if (isFinite(field) && vscodeApi && vscodeApi.postMessage) {
+          vscodeApi.postMessage({ command: 'showColumnInSource', fieldIndex: field });
+        }
+      });
+    });
+  }
+
+  // The columns whose field(n) or heading text(n) the editor's selection touches
+  function markCodeColumns(keys) {
+    var indexes = (keys || []).map(function(k) {
+      var m = /^(field|text):(\d+)$/.exec(k);
+      return m ? m[2] : null;
+    }).filter(Boolean);
+    document.querySelectorAll('.grid > .listview .lv-col').forEach(function(col) {
+      col.classList.toggle('lv-col-active', indexes.indexOf(col.getAttribute('data-col-field')) >= 0);
+    });
+  }
+
   var initialActiveTab = D.initialActiveTab;
   var currentActiveTab = null; // Track the currently active tab
   function applyTab(tabId){
     try {
+      layoutListviews(tabId);
       // A background on no tab's list is shown on all of them
       document.querySelectorAll('.bg-image').forEach(function(el) {
         var idx = JSON.parse(el.getAttribute('data-bg')).index;
@@ -561,6 +623,10 @@ window.__frmMain = function(D) {
     var type = el.getAttribute('data-type');
     var lists = { text: tabTexts, field: tabFields, pushbutton: tabPushButtons, image: tabImages }[type];
     var index = elementIndexOf(el);
+    if (type === 'listview') {
+      var on = (el.getAttribute('data-listview-tabs') || 'all').split(' ');
+      return !tabs.length || on[0] === 'all' ? null : on.map(Number);
+    }
     if (type === 'preview' && index !== null && previewOnTabs(index)) lists = tabPreviews;
     if (!tabs.length || !lists || index === null) return null;
     return tabs.filter(function(t) {
@@ -636,7 +702,7 @@ window.__frmMain = function(D) {
     var moveItem = document.getElementById('moveElementMenuItem');
     if (moveItem) {
       // A background's tabs are set in its dialog
-      if (hasTabs && elementType !== 'bgimage') {
+      if (hasTabs && elementType !== 'bgimage' && elementType !== 'listview') {
         moveItem.classList.remove('hidden');
       } else {
         moveItem.classList.add('hidden');
@@ -651,6 +717,8 @@ window.__frmMain = function(D) {
       item.classList.toggle('hidden', !!group);
     });
     if (group && moveItem) moveItem.classList.add('hidden');
+    var duplicateItem = menu.querySelector('[data-action="duplicate-element"]');
+    if (duplicateItem) duplicateItem.classList.toggle('hidden', !group && elementType === 'listview');
     ['Duplicate', 'Delete'].forEach(function(name) {
       var label = menu.querySelector('[data-action="' + name.toLowerCase() + '-element"] .label');
       if (label) label.textContent = group ? name + ' ' + group.length + ' elements' : name;
@@ -772,6 +840,8 @@ window.__frmMain = function(D) {
       elementIndex = parseInt(element.getAttribute('data-image-idx'));
     } else if (elementType === 'preview') {
       elementIndex = parseInt(element.getAttribute('data-preview-idx'));
+    } else if (elementType === 'listview') {
+      elementIndex = parseInt(element.getAttribute('data-listview-idx'));
     }
 
     // Get element-specific data from the element
@@ -964,7 +1034,12 @@ window.__frmMain = function(D) {
         switch(action) {
           case 'edit-element':
             // Open appropriate modal with existing data
-            if (elementType === 'text') {
+            if (elementType === 'listview') {
+              // No dialog: the table's numbers are edited in the file
+              if (vscodeApi && vscodeApi.postMessage) {
+                vscodeApi.postMessage({ command: 'showInSource', elementType: 'listview', elementIndex: elementIndex });
+              }
+            } else if (elementType === 'text') {
               startTextEdit(elementContextMenuState.element);
             } else if (elementType === 'field') {
               document.getElementById('fieldModalTitle').textContent = 'Edit Field';
@@ -3421,6 +3496,11 @@ window.__frmMain = function(D) {
     return { type: el.getAttribute('data-type'), index: elementIndexOf(el) };
   }
 
+  // A list view table can be moved, stretched and deleted, but not copied, duplicated or edited here
+  function isListview(el) {
+    return !!el && el.getAttribute('data-type') === 'listview';
+  }
+
   // Elements whose line has no index can't be found in the file
   function isLocked(el) {
     return elementIndexOf(el) === null || el.hasAttribute('data-no-index');
@@ -3475,6 +3555,11 @@ window.__frmMain = function(D) {
     var els = actionTargets();
     var rows = actionRows();
     var total = els.length + rows.length;
+    if (els.some(isListview)) {
+      els = els.filter(function(el) { return !isListview(el); });
+      total = els.length + rows.length;
+      if (!total) { showNotice('The list view table can\'t be ' + (cut ? 'cut' : 'copied')); return true; }
+    }
     if (!total) {
       if (!groupKeysBlocked()) showNotice('Elements without an index can\'t be copied');
     } else if (cut) {
@@ -3556,7 +3641,7 @@ window.__frmMain = function(D) {
   // The form element for a key; visual = its row in the Hidden Fields panel or its bottom-bar button instead
   function findByKey(key, visual) {
     var parts = key.split(':');
-    var cls = { text: 'text', field: 'field', pushbutton: 'push', image: 'image', preview: 'preview', bgimage: 'bgimage' }[parts[0]];
+    var cls = { text: 'text', field: 'field', pushbutton: 'push', image: 'image', preview: 'preview', bgimage: 'bgimage', listview: 'listview' }[parts[0]];
     if (!cls) return null;
     var attr = 'data-' + cls + '-idx';
     var idx = parts[1] === 'no-idx' ? ':not([' + attr + '])' : '[' + attr + '="' + parts[1] + '"]';
@@ -3582,6 +3667,7 @@ window.__frmMain = function(D) {
       if (el === primary) el.classList.add('primary');
     });
     visualElements.forEach(function(el) { el.classList.add('code-highlight'); });
+    document.querySelectorAll('.lv-col.lv-col-active').forEach(function(c) { c.classList.remove('lv-col-active'); });
     document.body.classList.toggle('multi-selected', els.length > 1);
     window.__frmCodeSelection = null; // a selection made here replaces one still waiting from the code
     showTriggers();
@@ -3833,6 +3919,7 @@ window.__frmMain = function(D) {
     var visualPrimary = visual.filter(function(v) { return v.at === at; })[0];
 
     setSelection(real.map(function(r) { return r.el; }), primary, visual.map(function(v) { return v.el; }), triggers);
+    markCodeColumns(msg.keys);
     var main = triggers.filter(function(t) { return t.line === msg.primaryTrigger; })[0];
     if (main) {
       revealTrigger(main.target);
@@ -4498,14 +4585,15 @@ window.__frmMain = function(D) {
   function elIndex(el) {
     var type = el.getAttribute('data-type');
     if (el.getAttribute('data-no-index')) return NaN;
-    var attr = type === 'field' ? 'data-field-idx' : type === 'image' ? 'data-image-idx' : type === 'preview' ? 'data-preview-idx' : null;
+    var attr = type === 'field' ? 'data-field-idx' : type === 'image' ? 'data-image-idx' : type === 'preview' ? 'data-preview-idx' :
+      type === 'listview' ? 'data-listview-idx' : null;
     return attr ? parseInt(el.getAttribute(attr), 10) : NaN;
   }
 
   function canStretch(el) {
     if (!el) return false;
     var type = el.getAttribute('data-type');
-    return (type === 'field' || type === 'image' || type === 'preview') && isFinite(elIndex(el));
+    return (type === 'field' || type === 'image' || type === 'preview' || type === 'listview') && isFinite(elIndex(el));
   }
 
   function sameBox(a, b) {
@@ -4541,6 +4629,11 @@ window.__frmMain = function(D) {
     if (type === 'preview') {
       el.setAttribute('data-preview-rows', String(b.rows));
       el.setAttribute('data-preview-cols', String(b.cols));
+    }
+    if (type === 'listview') {
+      el.setAttribute('data-listview-rows', String(b.rows));
+      el.setAttribute('data-listview-cols', String(b.cols));
+      updateListviewScroll(el);
     }
     updateOverflow(gridRows, gridCols);
   }
@@ -4987,7 +5080,7 @@ window.__frmMain = function(D) {
   function elementIndexOf(el) {
     var attr = {
       text: 'data-text-idx', field: 'data-field-idx', pushbutton: 'data-push-idx',
-      image: 'data-image-idx', preview: 'data-preview-idx', bgimage: 'data-bgimage-idx'
+      image: 'data-image-idx', preview: 'data-preview-idx', bgimage: 'data-bgimage-idx', listview: 'data-listview-idx'
     }[el.getAttribute('data-type')];
     var n = attr ? parseInt(el.getAttribute(attr), 10) : NaN;
     return isFinite(n) ? n : null;
@@ -5013,6 +5106,10 @@ window.__frmMain = function(D) {
     var backgrounds = actionRows().filter(function(row) { return row.classList.contains('bg-item'); });
     if (backgrounds.length < selectedRows.length) showNotice('Selected triggers and hidden fields not changed');
     var els = actionTargets();
+    if (els.some(isListview)) {
+      els = els.filter(function(el) { return !isListview(el); });
+      showNotice('The list view table can\'t be duplicated');
+    }
     if (!els.length && !backgrounds.length) return;
     var rowOf = function(el) { return parseInt(el.getAttribute('data-row'), 10); };
     var down;
@@ -5239,6 +5336,8 @@ window.__frmMain = function(D) {
   setupMarquee(); // first, so its click handler can stop the one that deselects
   setupKeyboardNavigation();
   setupCodeSelection();
+  setupListviewColumns();
+  if (!tabs.length) layoutListviews(null);
   fitTextSpans();
   
   // Restore selection if it existed before this update

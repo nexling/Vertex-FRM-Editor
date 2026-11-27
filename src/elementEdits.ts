@@ -27,12 +27,19 @@ export const SECTION_OF: Record<string, Section> = {
 
 const isInt = (v: unknown, min: number): v is number => typeof v === 'number' && Number.isInteger(v) && v >= min;
 
-/** The elements of a message from the preview, each once; anything malformed is left out. */
-export function validRefs<T extends ElementRef>(items: unknown, isValid: (item: T) => boolean = () => true): T[] {
+/** Elements that can be moved, stretched and deleted, but not added, copied or duplicated (page_listview). */
+export const PLACE_ONLY_TYPES = ['listview'];
+
+/**
+ * The elements of a message from the preview, each once; anything malformed is left out.
+ * placeOnly: also accept PLACE_ONLY_TYPES (moves and deletes).
+ */
+export function validRefs<T extends ElementRef>(items: unknown, isValid: (item: T) => boolean = () => true, placeOnly = false): T[] {
   if (!Array.isArray(items)) return [];
   const seen = new Set<string>();
+  const types = [...Object.keys(SECTION_OF), ...(placeOnly ? PLACE_ONLY_TYPES : [])];
   return (items as T[]).filter(item => {
-    if (!item || !Object.keys(SECTION_OF).includes(item.type) || !isInt(item.index, 0) || !isValid(item)) return false;
+    if (!item || !types.includes(item.type) || !isInt(item.index, 0) || !isValid(item)) return false;
     const key = keyOf(item);
     return !seen.has(key) && !!seen.add(key);
   });

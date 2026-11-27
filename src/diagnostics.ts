@@ -1,7 +1,8 @@
 // Checks an FRM file for problems. No VS Code dependency.
 import { backgroundProblems } from './backgrounds';
+import { EXO_FIELD, flagValue } from './listview';
 import {
-  buttonSpellings, firstLineValue, groupFixedValues, ItemKind, itemPosition, itemsOf, optListKind,
+  buttonSpellings, firstLineValue, groupFixedValues, ItemKind, itemPosition, itemsOf, listTokens, optListKind,
   parseStatements, referenceTokens, Statement,
 } from './frmStatements';
 
@@ -39,6 +40,11 @@ export function findProblems(lines: string[], imageExists?: (file: string) => bo
   const statements = parseStatements(lines);
   const groupFixed = groupFixedValues(lines, statements);
   const references = (s: Statement, kind: ItemKind) => referenceTokens(lines, s, kind, groupFixed).map(t => Number(t.text));
+  // List view: the indexes of the non-exo fields, which are table columns
+  const listForm = statements.some(s => s.keyword === 'page_listview' && s.valueStart >= 0);
+  const columnIndexes = new Set(listForm
+    ? itemsOf(statements, 'field').filter(s => s.index !== undefined && !isExoField(lines, s)).map(s => s.index)
+    : []);
 
   for (const s of statements) {
     const check = HEADER_CHECKS[s.keyword];
@@ -89,7 +95,10 @@ export function findProblems(lines: string[], imageExists?: (file: string) => bo
         const pos = itemPosition(lines, s);
         const hidden = pos && (pos.row === 1000 || pos.col === 1000);
         const bottomBar = kind === 'button' && pos?.row === 100;
-        if (!hidden && !bottomBar) {
+        // In a list view, a column on no opt_field list is on every page, as intended
+        // and its heading goes with it
+        const everyPageColumn = (kind === 'field' || kind === 'text') && columnIndexes.has(s.index!);
+        if (!hidden && !bottomBar && !everyPageColumn) {
           report(s, 'info', `${describe(s)} is declared but not assigned to any tab using opt_${s.keyword}`);
         }
       }
@@ -109,6 +118,8 @@ export function findProblems(lines: string[], imageExists?: (file: string) => bo
     }
   }
 
+  listviewProblems(lines, statements, report);
+
   if (buttonSpellings(statements).mixed) {
     for (const s of statements) {
       if (s.valueStart < 0 || (s.keyword !== 'pushbutton' && s.keyword !== 'opt_pushbutton')) continue;
@@ -117,4 +128,39 @@ export function findProblems(lines: string[], imageExists?: (file: string) => bo
   }
 
   return problems.sort((a, b) => a.startLine - b.startLine);
+}
+
+/** Field type has +4096. */
+function isExoField(lines: string[], s: Statement): boolean {
+  const m = firstLineValue(lines, s).match(/^\s*(?:"[^"]*"|<[^>]*>|\S+)\s+([\d+]+)/);
+  return !!m && (flagValue(m[1]) & EXO_FIELD) !== 0;
+}
+
+/** page_listview(page)= srow scol nrow ncol mode: five numbers, a page that exists, each page once. */
+function listviewProblems(lines: string[], statements: Statement[], report: (s: Statement, severity: Problem['severity'], message: string) => void): void {
+  const listviews = statements.filter(s => s.keyword === 'page_listview' && s.valueStart >= 0);
+  if (!listviews.length) return;
+  const pages = new Set(statements.filter(s => s.keyword === 'page_header' && s.index !== undefined).map(s => s.index));
+  const byPage = new Map<number, Statement[]>();
+  for (const s of listviews) {
+    const values = listTokens(lines, s).map(t => t.text);
+    // The mode is a sum of bits, e.g. 1+2
+    if (values.length !== 5 || !values.slice(0, 4).every(v => /^\d+$/.test(v)) || !/^\d+(\+\d+)*$/.test(values[4])) {
+      report(s, 'error', 'page_listview needs 5 numbers: srow scol nrow ncol mode');
+    }
+    if (s.index === undefined) {
+      report(s, 'error', 'page_listview needs a page number: page_listview(0) for every page, or the index of a page_header');
+      continue;
+    }
+    if (s.index !== 0 && !pages.has(s.index)) {
+      report(s, 'warning', `page_listview(${s.index}) is for a page that does not exist: there is no page_header(${s.index}). Use 0 for every page.`);
+    }
+    byPage.set(s.index, [...(byPage.get(s.index) ?? []), s]);
+  }
+  for (const same of byPage.values()) {
+    if (same.length < 2) continue;
+    for (const s of same) {
+      report(s, 'error', `Page_listview(${s.index}) is declared more than once (lines ${same.map(x => x.startLine + 1).join(', ')})`);
+    }
+  }
 }

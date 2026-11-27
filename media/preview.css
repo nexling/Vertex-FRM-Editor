@@ -330,6 +330,32 @@ body.marquee-selecting { user-select: none; }
 .preview-label { font-size: 11px; font-weight: 600; color: rgba(0,0,0,0.7); text-align: center; }
 .preview-path { font-size: 9px; color: rgba(0,0,0,0.5); text-align: center; word-break: break-all; }
 
+/* List view table (page_listview): header row, filter row, status column, empty rows; no data */
+.listview { --lv-row: calc(var(--row-h) + var(--row-gap)); --lv-line: rgba(0, 0, 0, .14); position: relative; z-index: 1;
+  background: #fff; border: 1px solid rgba(130, 135, 144, 1); box-sizing: border-box; font-family: 'Segoe UI', Tahoma, sans-serif; }
+.listview > .delete-button { top: -17px; right: -6px; z-index: 14; }
+.lv-table { position: absolute; inset: 0; display: flex; overflow: hidden; }
+.lv-status, .lv-col { flex: none; box-sizing: border-box; border-right: 1px solid var(--lv-line);
+  /* One line per body row; the header and filter cells cover the lines behind them */
+  background: repeating-linear-gradient(to bottom, transparent 0, transparent calc(var(--lv-row) - 1px), var(--lv-line) calc(var(--lv-row) - 1px), var(--lv-line) var(--lv-row)); }
+.lv-status { width: calc(2 * (var(--col-w) + var(--col-gap))); background-color: rgba(240, 240, 240, 1); }
+.lv-cols { flex: 1; min-width: 0; display: flex; overflow: hidden; }
+.lv-col.lv-auto { width: max-content; }
+.lv-head, .lv-filter { height: var(--lv-row); box-sizing: border-box; border-bottom: 1px solid var(--lv-line); white-space: nowrap; overflow: hidden; }
+.lv-head { padding: 0 6px; display: flex; align-items: center; background: linear-gradient(#fff, #f1f2f4); color: #000;
+  font-size: calc(var(--frm-font-size) * .95); cursor: pointer; }
+.lv-head:hover { background: #e5f1fb; }
+/* +1024: no header row; the heading still sizes a width-0 column */
+.lv-head.lv-head-hidden { height: 0; border: 0; visibility: hidden; }
+.lv-filter { background: #fafafa; cursor: pointer; }
+.lv-status .lv-head, .lv-status .lv-filter { cursor: inherit; }
+.lv-noheading { font-style: italic; opacity: .55; }
+.lv-col.lv-col-active { background-color: rgba(0, 120, 212, .08); }
+.lv-col.lv-col-active > .lv-head { background: #cce4f7; box-shadow: inset 0 -2px var(--vscode-focusBorder, #0078d4); }
+/* Columns cut off at the right edge: a scrollbar shows there is more */
+.lv-hscroll { position: absolute; left: 0; right: 0; bottom: 0; height: 9px; background: #f0f0f0; border-top: 1px solid var(--lv-line); }
+.lv-thumb { height: 5px; margin: 2px 0 0 2px; border-radius: 3px; background: rgba(0, 0, 0, .3); }
+
 /* Context Menu */
 .context-menu {
   position: fixed;

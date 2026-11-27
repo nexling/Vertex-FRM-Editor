@@ -15,6 +15,7 @@ import {
 import { newButtonKeyword } from './frmStatements';
 import { ALIGNMENTS, Background, BackgroundEdit, addBackground, editBackground, findBackgrounds, imageCandidates, isTif, parseColor, validTabs } from './backgrounds';
 import { convertButtons, registerLanguageFeatures, usesMixedButtons } from './languageFeatures';
+import { EXO_FIELD, Listview, columnOrder, hasNoColumnHeaders, listviewTabs, parseFilterRow, parseListviews } from './listview';
 
 // The extension's install folder; the preview page's styles and script are in its media/ folder
 let extensionUri: vscode.Uri | undefined;
@@ -157,7 +158,7 @@ const previewHistoryRuns = new Map<string, number>();
 // Messages from the preview that don't edit the file
 const NON_EDITING_COMMANDS = new Set([
   'gateCancel', 'frmReady', 'frmTiming', 'frmSoftUpdateFailed', 'setZoom', 'setActiveTab', 'setGridOn',
-  'resolveFieldValues', 'listImages', 'resolveImage', 'setToolbox', 'showInSource', 'copyElements', 'undo', 'redo', 'cancelTabOrder', 'dismissMixedButtons'
+  'resolveFieldValues', 'listImages', 'resolveImage', 'setToolbox', 'showInSource', 'showColumnInSource', 'copyElements', 'undo', 'redo', 'cancelTabOrder', 'dismissMixedButtons'
 ]);
 
 function followsCursor(): boolean {
@@ -518,6 +519,8 @@ function ensurePreview(context: vscode.ExtensionContext, doc: vscode.TextDocumen
         queueEdit(doc, () => runDocumentHistory(doc, createdPanel, msg.command));
       } else if (msg?.command === 'showInSource') {
         handleShowInSource(doc, createdPanel, msg);
+      } else if (msg?.command === 'showColumnInSource') {
+        handleShowColumnInSource(doc, msg);
       } else if (msg?.command === 'addTrigger') {
         handleAddTrigger(doc, msg);
       } else if (msg?.type === 'editTrigger') {
@@ -560,7 +563,7 @@ const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 const refNames = (refs: ElementRef[]) => refs.map(r => `${r.type}(${r.index})`).join(', ');
 
 function handleMoveElements(doc: vscode.TextDocument, panel: vscode.WebviewPanel, msg: MoveElementsMessage) {
-  const moves = validRefs(msg.moves, isMove);
+  const moves = validRefs(msg.moves, isMove, true);
   if (!moves.length) return;
   const key = doc.uri.toString();
   // Refreshes wait until the file has caught up with what the preview shows
@@ -588,7 +591,7 @@ function handleMoveElements(doc: vscode.TextDocument, panel: vscode.WebviewPanel
 }
 
 function handleDeleteElements(doc: vscode.TextDocument, msg: ElementsMessage) {
-  const refs = validRefs<ElementRef>(msg.elements);
+  const refs = validRefs<ElementRef>(msg.elements, undefined, true);
   const triggers = validTriggerRefs(msg.triggers);
   if (!refs.length && !triggers.length) return;
   queueEdit(doc, async () => {
@@ -845,10 +848,11 @@ function handleResizeElement(doc: vscode.TextDocument, msg: ResizeElementMessage
       // prefix (keyword, name, type) | col | ws | len
       lineRegex = /^(\s*field\s*\(\s*(\d+)\s*\)\s*=\s*"?\s*<?[$\w]+>?\s*"?\s+[\d+]+\s+\d+\s+)(\d+)(\s+)(\d+)/i;
       rewrite = m => m[1] + msg.col + m[4] + msg.len;
-    } else if (type === 'image' || type === 'preview') {
+    } else if (type === 'image' || type === 'preview' || type === 'listview') {
       if (!int(msg.row, 1) || !int(msg.rows, 1) || !int(msg.cols, 1)) return;
       // prefix | row | ws | col | ws | rows | ws | cols
-      lineRegex = new RegExp(`^(\\s*${type}\\s*\\(\\s*(\\d+)\\s*\\)\\s*=\\s*)(\\d+)(\\s+)(\\d+)(\\s+)(\\d+)(\\s+)(\\d+)`, 'i');
+      const keyword = type === 'listview' ? 'page_listview' : type;
+      lineRegex = new RegExp(`^(\\s*${keyword}\\s*\\(\\s*(\\d+)\\s*\\)\\s*=\\s*)(\\d+)(\\s+)(\\d+)(\\s+)(\\d+)(\\s+)(\\d+)`, 'i');
       rewrite = m => m[1] + msg.row + m[4] + msg.col + m[6] + msg.rows + m[8] + msg.cols;
     } else if (type === 'text') {
       // A boxed text: row/col is the box's top-left corner, #[rows,cols]* in the content is its size
@@ -1239,6 +1243,25 @@ function handleShowInSource(doc: vscode.TextDocument, panel: vscode.WebviewPanel
   }
 }
 
+/**
+ * A list view column header was clicked: select its field(n) line, and the heading's text(n) line,
+ * in the text editor. The preview keeps the focus; the editor's cursor ends on the field.
+ */
+async function handleShowColumnInSource(doc: vscode.TextDocument, msg: { fieldIndex?: unknown }) {
+  const index = msg.fieldIndex;
+  if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) return;
+  const lines = doc.getText().split(/\r?\n/);
+  const field = findElement(lines, 'field', index);
+  if (!field) return;
+  const heading = findElement(lines, 'text', index);
+  const whole = (s: { startLine: number; endLine: number }) =>
+    new vscode.Selection(s.startLine, 0, s.endLine, lines[s.endLine].length);
+  const shown = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === doc.uri.toString());
+  const editor = shown ?? await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preserveFocus: true });
+  editor.selections = [whole(field), ...(heading ? [whole(heading)] : [])];
+  editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+}
+
 function handleEditTrigger(doc: vscode.TextDocument, msg: EditTriggerMessage) {
   try {
     const { line, target, program, flag, createFile, openFile } = msg;
@@ -1549,9 +1572,10 @@ interface FrmField {
   rightAlign: boolean; // 16384 flag
   centerAlign: boolean; // 32768 flag
   transparent: boolean; // 8192 flag
+  exo: boolean; // 4096 flag: outside the database; a control (not a column) in a list view
   row: number;
   col: number;
-  len: number; // column length
+  len: number; // column length; whole columns only (10.2 counts as 10, 30|3 as 30)
   values: string[]; // dropdown choices if any
 }
 
@@ -1618,6 +1642,10 @@ interface FrmModel {
   images: FrmImage[];
   backgrounds: Array<Background & { resolvedSrc?: string }>; // lowest index first
   previews: FrmPreview[];
+  /** page_listview statements; any of them makes this a list view form. */
+  listviews: Listview[];
+  filterRow?: number; // filter_row= value
+  noColumnHeaders: boolean; // group(1) type +1024
   triggers: FrmTrigger[];
   tabOrder?: number[]; // field indexes in tab order sequence
   // Optional tab model
@@ -1898,7 +1926,8 @@ function parseFrm(src: string): FrmModel {
 
   // field= NAME type row col len ignore ["choices"...] OR field(n)= ...
   // NAME can be: plain (A-Z0-9_$), quoted ("$NAME"), angle-bracketed (<NAME>), or both ("<NAME>")
-  const fieldRegex = /^\s*field\s*(?:\(\s*(\d+)\s*\))?\s*=\s*"?\s*<?([$\w]+)>?\s*"?\s+([\d+]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)?([^\n]*)/gim;
+  // The width may carry decimals (10.2) or a line count (30|3); only the whole columns count here
+  const fieldRegex = /^\s*field\s*(?:\(\s*(\d+)\s*\))?\s*=\s*"?\s*<?([$\w]+)>?\s*"?\s+([\d+]+)\s+(\d+)\s+(\d+)\s+(\d+)(?:\.\d+|\|\d+)?\s+(\d+)?([^\n]*)/gim;
   let fm: RegExpExecArray | null;
   while ((fm = fieldRegex.exec(text))) {
     const idx = fm[1] != null ? Number(fm[1]) : undefined;
@@ -1927,7 +1956,8 @@ function parseFrm(src: string): FrmModel {
     // fm[7] is optional ignore value; fm[8] is trailing text containing optional choices
     const tail = (fm[8] ?? '').toString();
     const values = Array.from(tail.matchAll(/"([^"]+)"/g)).map(x => x[1]);
-    fields.push({ index: idx, name, nameFormat, type, typeExpr: normalizedTypeExpr, locked, rightAlign, centerAlign, transparent, row, col, len, values });
+    const exo = (type & EXO_FIELD) !== 0;
+    fields.push({ index: idx, name, nameFormat, type, typeExpr: normalizedTypeExpr, locked, rightAlign, centerAlign, transparent, exo, row, col, len, values });
   }
 
   // image(n)= row col rows cols mode "filename"
@@ -2064,11 +2094,19 @@ function parseFrm(src: string): FrmModel {
     tabPreviews[id].push(...list);
   }
 
+  // List view: any page_listview. Non-exo fields are then table columns, and the texts sharing their
+  // indexes are column headings; neither is placed on the grid.
+  const listviews = parseListviews(text);
+  const listMode = listviews.length > 0;
+  const columnIndexes = new Set(listMode ? fields.filter(f => !f.exo && f.index != null).map(f => f.index!) : []);
+
   // Determine grid extents (no padding; exact fit). Use 1 as absolute minimum only if empty.
   // Exclude bottom bar buttons (isBottomBar=true) and hidden fields (row or col 1000, shown in the side panel)
-  const gridFields = fields.filter(f => !isHiddenFieldPosition(f.row, f.col));
+  const gridFields = fields.filter(f => !isHiddenFieldPosition(f.row, f.col) && (!listMode || f.exo));
+  const gridTexts = texts.filter(t => t.index == null || !columnIndexes.has(t.index));
   const contentMaxRow = Math.max(
-    texts.reduce((a, t) => Math.max(a, t.row), 0),
+    listviews.reduce((a, l) => Math.max(a, l.row + Math.max(1, l.rows) - 1), 0),
+    gridTexts.reduce((a, t) => Math.max(a, t.row), 0),
     gridFields.reduce((a, f) => Math.max(a, f.row), 0),
     pushbuttons.filter(p => !p.isBottomBar).reduce((a, p) => Math.max(a, p.row), 0),
     boxes.reduce((a, b) => Math.max(a, b.row + Math.max(1, b.rows) - 1), 0),
@@ -2076,7 +2114,8 @@ function parseFrm(src: string): FrmModel {
     previews.reduce((a, p) => Math.max(a, p.row + Math.max(1, p.rows) - 1), 0)
   );
   const contentMaxCol = Math.max(
-    texts.reduce((a, t) => Math.max(a, t.col + Math.max(0, (t.content?.length ?? 0) - 1)), 0),
+    listviews.reduce((a, l) => Math.max(a, l.col + Math.max(1, l.cols) - 1), 0),
+    gridTexts.reduce((a, t) => Math.max(a, t.col + Math.max(0, (t.content?.length ?? 0) - 1)), 0),
     gridFields.reduce((a, f) => {
       const extra = (f.values && f.values.length > 0) ? 2 : 0; // dropdowns take +2 columns
       return Math.max(a, f.col + Math.max(1, f.len + extra) - 1);
@@ -2108,7 +2147,8 @@ function parseFrm(src: string): FrmModel {
     Object.keys(tabPreviews).forEach(k => { tabPreviews[Number(k)] = uniqueNums(tabPreviews[Number(k)]); });
   }
 
-  return { title, rows, cols, portRows: requestedRows, portCols: requestedCols, winstyle, revision, texts, fields, pushbuttons, boxes, images, backgrounds, previews, triggers, tabOrder, tabs: sortedTabs, tabBackgrounds: sortedTabs ? tabBackgrounds : undefined, tabTexts: sortedTabs ? tabTexts : undefined, tabFields: sortedTabs ? tabFields : undefined, tabPushButtons: sortedTabs ? tabPushButtons : undefined, tabImages: sortedTabs ? tabImages : undefined, tabPreviews: sortedTabs ? tabPreviews : undefined };
+  return { title, rows, cols, portRows: requestedRows, portCols: requestedCols, winstyle, revision, texts, fields, pushbuttons, boxes, images, backgrounds, previews,
+    listviews, filterRow: parseFilterRow(text), noColumnHeaders: hasNoColumnHeaders(text), triggers, tabOrder, tabs: sortedTabs, tabBackgrounds: sortedTabs ? tabBackgrounds : undefined, tabTexts: sortedTabs ? tabTexts : undefined, tabFields: sortedTabs ? tabFields : undefined, tabPushButtons: sortedTabs ? tabPushButtons : undefined, tabImages: sortedTabs ? tabImages : undefined, tabPreviews: sortedTabs ? tabPreviews : undefined };
 }
 
 // Translation support: load system/programs64/userprompt1.xml and resolve VXID keys
@@ -2755,6 +2795,50 @@ interface PreviewParts {
 }
 
 /**
+ * The list view tables. A table holds every column any of its tabs shows; data-listview-order says
+ * which columns each tab shows, in what order ('all' when the form has no tabs), and the page applies it.
+ */
+function renderListviews(model: FrmModel): string {
+  const tabIds = (model.tabs ?? []).map(t => t.id);
+  const showHeader = !model.noColumnHeaders;
+  const showFilter = model.filterRow !== 0;
+  const headingOf = (f: FrmField) => f.index != null ? model.texts.find(t => t.index === f.index) : undefined;
+  return [...listviewTabs(model.listviews, tabIds)].map(([page, on]) => {
+    const lv = model.listviews.find(l => l.page === page)!;
+    const order: Record<string, number[]> = {};
+    if (on === 'all') order.all = columnOrder(model.fields);
+    else for (const id of on) order[id] = columnOrder(model.fields, model.tabFields, id);
+    const positions = [...new Set(Object.values(order).flat())];
+    const cells = (head: string) =>
+      `<div class="lv-head${showHeader ? '' : ' lv-head-hidden'}">${head}</div>${showFilter ? '<div class="lv-filter"></div>' : ''}`;
+    const columns = positions.map(pos => {
+      const f = model.fields[pos];
+      const heading = headingOf(f);
+      const label = heading
+        ? escapeHtml(heading.content || '')
+        : `<span class="lv-noheading">${escapeHtml(f.name)}</span>`;
+      // Width 0 is automatic: the heading's width, as there is no data to measure
+      const width = f.len > 0 ? ` style="width: calc(${f.len} * (var(--col-w) + var(--col-gap)));"` : '';
+      const tip = `${f.index != null ? `field(${f.index}) ` : ''}${f.name}${heading ? `, heading text(${heading.index})` : ', no heading text'}`;
+      return `<div class="lv-col${f.len > 0 ? '' : ' lv-auto'}" data-col-pos="${pos}"${f.index != null ? ` data-col-field="${f.index}"` : ''} title="${escapeAttr(tip)}"${width}>${cells(label)}</div>`;
+    }).join('');
+    const spanR = Math.max(1, lv.rows);
+    const spanC = Math.max(1, lv.cols);
+    const tabs = on === 'all' ? 'all' : on.join(' ');
+    return `<div class="listview draggable" data-listview-idx="${page}" draggable="true" data-type="listview" data-row="${lv.row}" data-col="${lv.col}" data-listview-rows="${lv.rows}" data-listview-cols="${lv.cols}" data-listview-mode="${escapeAttr(lv.modeExpr)}" data-listview-tabs="${tabs}" data-listview-order="${escapeAttr(JSON.stringify(order))}" title="page_listview(${page})" style="grid-row:${lv.row} / span ${spanR}; grid-column:${lv.col} / span ${spanC};">
+      <div class="insertion-point" title="Insertion Point"></div>
+      <div class="delete-button" title="Delete">×</div>
+      <div class="lv-table">
+        <div class="lv-status">${cells('')}</div>
+        <div class="lv-cols">${columns}</div>
+      </div>
+      <div class="lv-hscroll hidden"><div class="lv-thumb"></div></div>
+      ${elementResizeHandles(['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'])}
+    </div>`;
+  }).join('\n');
+}
+
+/**
  * Render the form. The styles and script are static files (media/preview.css, media/preview.js),
  * so a refresh only sends this body and data; the page patches its body to match.
  */
@@ -2762,7 +2846,13 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
   const { initialZoom, initialActiveTab, initialGridOn, availableTriggerPrograms, showZoomControls, unindexed, mixedButtons } = opts;
   const unindexedMsg = unindexed.texts + unindexed.buttons > 0 ? unindexedMessage(unindexed) : null;
 
-  const texts = model.texts.map(t => {
+  // List view: non-exo fields are table columns and the texts sharing their indexes are the headings
+  const listMode = model.listviews.length > 0;
+  const isColumn = (f: FrmField) => listMode && !f.exo;
+  const columnIndexes = new Set(model.fields.filter(f => isColumn(f) && f.index != null).map(f => f.index!));
+  const isHeading = (t: FrmText) => t.index != null && columnIndexes.has(t.index);
+
+  const texts = model.texts.filter(t => !isHeading(t)).map(t => {
     // Initial guess; the page measures the rendered text and tightens it (fitTextSpans)
     const span = Math.max(1, t.content?.length ?? 1);
     const dataIdx = t.index != null ? ` data-text-idx="${t.index}"` : ' data-unindexed="1"';
@@ -2813,9 +2903,9 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     return `<div class="box${owner ? ' stretchable' : ''}"${stretch} data-row="${b.row}" data-col="${b.col}" style="grid-row:${b.row} / span ${rspan}; grid-column:${b.col} / span ${cspan};">${parts.join('')}${handles}</div>`;
   }).join('\n');
 
-  const hiddenFields = model.fields.filter(f => isHiddenFieldPosition(f.row, f.col));
+  const hiddenFields = model.fields.filter(f => isHiddenFieldPosition(f.row, f.col) && !isColumn(f));
 
-  const fields = model.fields.filter(f => !isHiddenFieldPosition(f.row, f.col)).map(f => {
+  const fields = model.fields.filter(f => !isHiddenFieldPosition(f.row, f.col) && !isColumn(f)).map(f => {
     const isDropdown = f.values.length > 0;
     const control = isDropdown
       ? `<select ${f.locked ? 'disabled' : ''}>
@@ -2968,8 +3058,10 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
     </div>`;
   }).join('\n');
 
+  const listviewsHtml = renderListviews(model);
+
   // Drawn by the page (layoutBackgrounds), which knows the areas' sizes
-  const bgData = (bg: FrmModel['backgrounds'][number]) => {
+  const bgData =(bg: FrmModel['backgrounds'][number]) => {
     const color = parseColor(bg.file);
     return { ...bg, resolvedSrc: bg.resolvedSrc, color: color && color.every(c => c <= 255) ? color : null };
   };
@@ -3045,6 +3137,7 @@ function renderPreview(model: FrmModel, opts: PreviewOptions): PreviewParts {
               ${push}
               ${images}
               ${previews}
+              ${listviewsHtml}
             </div>
               <div class="resize-handle e" data-resize="e" title="Drag to change width (port_size cols). Right-click to set to auto."></div>
               <div class="resize-handle s" data-resize="s" title="Drag to change height (port_size rows). Right-click to set to auto."></div>

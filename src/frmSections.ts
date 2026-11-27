@@ -105,7 +105,7 @@ export const enum Section {
   Trigger = 10,
 }
 
-const HEADER_KEYWORDS = new Set(['vxdbase_winstyle', 'port_size', 'revision', 'status_bar', 'header', 'page_header']);
+const HEADER_KEYWORDS = new Set(['vxdbase_winstyle', 'port_size', 'revision', 'status_bar', 'header', 'page_header', 'page_listview']);
 const OPT_KIND_ORDER = ['text', 'field', 'pushbutton', 'image', 'preview'];
 
 export interface StatementClass {

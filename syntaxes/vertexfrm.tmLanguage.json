@@ -91,7 +91,7 @@
         },
         {
           "name": "support.function.vertexfrm",
-          "match": "(?i)^\\s*(?:opt_\\w+|\\w+_of_field|save_label|cancel_button|ok_button|sort_mode|sort_order|preview|language|connection_of_field|mat_prop_attributes|connection|confirm_ok|cancel_label|ok_label|listboxbutton_of_field|image|master_control|button|tab_order|text|field|pushbutton|text_font|field_font|port_size|vxdbase_winstyle|header|page_header|has_pulldowns|group|trigger|status_bar|revision|help_label|help_file|filter_row|help_button|page_listview|save_button|option_button|bgimage)\\b(?=\\s*(?:\\(|=|$))"
+          "match": "(?i)^\\s*(?:opt_\\w+|\\w+_of_field|save_label|cancel_button|ok_button|sort_mode|sort_order|preview|language|connection_of_field|mat_prop_attributes|connection|confirm_ok|cancel_label|ok_label|listboxbutton_of_field|image|master_control|button|tab_order|text|field|pushbutton|text_font|field_font|port_size|vxdbase_winstyle|header|page_header|has_pulldowns|group|trigger|status_bar|revision|help_label|help_file|filter_row|autofit_mode|start_page|help_button|page_listview|save_button|option_button|bgimage)\\b(?=\\s*(?:\\(|=|$))"
         },
         {
           "name": "support.function.vertexfrm",

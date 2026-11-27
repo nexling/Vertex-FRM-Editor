@@ -33,6 +33,9 @@ export interface ElementSelection {
 }
 
 const DEFINITION = /^\s*(text|field|pushbutton|button|image|bgimage|preview)\s*\(\s*(\d+)\s*\)\s*=/i;
+// A list view table, type 'listview' in the preview. Not an element that can be copied or pasted, so
+// findElementStatements leaves it out; findElement and the cursor selection find it.
+const LISTVIEW = /^\s*page_listview\s*\(\s*(\d+)\s*\)\s*=/i;
 const TRIGGER = /^\s*trigger\s*=\s*(\$?\w+)/i;
 
 /** True if a logical FRM statement continues onto the next line. */
@@ -67,6 +70,16 @@ export function findElementStatements(lines: string[]): ElementStatement[] {
   return found;
 }
 
+/** Every page_listview statement, as type 'listview' with the page as index, in file order. */
+export function findListviewStatements(lines: string[]): ElementStatement[] {
+  const found: ElementStatement[] = [];
+  for (const range of statementRanges(lines)) {
+    const m = lines[range.startLine].match(LISTVIEW);
+    if (m) found.push({ type: 'listview', index: Number(m[1]), ...range });
+  }
+  return found;
+}
+
 /** Every trigger in the file, in file order. */
 export function findTriggerStatements(lines: string[]): Array<TriggerStatement & { startLine: number; endLine: number }> {
   return statementRanges(lines).flatMap(range => {
@@ -78,12 +91,13 @@ export function findTriggerStatements(lines: string[]): Array<TriggerStatement &
 /** The statement that defines an element (the first one, if it is defined twice). */
 export function findElement(lines: string[], type: string, index: number): ElementStatement | undefined {
   const wanted = normalizeType(type);
-  return findElementStatements(lines).find(s => s.type === wanted && s.index === Number(index));
+  const statements = wanted === 'listview' ? findListviewStatements(lines) : findElementStatements(lines);
+  return statements.find(s => s.type === wanted && s.index === Number(index));
 }
 
 /** The elements and triggers whose statements are touched by the selections; the first selection is the primary one. */
 export function elementsInSelections(lines: string[], selections: LineSelection[]): ElementSelection {
-  const statements = findElementStatements(lines);
+  const statements = [...findElementStatements(lines), ...findListviewStatements(lines)].sort((a, b) => a.startLine - b.startLine);
   const keyOf = (s: ElementStatement) => `${s.type}:${s.index}`;
   const allTriggers = findTriggerStatements(lines);
   const touchedBy = <T extends { startLine: number; endLine: number }>(sel: LineSelection, among: T[]): T[] => {
