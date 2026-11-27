@@ -441,8 +441,6 @@ body.marquee-selecting { user-select: none; }
   font-size: 11px;
   color: rgba(0,0,0,0.6);
 }
-.modal-field small.fv-hint { display: block; white-space: pre-line; font-style: italic; }
-.modal-field small.fv-hint:empty { display: none; }
 .modal-buttons {
   display: flex;
   gap: 8px;
@@ -748,7 +746,7 @@ body.tool-dragging.tool-no-drop * { cursor: not-allowed !important; }
   background: rgba(0,0,0,.75); color: #fff; font: 11px/1.4 sans-serif; white-space: nowrap;
 }
 
-/* Image dialog */
+/* Images list under a file name in the Properties panel */
 .image-list { height: 190px; overflow-y: auto; border: 1px solid var(--vscode-input-border, #ccc); border-radius: 3px; color: #000; background: #fff; font-size: 12px; }
 .image-list-item { display: flex; align-items: center; gap: 8px; padding: 3px 6px; cursor: pointer; }
 .image-list-item:hover { background: rgba(0, 120, 212, .1); }
@@ -757,10 +755,6 @@ body.tool-dragging.tool-no-drop * { cursor: not-allowed !important; }
 .image-list-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .image-list-origin { font-size: 11px; color: rgba(0,0,0,.6); }
 .image-list-note { padding: 6px 8px; color: rgba(0,0,0,.6); }
-.image-modes { display: grid; gap: 3px; }
-.modal-field .image-modes label { font-weight: normal; display: flex; align-items: center; gap: 6px; }
-.modal-field .image-modes input { padding: 0; }
-#imageModal .modal, #bgModal .modal { max-height: calc(100vh - 16px); overflow-y: auto; box-sizing: border-box; }
 
 /* Backgrounds: one layer under everything in the window, above its own colour */
 .content { position: relative; isolation: isolate; }
@@ -772,14 +766,6 @@ body.tool-dragging.tool-no-drop * { cursor: not-allowed !important; }
 .bg-thumb { flex: none; width: 28px; height: 24px; object-fit: contain; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(0,0,0,.25); box-sizing: border-box; }
 .bg-text { min-width: 0; }
 .bg-text > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.modal-field .bg-options { display: flex; gap: 16px; }
-.modal-field .bg-options label, .modal-field .bg-alignment label { font-weight: normal; display: flex; align-items: center; gap: 4px; margin: 0; }
-.bg-size { display: flex; gap: 8px; }
-.bg-size > * { flex: 1; min-width: 0; }
-.bg-alignment { display: grid; grid-template-columns: repeat(3, 20px); gap: 2px; width: fit-content; padding: 4px; }
-.bg-alignment label:last-child { grid-column: 1 / -1; width: max-content; }
-#bgColor { padding: 1px; height: 28px; width: 60px; }
-#bgTransparency { padding: 0; }
 
 /* Properties panel: over the other side panels while something is selected, out of the way while dragging */
 .side-panels.props-open > :not(.props-panel) { display: none; }
@@ -828,3 +814,7 @@ body.element-dragging .props-panel { display: none; }
   border: 1px solid var(--vscode-input-border, rgba(0,0,0,0.25)); background: #fff; color: rgba(0,0,0,1);
 }
 .props-button:hover { border-color: var(--vscode-focusBorder, #0078d4); }
+.props-picker { display: flex; flex-direction: column; gap: 3px; }
+.props-image-list { height: 160px; }
+.props-hint:empty { display: none; }
+.props-fv-hint { white-space: pre-line; font-style: italic; }

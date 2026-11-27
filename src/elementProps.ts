@@ -480,8 +480,14 @@ export function setElementProp(source: string[], ref: ElementRef, key: string, v
     }
     case 'pushbutton.kind': case 'pushbutton.action': case 'pushbutton.program': case 'pushbutton.variable': case 'pushbutton.value':
       return setButtonTail(lines, tokens, slots, current, key, value);
-    case 'image.file':
-      return put('file', rewrap(token('file')?.text ?? '""', value));
+    case 'image.file': {
+      const file = token('file');
+      if (file) return put('file', rewrap(file.text, value));
+      const mode = token('mode');
+      if (!mode) return undefined;
+      insertAfter(lines, mode, rewrap('""', value));
+      return lines;
+    }
     case 'preview.path': case 'preview.field':
       return put(key, `"${value.replace(/"/g, '')}"`);
     case 'preview.portType':
